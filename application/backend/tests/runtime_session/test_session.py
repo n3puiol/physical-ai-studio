@@ -254,11 +254,14 @@ async def test_teleop_without_a_leader_is_refused_and_holds(new_session) -> None
         await session.stop()
 
 
-async def test_a_failing_control_reports_and_falls_back_to_hold(new_session) -> None:
+async def test_a_failing_control_reports_and_falls_back_to_hold(new_session, monkeypatch) -> None:
+    from runtime_session.controls import TeleopControl
     from schemas.runtime_session import TeleopControlConfig
 
+    monkeypatch.setattr(TeleopControl, "outage_s", 0.2)
     session = await new_session()
     statuses = subscribe_statuses(session)
+    events = subscribe_events(session)
     await session.load_environment(make_environment(cameras=0))
     try:
 
@@ -271,6 +274,62 @@ async def test_a_failing_control_reports_and_falls_back_to_hold(new_session) -> 
         assert status.state == "failed" and "leader unplugged" in status.error
         await _until(lambda: session.state().control is None)
         assert session.environment is not None  # the environment stays loaded
+
+        # The client is told teleop ended, then sees the state without it.
+        async with asyncio.timeout(5):
+            while (event := await events.next()).type != "error":
+                pass
+        assert event.component == "control"
+        assert event.error_code == "control_failed"
+        assert event.session_alive
+        assert event.message.startswith("Teleoperation stopped: ") and "leader unplugged" in event.message
+        async with asyncio.timeout(5):
+            while (event := await events.next()).type != "state":
+                pass
+        assert event.data.control is None
+    finally:
+        await session.stop()
+
+
+async def test_teleop_rides_out_a_leader_that_drops_a_few_reads(new_session) -> None:
+    from schemas.runtime_session import TeleopControlConfig
+
+    session = await new_session()
+    statuses = subscribe_statuses(session)
+    await session.load_environment(make_environment(cameras=0))
+    try:
+        leader = session.leader
+        answer = leader.get_observation
+        dropped = 5
+
+        def flaky():
+            nonlocal dropped
+            if dropped:
+                dropped -= 1
+                raise ConnectionError("Remote end closed connection without response")
+            return answer()
+
+        leader.get_observation = flaky
+        await session.set_control(TeleopControlConfig(hz=50, grace_s=0))
+        await _until(lambda: dropped == 0)
+        await asyncio.sleep(0.2)
+        assert session.state().control == TeleopControlConfig(hz=50, grace_s=0)
+        while (status := statuses.poll()) is not None:
+            assert not (status.component == "control" and status.state == "failed")
+    finally:
+        await session.stop()
+
+
+async def test_a_late_failure_does_not_drop_the_control_started_since(new_session) -> None:
+    from schemas.runtime_session import StatusMessage, TeleopControlConfig
+
+    session = await new_session()
+    await session.load_environment(make_environment(cameras=0))
+    try:
+        await session.set_control(TeleopControlConfig())
+        # The failure of a control the session has replaced since arrives late: the running one stays.
+        await session._on_control(StatusMessage(component="control", state="failed", error="old news"))
+        assert session.state().control == TeleopControlConfig()
     finally:
         await session.stop()
 

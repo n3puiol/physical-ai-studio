@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from runtime_session.controls import TeleopControl, build_control
+from runtime_session.controls.teleop import LeaderLostError
 from runtime_session.store import ACTION, STATE, FeatureSpec, Store
 from schemas.runtime_session import TeleopControlConfig
 from tests.workers.fake_robot import FakeRobot
@@ -81,3 +82,77 @@ async def test_a_control_runs_as_a_thread_until_stopped(store: Store, tmp_path: 
     first = store.read(ACTION).timestamp
     await asyncio.sleep(0.05)
     assert store.read(ACTION).timestamp == first  # stopped writing
+
+
+class _FlakyLeader:
+    """Wraps a leader so the next ``failures`` reads raise, as a simulator does while it resets."""
+
+    def __init__(self, leader: FakeRobot) -> None:
+        self._leader = leader
+        self.joint_names = leader.joint_names
+        self.failures = 0
+
+    def get_observation(self):
+        if self.failures:
+            self.failures -= 1
+            raise ConnectionError("Remote end closed connection without response")
+        return self._leader.get_observation()
+
+
+def test_a_failed_leader_read_skips_the_tick_and_holds(store: Store, tmp_path: Path) -> None:
+    leader = _FlakyLeader(_leader(tmp_path))
+    control = TeleopControl(store, leader, TeleopControlConfig(grace_s=0))
+    control.on_start()
+    control.on_tick()
+    before = store.read(ACTION)
+
+    leader.failures = 3
+    for _ in range(3):
+        control.on_tick()  # does not raise
+    assert store.read(ACTION).timestamp == before.timestamp  # nothing new commanded: the follower holds
+    assert control.failed_reads == 3
+
+    control.on_tick()  # answers again
+    assert store.read(ACTION).timestamp > before.timestamp
+    assert control.failed_reads == 0
+    assert control.failing_since is None
+
+
+def test_a_leader_that_stays_down_ends_teleop(store: Store, tmp_path: Path) -> None:
+    leader = _FlakyLeader(_leader(tmp_path))
+    control = TeleopControl(store, leader, TeleopControlConfig(grace_s=0))
+    control.on_start()
+    leader.failures = 1_000
+    control.on_tick()
+    control.failing_since = time.monotonic() - control.outage_s  # failing for as long as it tolerates
+    with pytest.raises(LeaderLostError, match="has not answered") as lost:
+        control.on_tick()
+    assert isinstance(lost.value.__cause__, ConnectionError)
+
+
+async def test_a_running_teleop_rides_out_a_brief_outage(store: Store, tmp_path: Path) -> None:
+    leader = _FlakyLeader(_leader(tmp_path))
+    control = TeleopControl(store, leader, TeleopControlConfig(hz=100, grace_s=0))
+    async with control:
+        await asyncio.sleep(0.05)
+        leader.failures = 20  # about 0.2s of failed reads at 100Hz
+        await asyncio.sleep(0.4)
+        assert control.is_alive()
+        assert leader.failures == 0  # it kept reading through the outage and got past it
+        answered_at = store.read(ACTION).timestamp
+        await asyncio.sleep(0.05)
+        assert store.read(ACTION).timestamp > answered_at  # tracking the leader again
+    assert control.failure is None
+
+
+async def test_a_running_teleop_stops_once_the_leader_is_lost(store: Store, tmp_path: Path) -> None:
+    leader = _FlakyLeader(_leader(tmp_path))
+    control = TeleopControl(store, leader, TeleopControlConfig(hz=100, grace_s=0))
+    control.outage_s = 0.1
+    async with control:
+        leader.failures = 1_000_000
+        async with asyncio.timeout(2):
+            await control.wait_stopped()
+    assert control.failure is not None
+    assert "LeaderLostError" in control.failure
+    assert "Remote end closed connection" in control.failure

@@ -610,12 +610,31 @@ class RuntimeSession:
             self._emit(StateMessage(data=self.state()))
 
     async def _on_control(self, status: StatusMessage) -> None:
-        """A failed control is dropped, and the follower holds; the environment stays loaded."""
-        if status.state == "failed":
-            async with self._lock:
-                if (loaded := self._environment.value) is not None and self._control.value is not None:
-                    await self._switch_control(loaded.environment, None)
-            self._emit(StateMessage(data=self.state()))
+        """A control that stopped by itself is dropped, and the follower holds; the environment stays loaded.
+
+        The client is told with an ``error`` naming why, then the state without a control,
+        so nothing reads as teleoperating a follower that no longer moves.
+        """
+        if status.state != "failed":
+            return
+        async with self._lock:
+            control = self._control.value
+            # A control that failed to start never loaded; one started since the failure is still running.
+            if control is None or control.is_alive():
+                return
+            if (loaded := self._environment.value) is not None:
+                await self._switch_control(loaded.environment, None)
+            else:
+                await self._control.unload()
+        self._emit(
+            ErrorMessage(
+                component=_CONTROL,
+                message=f"{_control_name(control.config)} stopped: {status.error or 'stopped unexpectedly'}",
+                error_code="control_failed",
+                session_alive=True,
+            )
+        )
+        self._emit(StateMessage(data=self.state()))
 
     async def _on_model(self, status: StatusMessage) -> None:
         """A failed model is unloaded, and the follower holds if it was driving it."""
@@ -638,6 +657,11 @@ class RuntimeSession:
             self._bus.publish(EVENTS, event)
         if event.type == "state":
             self._registry.changed()
+
+
+def _control_name(config: ControlConfig) -> str:
+    """How an error names a control to a user."""
+    return "Teleoperation" if config.type == "teleop" else "Model control"
 
 
 def _model_mismatch(model: ProcessModel, spec: FeatureSpec) -> str | None:
