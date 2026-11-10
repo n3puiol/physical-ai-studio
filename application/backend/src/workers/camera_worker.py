@@ -7,7 +7,7 @@ import cv2
 from loguru import logger
 from physicalai.capture import SharedCamera
 
-from runtime_session.bus import Bus, publish_status
+from runtime_session.bus import Bus, BusAddress, publish_status
 from runtime_session.store import ImageSpec, Store
 from schemas.project_camera import Camera
 from schemas.runtime_session import ComponentState
@@ -47,13 +47,13 @@ class CameraWorker(ThreadWorker[SharedCamera]):
         key: str,
         is_locked: bool = False,
         *,
-        session_id: str | None = None,
+        bus_address: BusAddress | None = None,
         component: str | None = None,
     ) -> None:
-        """Pass ``session_id`` and ``component`` to report a failure on that session's bus."""
+        """Pass ``bus_address`` and ``component`` to report a failure on that session's bus."""
         super().__init__(name=f"CameraWorker-{config.name}")
         self.config = config
-        self.session_id = session_id
+        self.bus_address = bus_address
         self.component = component
         self._bus: Bus | None = None
         self._camera: SharedCamera | None = None
@@ -67,7 +67,7 @@ class CameraWorker(ThreadWorker[SharedCamera]):
         camera = self._open()
         self._camera = camera
         try:
-            with Bus.join(self.session_id) if self.session_id else nullcontext() as self._bus:
+            with Bus.join(self.bus_address) if self.bus_address else nullcontext() as self._bus:
                 yield camera
         finally:
             logger.info("Camera run loop stopped. Disconnecting")

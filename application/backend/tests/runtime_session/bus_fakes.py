@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Annotated, Literal
 
 from pydantic import BaseModel, Field
 
-from runtime_session.bus import Bus
+from runtime_session.bus import Bus, BusAddress
 from workers.base import ProcessWorker
 
 if TYPE_CHECKING:
@@ -39,13 +39,13 @@ def upper(message: Say) -> Heard:
 class EchoWorker(ProcessWorker[Bus]):
     """Publishes every ``say`` command back as an event and serves ``upper``."""
 
-    def __init__(self, session_id: str) -> None:
+    def __init__(self, bus_address: BusAddress) -> None:
         super().__init__(name="EchoWorker")
-        self.session_id = session_id
+        self.bus_address = bus_address
 
     @asynccontextmanager
     async def lifecycle(self) -> AsyncIterator[Bus]:
-        with Bus.join(self.session_id) as bus:
+        with Bus.join(self.bus_address) as bus:
             yield bus
 
     async def run_loop(self, context: Bus) -> None:

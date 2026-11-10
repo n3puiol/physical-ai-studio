@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 import numpy as np
 from pydantic import BaseModel
 
-from runtime_session.bus import Bus
+from runtime_session.bus import Bus, BusAddress
 from runtime_session.store import FeatureSpec, Store
 from schemas.runtime_session import CommandDone
 from workers.base import ProcessWorker
@@ -93,7 +93,7 @@ class ModelWorker(ProcessWorker[Inference]):
         *,
         backend: str,
         device: str,
-        session_id: str,
+        bus_address: BusAddress,
         store_name: str,
         spec: FeatureSpec,
         images: Mapping[str, str],
@@ -102,7 +102,7 @@ class ModelWorker(ProcessWorker[Inference]):
         self.export_dir = export_dir
         self.backend = backend
         self.device = device
-        self.session_id = session_id
+        self.bus_address = bus_address
         self.store_name = store_name
         self.spec = spec
         self.images = dict(images)
@@ -117,7 +117,7 @@ class ModelWorker(ProcessWorker[Inference]):
     async def lifecycle(self) -> AsyncIterator[Inference]:
         store = Store.attach(self.spec, self.store_name)
         try:
-            with Bus.join(self.session_id) as bus:
+            with Bus.join(self.bus_address) as bus:
                 inference = Inference(self.open_model(), store, self.images)
                 bus.serve(INFER, InferRequest, inference.infer)
                 bus.serve(RESET, Empty, inference.reset)

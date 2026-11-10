@@ -19,7 +19,7 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
-from runtime_session.bus import Bus, publish_status, until_serving
+from runtime_session.bus import Bus, BusAddress, publish_status, until_serving
 from runtime_session.store import FeatureSpec, ImageSpec
 from schemas.runtime_session import SessionDataset
 from workers import dataset_worker as dataset_rpc
@@ -110,7 +110,7 @@ class Recording:
     """
 
     def __init__(
-        self, dataset: Dataset, session_id: str, store: Store, robot_type: str, fps: int | None = None
+        self, dataset: Dataset, bus_address: BusAddress, store: Store, robot_type: str, fps: int | None = None
     ) -> None:
         self.dataset = dataset
         self.fps = dataset_fps(dataset, fps)
@@ -118,9 +118,14 @@ class Recording:
         self.status = RecordingStatus(is_recording=False, episodes_recorded=0)
         """What the worker last announced on ``evt/dataset``; the worker owns it, the session keeps this up to date."""
         self._worker = DatasetWorker(
-            dataset, session_id=session_id, store_name=store.name, spec=store.spec, fps=self.fps, robot_type=robot_type
+            dataset,
+            bus_address=bus_address,
+            store_name=store.name,
+            spec=store.spec,
+            fps=self.fps,
+            robot_type=robot_type,
         )
-        self._session_id = session_id
+        self._bus_address = bus_address
         self._store = store
         self._stack: AsyncExitStack | None = None
         self._started = False
@@ -143,7 +148,7 @@ class Recording:
             WorkerStartupError: The dataset could not be opened for recording.
         """
         async with AsyncExitStack() as stack:
-            bus = stack.enter_context(Bus.join(self._session_id))
+            bus = stack.enter_context(Bus.join(self._bus_address))
             publish_status(bus, COMPONENT, "starting")
             # Runs after the worker has stopped, while the bus is still open.
             stack.callback(self._report_stopped, bus)

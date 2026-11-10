@@ -401,7 +401,7 @@ class RuntimeSession:
         store = cast("Store", self._store)  # created before the environment is loaded
         await self._registry.until_closed(within=_RELEASE_S)
         with self._claim(description):
-            async with Environment(description, self.id, store) as held:
+            async with Environment(description, self.bus.address, store) as held:
                 yield LoadedEnvironment(
                     environment=held,
                     state=description.session_environment(),
@@ -522,7 +522,7 @@ class RuntimeSession:
 
     def _recording(self, dataset: Dataset, robot_type: str, fps: int | None) -> Recording:
         # The store is there with any environment, even one that failed to connect.
-        return Recording(dataset, self.id, cast("Store", self._store), robot_type, fps)
+        return Recording(dataset, self.bus.address, cast("Store", self._store), robot_type, fps)
 
     async def load_model(self, model: Model, backend: str, device: str) -> None:
         """Load one of ``model``'s exports in its own process, replacing a loaded model.
@@ -541,7 +541,7 @@ class RuntimeSession:
 
     def _process_model(self, model: Model, backend: str, device: str) -> ProcessModel:
         # The store is there with any environment, even one that failed to connect.
-        return ProcessModel(model, self.id, cast("Store", self._store), backend=backend, device=device)
+        return ProcessModel(model, self.bus.address, cast("Store", self._store), backend=backend, device=device)
 
     async def unload_model(self) -> None:
         """Stop a model control, then the model. A no-op when none is loaded."""

@@ -28,7 +28,7 @@ from loguru import logger
 
 from exceptions import RuntimeSessionCommandError
 from robots.features import sanitize_camera_name
-from runtime_session.bus import Bus, Subscription, publish_status, status_key
+from runtime_session.bus import Bus, BusAddress, Subscription, publish_status, status_key
 from runtime_session.store import FeatureSpec, Store
 from schemas.runtime_session import CommandDone, ReloadEnvironment, SessionCamera, SessionEnvironment, StatusMessage
 from workers.base import WorkerStartupError
@@ -144,9 +144,9 @@ class Environment:
     reloaded or released. A reload connects the devices again in place.
     """
 
-    def __init__(self, description: EnvironmentDescription, session_id: str, store: Store) -> None:
+    def __init__(self, description: EnvironmentDescription, bus_address: BusAddress, store: Store) -> None:
         self.description = description
-        self.session_id = session_id
+        self.bus_address = bus_address
         self.store = store
         self.leader: Robot | None = None
         """Connected, for controls to borrow; ``None`` while the devices are not connected."""
@@ -155,7 +155,7 @@ class Environment:
 
     async def __aenter__(self) -> Self:
         """Join the bus and try to connect the devices; if that fails, it is reported failed, to reload."""
-        self._bus = Bus.join(self.session_id)
+        self._bus = Bus.join(self.bus_address)
         self._bus.serve(RELOAD, ReloadEnvironment, self.reload)  # undeclared with the bus
         try:
             await self._connect()
@@ -216,13 +216,13 @@ class Environment:
                     store.name,
                     store.spec,
                     hz=DEFAULT_ROBOT_HZ,
-                    session_id=self.session_id,
+                    bus_address=self.bus_address,
                     component=f"{COMPONENT}/follower",
                 )
                 managers: dict[str, AbstractAsyncContextManager[Any]] = {"follower": follower}
                 for key, row in description.cameras.items():
                     managers[key] = CameraWorker(
-                        row, store, key, session_id=self.session_id, component=f"{COMPONENT}/{key}"
+                        row, store, key, bus_address=self.bus_address, component=f"{COMPONENT}/{key}"
                     )
                 if description.leader is not None:
                     managers["leader"] = _connected_driver(description.leader)
