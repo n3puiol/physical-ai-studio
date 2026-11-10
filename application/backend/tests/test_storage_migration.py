@@ -89,27 +89,93 @@ def test_migration_replaces_empty_storage_scaffold(tmp_path: Path, monkeypatch: 
 def test_migration_fails_when_destination_contains_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     settings = _settings(tmp_path)
     old_storage = _old_storage(tmp_path, monkeypatch)
-    old_storage.mkdir(parents=True)
+    (old_storage / "datasets").mkdir(parents=True)
+    (old_storage / "datasets" / "dataset.txt").write_text("old data")
+    (old_storage / "isolate").mkdir()
     settings.storage_dir.mkdir(parents=True)
     (settings.storage_dir / "existing.txt").write_text("data")
     monkeypatch.setenv("AUTO_MIGRATE_STORAGE_DIR", "true")
 
-    with pytest.raises(StorageMigrationError, match="already contains files"):
+    with pytest.raises(StorageMigrationError, match="already contains files") as exc_info:
         migrate_default_storage_dir(settings, interactive=False)
 
-    assert old_storage.exists()
+    assert f"STORAGE_DIR={old_storage}" not in str(exc_info.value)
+    assert (old_storage / "datasets" / "dataset.txt").read_text() == "old data"
+    assert (settings.storage_dir / "existing.txt").read_text() == "data"
+
+
+def _runtime_isolate_cache(old_storage: Path) -> Path:
+    isolate_env = old_storage / "isolate" / "abc123"
+    (isolate_env / "venv").mkdir(parents=True)
+    (isolate_env / "project").mkdir()
+    (isolate_env / ".physicalai-isolate.json").write_text("{}")
+    (isolate_env / ".physicalai-engine.json").write_text("{}")
+    return isolate_env
+
+
+def test_migration_ignores_runtime_isolate_cache_when_destination_contains_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    old_storage = _old_storage(tmp_path, monkeypatch)
+    isolate_env = _runtime_isolate_cache(old_storage)
+    (settings.storage_dir / "datasets").mkdir(parents=True)
+    (settings.storage_dir / "datasets" / "dataset.txt").write_text("data")
+
+    migrate_default_storage_dir(settings, interactive=False)
+
+    assert (isolate_env / ".physicalai-isolate.json").exists()
+    assert (settings.storage_dir / "datasets" / "dataset.txt").read_text() == "data"
+
+
+@pytest.mark.parametrize("auto_migrate", [False, True])
+def test_migration_noops_when_old_storage_has_only_runtime_cache_and_empty_scaffold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, auto_migrate: bool
+) -> None:
+    settings = _settings(tmp_path)
+    old_storage = _old_storage(tmp_path, monkeypatch)
+    isolate_env = _runtime_isolate_cache(old_storage)
+    for subdir in storage_migration.EXPECTED_STORAGE_SUBDIRS:
+        (old_storage / subdir).mkdir()
+    if auto_migrate:
+        monkeypatch.setenv("AUTO_MIGRATE_STORAGE_DIR", "true")
+
+    migrate_default_storage_dir(settings, interactive=False)
+
+    assert (isolate_env / "venv").is_dir()
+    assert not settings.storage_dir.exists()
+
+
+def test_migration_leaves_runtime_isolate_cache_in_old_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = _settings(tmp_path)
+    old_storage = _old_storage(tmp_path, monkeypatch)
+    isolate_env = _runtime_isolate_cache(old_storage)
+    (old_storage / "datasets").mkdir()
+    (old_storage / "datasets" / "dataset.txt").write_text("data")
+    (old_storage / "logs").mkdir()
+    monkeypatch.setenv("AUTO_MIGRATE_STORAGE_DIR", "true")
+
+    migrate_default_storage_dir(settings, interactive=False)
+
+    assert (settings.storage_dir / "datasets" / "dataset.txt").read_text() == "data"
+    assert (settings.storage_dir / "logs").is_dir()
+    assert not (settings.storage_dir / "isolate").exists()
+    assert not (old_storage / "datasets").exists()
+    assert not (old_storage / "logs").exists()
+    assert (isolate_env / ".physicalai-engine.json").exists()
 
 
 def test_migration_fails_non_interactive_without_auto_migrate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     settings = _settings(tmp_path)
     old_storage = _old_storage(tmp_path, monkeypatch)
-    old_storage.mkdir(parents=True)
+    (old_storage / "models").mkdir(parents=True)
+    (old_storage / "models" / "model.txt").write_text("model")
     monkeypatch.delenv("AUTO_MIGRATE_STORAGE_DIR", raising=False)
 
     with pytest.raises(StorageMigrationError, match="non-interactive"):
         migrate_default_storage_dir(settings, interactive=False)
 
-    assert old_storage.exists()
+    assert (old_storage / "models" / "model.txt").exists()
 
 
 def test_migration_rewrites_database_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
