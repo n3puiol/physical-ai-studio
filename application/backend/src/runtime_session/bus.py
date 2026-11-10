@@ -319,4 +319,8 @@ def _config(*, listen: Path | None = None, connect: Path | None = None) -> zenoh
     config.insert_json5("scouting/multicast/enabled", "false")
     config.insert_json5("listen/endpoints", json.dumps([f"unixsock-stream/{listen}"] if listen else []))
     config.insert_json5("connect/endpoints", json.dumps([f"unixsock-stream/{connect}"] if connect else []))
+    # zenoh moves payloads over 3 KiB through its own shared memory. Behind a long-running session's router, a
+    # reply sent that way after a delay was lost, so a model's 50-action chunk (~6 KB, after ~0.3 s of inference)
+    # came back as NoResponderError. Bus messages are small; camera frames go through the Store, not the bus.
+    config.insert_json5("transport/shared_memory/enabled", "false")
     return config

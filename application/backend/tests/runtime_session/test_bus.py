@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 
 import pytest
 
-from runtime_session.bus import Bus, BusRequestError, NoResponderError, socket_path
+from runtime_session.bus import Bus, BusRequestError, NoResponderError, _config, socket_path
 
 from .bus_fakes import Command, EchoWorker, Heard, Say, Stop, upper
 
@@ -56,6 +57,32 @@ async def test_request_replies_and_reports_handler_errors(session_id: str) -> No
         with pytest.raises(NoResponderError):
             await bus.request("rpc/nobody/home", Say(text="hi"), Heard, timeout=0.2)
 
+
+
+def test_buses_do_not_use_zenoh_shared_memory(session_id: str) -> None:
+    # A long-running router lost shared-memory replies sent after a delay, such as a model's action chunk.
+    path = socket_path(session_id)
+    for config in (_config(listen=path), _config(connect=path)):
+        assert json.loads(config.get_json("transport/shared_memory/enabled")) is False
+
+
+async def test_a_large_reply_after_a_delay_arrives(session_id: str) -> None:
+    async def slow_and_long(message: Say) -> Heard:
+        await asyncio.sleep(0.3)
+        return Heard(text=message.text * 3000)
+
+    with Bus.host(session_id) as host, Bus.join(session_id) as worker, Bus.join(session_id) as client:
+        worker.serve("rpc/echo/long", Say, slow_and_long)
+        for _ in range(100):  # the queryable takes a moment to reach the client
+            try:
+                heard = await client.request("rpc/echo/long", Say(text="hi"), Heard, timeout=2)
+                break
+            except NoResponderError:
+                await asyncio.sleep(0.05)
+        else:
+            raise AssertionError("never served")
+        assert heard == Heard(text="hi" * 3000)
+        del host
 
 async def test_worker_process_on_the_bus(session_id: str) -> None:
     with Bus.host(session_id) as bus:
