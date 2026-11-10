@@ -19,6 +19,9 @@ OLD_DEFAULT_STORAGE_DIR = Path("~/.cache/physicalai").expanduser()
 OLD_DEFAULT_DATA_DIR_CANDIDATES = (Path("data"), Path("/app/data"))
 AUTO_MIGRATE_STORAGE_DIR_ENV = "AUTO_MIGRATE_STORAGE_DIR"
 EXPECTED_STORAGE_SUBDIRS = {"models", "cache", "snapshots", "datasets", "robots", "logs"}
+# Entries Studio owns inside the legacy storage directory. Anything else (for example the Runtime's
+# ``isolate/`` model-execution cache, which shares ``~/.cache/physicalai``) is left untouched.
+LEGACY_STUDIO_STORAGE_ENTRIES = EXPECTED_STORAGE_SUBDIRS | {"data"}
 
 
 class StorageMigrationError(Exception):
@@ -45,6 +48,10 @@ def _migrate_default_storage_dir(settings: Settings, *, interactive: bool) -> No
     if _same_path(old_storage_dir, new_storage_dir):
         return
 
+    if not _contains_studio_data(old_storage_dir):
+        logger.debug(f"No Physical AI Studio data found in {old_storage_dir}; skipping storage migration.")
+        return
+
     auto_migrate = _env_flag(AUTO_MIGRATE_STORAGE_DIR_ENV)
     storage_dir_is_overridden = "STORAGE_DIR" in os.environ
     if storage_dir_is_overridden and not auto_migrate:
@@ -67,7 +74,7 @@ def _migrate_default_storage_dir(settings: Settings, *, interactive: bool) -> No
     logger.info(f"Migrating storage directory from {old_storage_dir} to {new_storage_dir}")
     _remove_empty_storage_scaffold(new_storage_dir)
     new_storage_dir.parent.mkdir(parents=True, exist_ok=True)
-    _move_storage_dir(old_storage_dir, new_storage_dir)
+    _move_studio_storage(old_storage_dir, new_storage_dir)
     _rewrite_database_paths(settings, old_storage_dir, new_storage_dir)
 
 
@@ -101,7 +108,7 @@ def _migrate_default_database_file(settings: Settings, *, interactive: bool) -> 
 
     logger.info(f"Migrating database from {source_database_path} to {destination_database_path}")
     destination_database_path.parent.mkdir(parents=True, exist_ok=True)
-    _move_file(source_database_path, destination_database_path)
+    _move_path(source_database_path, destination_database_path)
 
 
 def _env_flag(name: str) -> bool:
@@ -129,19 +136,43 @@ def _is_effectively_empty_storage_dir(path: Path) -> bool:
     return True
 
 
+def _contains_studio_data(path: Path) -> bool:
+    """Return whether a legacy storage directory holds anything Studio would need to migrate.
+
+    Empty Studio scaffold directories and entries owned by other tools (such as the Runtime's
+    ``isolate/`` cache) do not count.
+    """
+    if not path.is_dir():
+        return False
+
+    for name in LEGACY_STUDIO_STORAGE_ENTRIES:
+        entry = path / name
+        if entry.is_file():
+            return True
+        if entry.is_dir() and any(entry.iterdir()):
+            return True
+    return False
+
+
 def _remove_empty_storage_scaffold(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path)
 
 
-def _move_storage_dir(source: Path, destination: Path) -> None:
-    try:
-        source.rename(destination)
-    except OSError:
-        shutil.move(str(source), str(destination))
+def _move_studio_storage(source: Path, destination: Path) -> None:
+    """Move Studio-owned entries from ``source`` to ``destination``, leaving other entries in place."""
+    if all(child.name in LEGACY_STUDIO_STORAGE_ENTRIES for child in source.iterdir()):
+        _move_path(source, destination)
+        return
+
+    destination.mkdir(parents=True, exist_ok=True)
+    for name in sorted(LEGACY_STUDIO_STORAGE_ENTRIES):
+        entry = source / name
+        if entry.exists():
+            _move_path(entry, destination / name)
 
 
-def _move_file(source: Path, destination: Path) -> None:
+def _move_path(source: Path, destination: Path) -> None:
     try:
         source.rename(destination)
     except OSError:
@@ -219,12 +250,15 @@ def _rewrite_path_prefix(path_value: str, old_storage_dir: Path, new_storage_dir
 
 
 def _non_empty_destination_message(old_storage_dir: Path, new_storage_dir: Path) -> str:
+    studio_entries = ", ".join(f"{name}/" for name in sorted(LEGACY_STUDIO_STORAGE_ENTRIES))
     return (
         "Cannot automatically migrate Physical AI Studio storage because the new storage directory already "
-        "contains files.\n\n"
+        "contains files and the old storage directory also contains Studio data.\n\n"
         f"Old storage: {old_storage_dir}\n"
         f"New storage: {new_storage_dir}\n\n"
-        f"Move or merge the data manually, or set STORAGE_DIR={old_storage_dir} to keep using the old location."
+        "Physical AI Studio uses the new storage directory. Merge the Studio data from the old directory "
+        f"({studio_entries}) into the new one manually, then remove those entries from the old directory. "
+        "Leave other entries in the old directory, such as the Physical AI Runtime's isolate/ cache, in place."
     )
 
 
@@ -233,7 +267,7 @@ def _non_interactive_message(old_storage_dir: Path, new_storage_dir: Path) -> st
         "Physical AI Studio storage needs to move, but startup is non-interactive.\n\n"
         f"Old storage: {old_storage_dir}\n"
         f"New storage: {new_storage_dir}\n\n"
-        f"Move the directory manually, set STORAGE_DIR={old_storage_dir} to keep using the old location, or set "
+        f"Move the Studio data manually, set STORAGE_DIR={old_storage_dir} to keep using the old location, or set "
         f"{AUTO_MIGRATE_STORAGE_DIR_ENV}=true to allow automatic migration."
     )
 
@@ -243,7 +277,7 @@ def _declined_message(old_storage_dir: Path, new_storage_dir: Path) -> str:
         "Storage migration was declined.\n\n"
         f"Old storage: {old_storage_dir}\n"
         f"New storage: {new_storage_dir}\n\n"
-        f"Move the directory manually or set STORAGE_DIR={old_storage_dir} to keep using the old location."
+        f"Move the Studio data manually or set STORAGE_DIR={old_storage_dir} to keep using the old location."
     )
 
 
