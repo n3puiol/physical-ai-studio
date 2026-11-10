@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
+import tempfile
 import uuid
+from pathlib import Path
 
 import pytest
 
-from runtime_session.bus import Bus, BusRequestError, NoResponderError, socket_path
+from runtime_session.bus import Bus, BusRequestError, NoResponderError, socket_path, until_serving
 
 from .bus_fakes import Command, EchoWorker, Heard, Say, Stop, upper
 
@@ -60,12 +63,44 @@ async def test_request_replies_and_reports_handler_errors(session_id: str) -> No
 async def test_worker_process_on_the_bus(session_id: str) -> None:
     with Bus.host(session_id) as bus:
         events = bus.subscribe("evt/echo", Heard)
-        async with EchoWorker(session_id) as worker:
+        async with EchoWorker(bus.address) as worker:
             assert await _until_heard(bus, events, "hello") == Heard(text="hello")
             assert await bus.request("rpc/echo/upper", Say(text="hi"), Heard, timeout=5) == Heard(text="HI")
             bus.publish("cmd/echo", Stop())
             await asyncio.wait_for(worker.wait_stopped(), 5)
     assert not socket_path(session_id).exists()
+
+
+async def test_worker_joins_where_the_host_listens_when_their_temp_dirs_differ(
+    session_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # As when /tmp was full as the backend started: the host's temp dir fell back
+    # elsewhere, while workers spawned later resolve the default one.
+    child_default = Path(tempfile.gettempdir())
+    parent_only = Path(tempfile.mkdtemp(prefix="pai-bus-"))  # short: a Unix socket path has a length limit
+    try:
+        monkeypatch.setattr(tempfile, "tempdir", str(parent_only))  # this process only, not the spawned worker
+        with Bus.host(session_id) as bus:
+            assert bus.address.socket.parent == parent_only != child_default
+            events = bus.subscribe("evt/echo", Heard)
+            async with EchoWorker(bus.address) as worker:
+                assert await _until_heard(bus, events, "hello") == Heard(text="hello")
+                bus.publish("cmd/echo", Stop())
+                await asyncio.wait_for(worker.wait_stopped(), 5)
+    finally:
+        shutil.rmtree(parent_only, ignore_errors=True)
+
+
+async def test_host_replaces_a_stale_socket(session_id: str) -> None:
+    stale = socket_path(session_id)
+    stale.touch()  # left behind by a killed session
+    try:
+        with Bus.host(session_id) as bus, Bus.join(bus.address) as joined:
+            assert bus.address.socket == stale
+            bus.serve("rpc/echo/upper", Say, upper)
+            assert await until_serving(joined, "rpc/echo/upper", Say(text="hi"), Heard, within=5) == Heard(text="HI")
+    finally:
+        stale.unlink(missing_ok=True)
 
 
 async def test_sessions_do_not_hear_each_other(session_id: str) -> None:

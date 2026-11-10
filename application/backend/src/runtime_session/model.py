@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Self
 
 import numpy as np
 
-from runtime_session.bus import Bus, publish_status, until_serving
+from runtime_session.bus import Bus, BusAddress, publish_status, until_serving
 from schemas.runtime_session import CommandDone, SessionModel
 from workers import model_worker as model_rpc
 from workers.model_worker import ActionChunk, InferRequest, ModelWorker
@@ -86,7 +86,7 @@ class ProcessModel:
     that dies is reported ``failed``.
     """
 
-    def __init__(self, model: Model, session_id: str, store: Store, *, backend: str, device: str) -> None:
+    def __init__(self, model: Model, bus_address: BusAddress, store: Store, *, backend: str, device: str) -> None:
         if backend not in model.available_backends:
             raise ValueError(f"Model {model.name!r} has no {backend} export; it has {model.available_backends}")
         export_dir = Path(model.path) / "exports" / backend
@@ -98,12 +98,12 @@ class ProcessModel:
             export_dir,
             backend=backend,
             device=device,
-            session_id=session_id,
+            bus_address=bus_address,
             store_name=store.name,
             spec=store.spec,
             images=self.inputs.images,
         )
-        self._session_id = session_id
+        self._bus_address = bus_address
         self._bus: Bus | None = None
         self._stack: AsyncExitStack | None = None
         self._started = False
@@ -118,7 +118,7 @@ class ProcessModel:
             WorkerStartupError: The model could not be loaded.
         """
         async with AsyncExitStack() as stack:
-            bus = stack.enter_context(Bus.join(self._session_id))
+            bus = stack.enter_context(Bus.join(self._bus_address))
             publish_status(bus, COMPONENT, "starting")
             stack.callback(self._report_stopped, bus)
             try:

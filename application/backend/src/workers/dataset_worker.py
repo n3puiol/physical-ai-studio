@@ -25,7 +25,7 @@ from loguru import logger
 from pydantic import BaseModel
 
 from exceptions import RuntimeSessionCommandError
-from runtime_session.bus import Bus, command_key, status_key
+from runtime_session.bus import Bus, BusAddress, command_key, status_key
 from runtime_session.store import ACTION, STATE, FeatureSpec, Store
 from schemas.runtime_session import DiscardEpisodeCommand, SaveEpisodeCommand, StartEpisodeCommand, StatusMessage
 from workers.base import ProcessWorker
@@ -179,11 +179,18 @@ class DatasetWorker(ProcessWorker[Recorder]):
     """Closing copies the cache back; killing the worker during that copy loses the dataset."""
 
     def __init__(
-        self, dataset: Dataset, *, session_id: str, store_name: str, spec: FeatureSpec, fps: int, robot_type: str
+        self,
+        dataset: Dataset,
+        *,
+        bus_address: BusAddress,
+        store_name: str,
+        spec: FeatureSpec,
+        fps: int,
+        robot_type: str,
     ) -> None:
         super().__init__(name=f"DatasetWorker-{dataset.id}")
         self.dataset = dataset
-        self.session_id = session_id
+        self.bus_address = bus_address
         self.store_name = store_name
         self.spec = spec
         self.fps = fps
@@ -202,7 +209,7 @@ class DatasetWorker(ProcessWorker[Recorder]):
     async def lifecycle(self) -> AsyncIterator[Recorder]:
         store = Store.attach(self.spec, self.store_name)
         try:
-            with Bus.join(self.session_id) as bus:
+            with Bus.join(self.bus_address) as bus:
                 recorder = Recorder(self.open_mutation(), store, publish=lambda status: bus.publish(EVENTS, status))
                 try:
                     bus.listen(status_key("environment/*"), StatusMessage, recorder.camera_status)

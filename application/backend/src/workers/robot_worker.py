@@ -22,7 +22,7 @@ from loguru import logger
 
 from exceptions import RobotDeviceAlreadyOwnedError
 from robots.features import feature_names
-from runtime_session.bus import Bus, publish_status
+from runtime_session.bus import Bus, BusAddress, publish_status
 from runtime_session.store import ACTION, STATE, FeatureSpec, Store
 from workers.base import ProcessWorker
 from workers.rate import Rate
@@ -113,17 +113,17 @@ class RobotWorker(ProcessWorker["Robot"]):
         *,
         hz: float,
         observe_only: bool = False,
-        session_id: str | None = None,
+        bus_address: BusAddress | None = None,
         component: str | None = None,
     ) -> None:
-        """Pass ``session_id`` and ``component`` to report a failure on that session's bus."""
+        """Pass ``bus_address`` and ``component`` to report a failure on that session's bus."""
         super().__init__(name=f"RobotWorker-{recipe.robot_id}")
         self.recipe = recipe
         self.store_name = store_name
         self.spec = spec
         self.hz = hz
         self.observe_only = observe_only
-        self.session_id = session_id
+        self.bus_address = bus_address
         self.component = component
         self._bus: Bus | None = None
 
@@ -133,7 +133,7 @@ class RobotWorker(ProcessWorker["Robot"]):
 
         self._store = Store.attach(self.spec, self.store_name)
         try:
-            with Bus.join(self.session_id) if self.session_id else nullcontext() as self._bus:
+            with Bus.join(self.bus_address) if self.bus_address else nullcontext() as self._bus:
                 driver = cast("Robot", instantiate(self.recipe.driver))
                 driver.connect()
                 try:

@@ -1,7 +1,9 @@
 """Commands, events and requests between the processes of one session, over zenoh.
 
 The session process :meth:`Bus.host`\\ s a zenoh router listening on a Unix
-socket; its worker processes :meth:`Bus.join` by connecting to that socket.
+socket; its worker processes :meth:`Bus.join` by connecting to that socket, at
+the :class:`BusAddress` the host hands them. Workers never work out the socket
+themselves: a temp dir resolved in another process can differ from the host's.
 Nothing listens on the network and sessions cannot hear each other. Keys are
 relative to ``pai/<session_id>/``: ``cmd/<component>`` and ``evt/<component>``
 for pub/sub, ``rpc/<component>/<op>`` for requests. Payloads are pydantic
@@ -17,6 +19,7 @@ import inspect
 import json
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
@@ -74,9 +77,23 @@ class NoResponderError(LookupError):
 
 
 def socket_path(session_id: str) -> Path:
-    """Where the hosting session listens."""
+    """Where a session hosted by this process listens; only :meth:`Bus.host` calls it.
+
+    ``tempfile.gettempdir()`` is resolved, and cached, per process: one that starts
+    while ``/tmp`` is full falls back to ``/var/tmp``. Joiners take the path from
+    the host's :class:`BusAddress` instead of resolving it again.
+    """
     # shortcut: a fixed temp-dir path assumes one backend per host (like store blocks); use a per-backend dir otherwise.
     return Path(tempfile.gettempdir()) / f"pai-{session_id}.sock"
+
+
+@dataclass(frozen=True)
+class BusAddress:
+    """How to reach a session's bus: what :meth:`Bus.join` takes, from the host's :attr:`Bus.address`."""
+
+    session_id: str
+    socket: Path
+    """The Unix socket the host listens on, as the host resolved it."""
 
 
 class Declaration:
@@ -135,23 +152,25 @@ class Subscription[M](Declaration):
 class Bus:
     """One process's zenoh session, scoped to a runtime session."""
 
-    def __init__(self, session_id: str, config: zenoh.Config) -> None:
-        self.session_id = session_id
-        self._prefix = f"{_ROOT}/{session_id}/"
+    def __init__(self, address: BusAddress, config: zenoh.Config) -> None:
+        self.address = address
+        """Where this bus is; hand it to the processes that should join it."""
+        self.session_id = address.session_id
+        self._prefix = f"{_ROOT}/{address.session_id}/"
         self._session = zenoh.open(config)
         self._declared: set[Declaration] = set()
 
     @classmethod
     def host(cls, session_id: str) -> Bus:
-        """The session process's bus: listens on the session's socket."""
-        path = socket_path(session_id)
-        path.unlink(missing_ok=True)  # left behind by a killed session
-        return cls(session_id, _config(listen=path))
+        """The session process's bus: listens on the session's socket, resolved here once."""
+        address = BusAddress(session_id, socket_path(session_id))
+        address.socket.unlink(missing_ok=True)  # left behind by a killed session
+        return cls(address, _config(listen=address.socket))
 
     @classmethod
-    def join(cls, session_id: str) -> Bus:
-        """A worker process's bus: connects to the hosting session."""
-        return cls(session_id, _config(connect=socket_path(session_id)))
+    def join(cls, address: BusAddress) -> Bus:
+        """A worker process's bus: connects to the hosting session at its ``address``."""
+        return cls(address, _config(connect=address.socket))
 
     def publish(self, key: str, message: BaseModel) -> None:
         self._session.put(self._prefix + key, message.model_dump_json())
