@@ -139,6 +139,12 @@ class QueueManager:
             await asyncio.sleep(0.5)
 
     async def _run_job(self, job_id: str) -> None:
+        def _report(progress: int, message: str | None, extra_info: dict | None) -> None:
+            self.store.update(job_id, progress=progress, message=message, extra_info=extra_info)
+
+        def _should_stop() -> bool:
+            return job_id in self._cancel_requested or self._stopped.is_set()
+
         try:
             request = self.store.get_request(job_id)
             if request is None:
@@ -150,12 +156,6 @@ class QueueManager:
             # in-memory copy stashed at submission time before training runs.
             request.spec.run_options.hf_token = self.store.take_secret(job_id)
 
-            def _report(progress: int, message: str | None, extra_info: dict | None) -> None:
-                self.store.update(job_id, progress=progress, message=message, extra_info=extra_info)
-
-            def _should_stop() -> bool:
-                return job_id in self._cancel_requested or self._stopped.is_set()
-
             if self._max_concurrent_jobs == 1:
                 archive_path = await asyncio.to_thread(
                     self._runner.run, job_id, request, should_stop=_should_stop, report=_report
@@ -165,25 +165,50 @@ class QueueManager:
             if job_id in self._cancel_requested:
                 self.store.update(job_id, status=TrainerJobStatus.CANCELED, message="Canceled")
             else:
-                self.store.update(
-                    job_id,
-                    status=TrainerJobStatus.COMPLETED,
-                    progress=100,
-                    message="Training finished",
-                    artifact=str(archive_path),
-                )
+                self._mark_completed(job_id, archive_path, self._runner.completion_message(job_id))
         except JobCanceledError:
             logger.info("Training job canceled")
             self.store.update(job_id, status=TrainerJobStatus.CANCELED, message="Canceled")
         except Exception as exc:  # surface any training failure as a FAILED job, never crash the loop
-            logger.exception("Training job failed: {}", exc)
-            status = TrainerJobStatus.CANCELED if job_id in self._cancel_requested else TrainerJobStatus.FAILED
-            self.store.update(job_id, status=status, message=f"Training failed: {exc}")
+            await self._fail_or_salvage(job_id, exc, _report)
         finally:
             self._cancel_requested.discard(job_id)
             self._active.pop(job_id, None)
             self._active_devices.pop(job_id, None)
             self._cleanup_if_not_completed(job_id)
+
+    def _mark_completed(self, job_id: str, archive_path: Path, message: str) -> None:
+        self.store.update(
+            job_id,
+            status=TrainerJobStatus.COMPLETED,
+            progress=100,
+            message=message,
+            artifact=str(archive_path),
+        )
+
+    async def _fail_or_salvage(self, job_id: str, exc: Exception, report: Any) -> None:
+        """End a job that raised: COMPLETED if its training finished, else FAILED (or CANCELED).
+
+        A job can die after training has already published its checkpoint,
+        e.g. when a native export crash takes down the isolated training
+        process. Failing it would let `_cleanup_if_not_completed` delete hours
+        of trained weights, so it is delivered with whatever exports finished.
+        """
+        if job_id in self._cancel_requested:
+            logger.info("Training job canceled while failing: {}", exc)
+            self.store.update(job_id, status=TrainerJobStatus.CANCELED, message=f"Training failed: {exc}")
+            return
+        try:
+            archive_path = await asyncio.to_thread(self._runner.salvage, job_id, str(exc), report=report)
+        except Exception:
+            logger.exception("Could not salvage the trained model")
+            archive_path = None
+        if archive_path is None:
+            logger.opt(exception=exc).error("Training job failed: {}", exc)
+            self.store.update(job_id, status=TrainerJobStatus.FAILED, message=f"Training failed: {exc}")
+            return
+        logger.opt(exception=exc).warning("Training finished but the job failed afterwards; delivering the model")
+        self._mark_completed(job_id, archive_path, self._runner.completion_message(job_id))
 
     async def _run_isolated(self, job_id: str, request: SubmitJobRequest, report: Any, should_stop: Any) -> Path:
         context = mp.get_context("spawn")
