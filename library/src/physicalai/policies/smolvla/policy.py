@@ -77,7 +77,8 @@ class SmolVLA(SnapFlowPolicyMixin, RTCPolicyMixin, ExportablePolicyMixin, Policy
         min_period: Minimum period for sine-cosine positional encoding. Default: 4e-3.
         max_period: Maximum period for sine-cosine positional encoding. Default: 4.0.
         use_random_input_noise: Whether to use random noise as the initial input for the denoising
-            process during inference. If False, zeros are used instead. Default: True.
+            process during inference. If False, zeros are used instead. Training always samples
+            Gaussian noise regardless of this setting. Default: False.
         num_steps: Number of decoding steps. Default: 10.
         use_cache: Whether to use attention cache. Default: True.
         freeze_vision_encoder: Whether to freeze vision encoder during training. Default: True.

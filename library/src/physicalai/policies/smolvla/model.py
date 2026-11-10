@@ -880,7 +880,25 @@ class VLAFlowMatching(SnapFlowModelMixin, nn.Module):
             if any(selector in name for selector in params_to_keep_float32):
                 param.data = param.data.to(dtype=torch.float32)
 
+    @staticmethod
+    def _sample_training_noise(shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
+        """Sample the Gaussian noise that flow-matching training regresses from.
+
+        Always random: ``use_random_input_noise`` only selects the *inference* starting point.
+        Zero training noise would make ``x_t = (1 - t) * actions`` reveal the target for most
+        timesteps, so the loss collapses without the policy learning from its observations.
+
+        Returns:
+            Standard-normal float32 noise of ``shape`` on ``device``.
+        """
+        return torch.randn(shape, dtype=torch.float32, device=device)
+
     def _sample_noise(self, shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
+        """Sample the inference starting point: zeros unless ``use_random_input_noise`` is set.
+
+        Returns:
+            Noise of ``shape`` on ``device``; zeros when disabled or while tracing for export.
+        """
         if not self._use_random_input_noise:
             return torch.zeros(shape, dtype=torch.float32, device=device)
         if getattr(torch.jit, "is_tracing", lambda: False)() or torch.onnx.is_in_onnx_export():
@@ -1196,7 +1214,7 @@ class VLAFlowMatching(SnapFlowModelMixin, nn.Module):
                 with shape (batch_size, chunk_size, action_dim)
         """
         if noise is None:
-            noise = self._sample_noise(actions.shape, actions.device)
+            noise = self._sample_training_noise(actions.shape, actions.device)
 
         if time is None:
             time = self._sample_time(actions.shape[0], actions.device)
@@ -1258,7 +1276,7 @@ class VLAFlowMatching(SnapFlowModelMixin, nn.Module):
             return losses, None
 
         if noise is None:
-            noise = self._sample_noise(actions.shape, actions.device)
+            noise = self._sample_training_noise(actions.shape, actions.device)
 
         if time is None:
             time = self._sample_time(actions.shape[0], actions.device)
@@ -1283,7 +1301,7 @@ class VLAFlowMatching(SnapFlowModelMixin, nn.Module):
             prefix_embs=prefix_embs,
             prefix_pad_masks=prefix_pad_masks,
             prefix_att_masks=prefix_att_masks,
-            sample_noise=self._sample_noise,
+            sample_noise=self._sample_training_noise,
             predict_velocity=self._predict_velocity,
         )
         return losses, cd_idx

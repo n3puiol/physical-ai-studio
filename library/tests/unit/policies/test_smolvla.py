@@ -9,6 +9,7 @@ Fast, self-contained tests with no external dependencies (no HuggingFace model d
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -646,6 +647,80 @@ class TestMixedPrecisionDtypeCasting:
 # ============================================================================ #
 # Sample Input Tests                                                           #
 # ============================================================================ #
+
+
+class TestFlowMatchingNoise:
+    """Training must always regress from Gaussian noise; ``use_random_input_noise`` is inference-only.
+
+    With zero training noise ``x_t = (1 - t) * actions`` reveals the target ``-actions`` for most
+    timesteps, so the loss collapses without the policy learning to use its observations.
+    """
+
+    @staticmethod
+    def _flow_model(*, snapflow: bool) -> Any:  # noqa: ANN401
+        """A ``VLAFlowMatching`` with inference noise off whose VLM-dependent steps are recorded.
+
+        The real noise, time and loss code runs; prefix embedding, velocity prediction and the
+        SnapFlow loss are replaced so the test needs no model weights.
+        """
+        from physicalai.policies.smolvla.model import VLAFlowMatching
+
+        class _WithoutVLM(VLAFlowMatching):
+            def __init__(self) -> None:
+                torch.nn.Module.__init__(self)
+                self._use_random_input_noise = False
+                self._snapflow_enabled = snapflow
+                self.seen: dict[str, Any] = {}
+
+            def embed_prefix(self, *_args: Any, **_kwargs: Any) -> Any:  # noqa: ANN401, PLR6301
+                return None, None, None
+
+            def _predict_velocity(self, *args: Any, **_kwargs: Any) -> Any:  # noqa: ANN401
+                self.seen["x_t"] = args[0]
+                return torch.zeros_like(args[0])
+
+            def snapflow_mixed_loss(self, **kwargs: Any) -> Any:  # noqa: ANN401
+                self.seen.update(kwargs)
+                return torch.zeros(()), None
+
+        return _WithoutVLM()
+
+    @staticmethod
+    def _implied_noise(x_t: torch.Tensor, actions: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
+        t = time[:, None, None]
+        return (x_t - (1 - t) * actions) / t
+
+    def test_flow_matching_loss_samples_gaussian_noise_when_inference_noise_is_off(self) -> None:
+        model = self._flow_model(snapflow=False)
+        actions = torch.ones(64, 50, 32)
+        time = torch.full((64,), 0.5)
+        torch.manual_seed(0)
+
+        model._forward_fm(None, None, None, None, None, actions, time=time)  # noqa: SLF001
+
+        noise = self._implied_noise(model.seen["x_t"], actions, time)
+        assert noise.mean().abs() < 0.05
+        assert noise.std() == pytest.approx(1.0, abs=0.05)
+
+    def test_snapflow_loss_samples_gaussian_noise_when_inference_noise_is_off(self) -> None:
+        model = self._flow_model(snapflow=True)
+        actions = torch.ones(64, 50, 32)
+        time = torch.full((64,), 0.5)
+        torch.manual_seed(0)
+
+        model.forward(None, None, None, None, None, actions, time=time)
+
+        noise = self._implied_noise(model.seen["x_t"], actions, time)
+        assert noise.std() == pytest.approx(1.0, abs=0.05)
+        consistency_noise = model.seen["sample_noise"]((64, 50, 32), torch.device("cpu"))
+        assert consistency_noise.std() == pytest.approx(1.0, abs=0.05)
+
+    def test_inference_still_starts_from_zeros_when_inference_noise_is_off(self) -> None:
+        model = self._flow_model(snapflow=False)
+
+        noise = model._sample_noise((2, 50, 32), torch.device("cpu"))  # noqa: SLF001
+
+        assert torch.equal(noise, torch.zeros(2, 50, 32))
 
 
 class TestSampleInput:
