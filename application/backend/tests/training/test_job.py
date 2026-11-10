@@ -29,6 +29,7 @@ from pydantic import SecretStr, ValidationError
 
 from api.policies import _available_policy_classes
 from training import RunOptions, TrainingJobSpec
+from training.export import EXPORT_REPORT_NAME, ExportReport, ExportStatus
 from training.job import (
     CHECKPOINT_NAME,
     EXPORTS_DIRNAME,
@@ -42,6 +43,10 @@ from training.job import (
 )
 
 JOB = "training.job"
+
+# Exports normally run in a spawned child, out of reach of this module's
+# patches; run them on a thread here. test_export.py covers the real child.
+pytestmark = pytest.mark.usefixtures("exports_in_thread")
 
 
 class TestTrainingJobSpec:
@@ -248,15 +253,28 @@ class TestBuildPolicy:
 class _ExportablePolicy(ExportablePolicyMixin):
     """A policy that records the export calls the runner makes."""
 
-    def __init__(self, backends: list[ExportBackend], *, failing: set[ExportBackend] | None = None) -> None:
+    def __init__(
+        self,
+        backends: list[ExportBackend],
+        *,
+        failing: set[ExportBackend] | None = None,
+        missing_dependency: set[ExportBackend] | None = None,
+    ) -> None:
         self._backends = backends
         self._failing = failing or set()
+        self._missing_dependency = missing_dependency or set()
         self.exported: list[tuple[str, ExportBackend]] = []
 
     def get_supported_export_backends(self) -> list[ExportBackend]:  # type: ignore[override]
         return self._backends
 
     def export(self, output_path, backend, input_sample=None, **export_kwargs) -> None:  # type: ignore[override]
+        if backend in self._missing_dependency:
+            msg = f"No module named {backend.value!r}"
+            raise ImportError(msg)
+        # Leave a partial artifact behind, as a converter failing mid-write would.
+        Path(output_path).mkdir(parents=True, exist_ok=True)
+        (Path(output_path) / "model.partial").write_text("x")
         if backend in self._failing:
             msg = f"{backend} unavailable"
             raise RuntimeError(msg)
@@ -589,6 +607,52 @@ class TestRunTrainingJob:
         _run(TrainingJobSpec(policy="act"), tmp_path, policy=policy)
 
         assert [backend for _, backend in policy.exported] == [ExportBackend.OPENVINO]
+        assert (tmp_path / "model" / CHECKPOINT_NAME).is_file()
+
+    def test_export_outcomes_are_recorded_beside_the_checkpoint(self, tmp_path: Path) -> None:
+        policy = _ExportablePolicy(
+            [ExportBackend.TORCH, ExportBackend.OPENVINO, ExportBackend.EXECUTORCH],
+            failing={ExportBackend.OPENVINO},
+            missing_dependency={ExportBackend.EXECUTORCH},
+        )
+
+        _run(TrainingJobSpec(policy="act"), tmp_path, policy=policy)
+
+        report = ExportReport.load(tmp_path / "model")
+        assert report is not None and report.finished
+        assert {result.backend: result.status for result in report.backends} == {
+            "torch": ExportStatus.SUCCEEDED,
+            "openvino": ExportStatus.FAILED,
+            "executorch": ExportStatus.SKIPPED,
+        }
+        assert report.failures[0].error == "RuntimeError: openvino unavailable"
+        assert report.summary() == "OpenVINO export failed"
+
+    def test_a_failed_backend_leaves_no_partial_export_behind(self, tmp_path: Path) -> None:
+        """A non-empty exports/<backend> reads as an available backend, so a failed one is removed."""
+        policy = _ExportablePolicy(
+            [ExportBackend.TORCH, ExportBackend.OPENVINO],
+            failing={ExportBackend.OPENVINO},
+        )
+
+        _run(TrainingJobSpec(policy="act"), tmp_path, policy=policy)
+
+        exports = tmp_path / "model" / EXPORTS_DIRNAME
+        assert (exports / "torch").is_dir()
+        assert not (exports / "openvino").exists()
+
+    def test_a_policy_without_export_support_records_an_empty_report(self, tmp_path: Path) -> None:
+        _run(TrainingJobSpec(policy="act"), tmp_path, policy=object())
+
+        report = ExportReport.load(tmp_path / "model")
+        assert report is not None
+        assert report.finished and report.planned and report.backends == []
+        assert report.summary() is None
+
+    def test_a_canceled_run_writes_no_export_report(self, tmp_path: Path) -> None:
+        _run(TrainingJobSpec(policy="act"), tmp_path, should_stop=True)
+
+        assert not (tmp_path / "model" / EXPORT_REPORT_NAME).exists()
 
     @pytest.mark.parametrize("policy_name", ["act", "smolvla", "pi05"])
     def test_compiled_policy_reloads_the_selected_checkpoint_for_export(self, policy_name: str, tmp_path: Path) -> None:
@@ -609,15 +673,16 @@ class TestRunTrainingJob:
         assert reload.call_args.args[0].compile_model is False
         assert [backend for _, backend in policy.exported] == [ExportBackend.OPENVINO]
 
-    def test_checkpoint_reload_failure_fails_the_job(self, tmp_path: Path) -> None:
-        """Do not silently export final-epoch weights when the selected checkpoint fails to load."""
-        with (
-            patch(f"{JOB}._load_policy_from_checkpoint", side_effect=RuntimeError("reload failed")) as reload,
-            pytest.raises(RuntimeError, match="reload failed"),
-        ):
+    def test_checkpoint_reload_failure_keeps_the_checkpoint_and_is_reported(self, tmp_path: Path) -> None:
+        """Do not export final-epoch weights instead, and do not throw the trained checkpoint away."""
+        with patch(f"{JOB}._load_policy_from_checkpoint", side_effect=RuntimeError("reload failed")) as reload:
             _run(TrainingJobSpec(policy="act"), tmp_path, checkpoint_loader=reload)
 
         reload.assert_called_once()
+        assert (tmp_path / "model" / CHECKPOINT_NAME).is_file()
+        report = ExportReport.load(tmp_path / "model")
+        assert report is not None and report.finished
+        assert report.error == "could not reload the checkpoint (RuntimeError: reload failed)"
 
     def test_trainer_and_datamodule_are_released_before_export(self, tmp_path: Path) -> None:
         """Release training resources and the live policy before checkpoint reload.

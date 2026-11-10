@@ -7,6 +7,8 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, computed_field
 
 from schemas.base import BaseIDModel, Field, UTCDatetime
+from schemas.operational_issue import OperationalIssue
+from training.export import ExportReport, backend_label
 
 LORA_PROPERTY = "lora_enabled"
 DORA_PROPERTY = "lora_use_dora"
@@ -45,6 +47,39 @@ class Model(BaseIDModel):
             backends.append(backend_dir.name)
 
         return sorted(backends)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def export_issues(self) -> list[OperationalIssue]:
+        """Exports that failed after training, read from the model's export report.
+
+        Training keeps its checkpoint when an export backend fails, so a model
+        can lack a backend it was meant to have; each failure is reported here
+        rather than failing the training job.
+        """
+        report = ExportReport.load(self.path)
+        if report is None:
+            return []
+        issues = [
+            OperationalIssue(
+                id=f"model-{self.id}-export-{failure.backend}",
+                title=f"{backend_label(failure.backend)} export failed",
+                detail=f"{backend_label(failure.backend)} export failed: {failure.error or 'unknown error'}",
+                copy_text=failure.error,
+            )
+            for failure in report.failures
+        ]
+        if report.error is not None:
+            issues.insert(
+                0,
+                OperationalIssue(
+                    id=f"model-{self.id}-export",
+                    title="Export failed",
+                    detail=f"Export failed: {report.error}",
+                    copy_text=report.error,
+                ),
+            )
+        return issues
 
     @computed_field  # type: ignore[prop-decorator]
     @computed_field  # type: ignore[prop-decorator]

@@ -35,11 +35,16 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
+from training.export import EXPORTS_DIRNAME, ExportStatus, run_exports_isolated
+
 if TYPE_CHECKING:
+    from multiprocessing.connection import Connection
+
+    from physicalai.export import ExportablePolicyMixin
     from physicalai.policies.base import Policy
     from physicalai.train.callbacks import ReportFn, StopFn
 
@@ -64,9 +69,6 @@ SNAPFLOW_POLICIES = frozenset({"pi05", "smolvla"})
 SnapFlow is a flow-matching technique; only the flow-matching policies mix in
 :class:`~physicalai.policies.mixins.SnapFlowPolicyMixin`.
 """
-
-EXPORTS_DIRNAME = "exports"
-"""Subdirectory of ``output_dir`` holding one directory per export backend."""
 
 _DATASET_REPO_ID = "snapshot"
 """Placeholder repo id: datasets are always loaded from a local root here."""
@@ -337,8 +339,10 @@ def run_training_job(
     """Train one policy end to end: fit, checkpoint, and export.
 
     On success ``output_dir`` holds a checkpoint (:data:`CHECKPOINT_NAME`),
-    the Lightning CSV logs, and an :data:`EXPORTS_DIRNAME` directory per
-    successful export backend. That checkpoint is normally the best epoch,
+    the Lightning CSV logs, an :data:`EXPORTS_DIRNAME` directory per
+    successful export backend, and an
+    :data:`~training.export.EXPORT_REPORT_NAME` recording each backend's
+    outcome. That checkpoint is normally the best epoch,
     written by the ``ModelCheckpoint`` callback during ``fit``; this function
     only saves a checkpoint of its own as a fallback when the callback did
     not produce one (e.g. the monitored metric never logged), so it never
@@ -358,12 +362,19 @@ def run_training_job(
     has no artifact worth keeping. Callers distinguish a canceled run from a
     completed one by consulting ``should_stop`` again after this returns.
 
+    Export never fails the run. By the time it starts the checkpoint is already
+    published to ``output_dir``, and exports run in a child process (see
+    :func:`~training.export.run_exports_isolated`) so that neither a Python
+    exception nor a native crash in a backend's converter can lose it. Failed
+    backends are recorded in the export report and their partial output is
+    discarded; callers deliver the model with whatever exports succeeded.
+
     Before export, the trainer, datamodule, and their references back into the
     policy are dropped and accelerator memory is released (see
     :func:`_detach_trainer` and :func:`_release_memory`): the trainer's
-    optimizer state and dataloaders would otherwise stay resident throughout
-    export, and export conversion (OpenVINO in particular) can need several GB
-    on top of that.
+    optimizer state and dataloaders would otherwise stay resident while the
+    export child loads its own copy of the checkpoint, and export conversion
+    (OpenVINO in particular) can need several GB on top of that.
 
     Args:
         spec: What to train.
@@ -436,8 +447,16 @@ def run_training_job(
         _detach_trainer(policy, trainer)
         del trainer, datamodule, policy
         _release_memory()
-        export_policy = _export_policy(spec, output_dir)
-        _export(export_policy, output_dir, report, spec.export_backends)
+        export_report = run_exports_isolated(
+            _export_worker,
+            # run_options are runner-local; the child inherits HF_TOKEN from the environment.
+            (spec.model_copy(update={"run_options": RunOptions()}), str(output_dir)),
+            output_dir,
+            report=report,
+            should_stop=should_stop,
+        )
+        if (summary := export_report.summary()) is not None:
+            logger.warning("Training finished, but %s; the checkpoint is kept", summary)
 
 
 def _build_snapflow_callback(spec: TrainingJobSpec) -> Any:
@@ -628,8 +647,8 @@ def _backend_name(backend: Any) -> str:
     return backend.value if hasattr(backend, "value") else str(backend)
 
 
-def _export(policy: Policy, output_dir: Path, report: ReportFn, requested: list[str] | None = None) -> None:
-    """Export the policy to the requested backends, or to every one it supports.
+def _plan_exports(policy: Policy, requested: list[str] | None) -> list[Any]:
+    """Return the backends to export: the requested ones the policy supports, or all it supports.
 
     A requested backend the policy cannot produce is skipped rather than
     treated as an error: the caller asks for formats it wants, and which of
@@ -639,7 +658,7 @@ def _export(policy: Policy, output_dir: Path, report: ReportFn, requested: list[
 
     if not isinstance(policy, ExportablePolicyMixin):
         logger.info("Skipping export: policy does not support export backends")
-        return
+        return []
 
     supported = policy.get_supported_export_backends()
     backends = supported if requested is None else [b for b in supported if _backend_name(b) in requested]
@@ -650,23 +669,67 @@ def _export(policy: Policy, output_dir: Path, report: ReportFn, requested: list[
             logger.warning("Skipping unsupported export backends: %s", ", ".join(unsupported))
     if not backends:
         logger.info("Skipping export: no requested backend is supported by this policy")
-        return
+    return backends
 
-    for backend in backends:
-        name = _backend_name(backend)
+
+def _export_backend(
+    policy: ExportablePolicyMixin, output_dir: Path, backend: Any
+) -> tuple[ExportStatus, str | None, str | None]:
+    """Export to one backend, containing any Python exception it raises.
+
+    Returns:
+        ``(status, error, details)``: the outcome, a one-line reason when it
+        did not succeed, and a traceback for the log.
+    """
+    import traceback
+
+    try:
+        policy.export(output_dir / EXPORTS_DIRNAME / _backend_name(backend), backend=backend)
+    except ImportError as exc:
+        # An optional backend dependency is missing (e.g. executorch on xpu
+        # builds): the backend is unavailable here, not broken.
+        return ExportStatus.SKIPPED, f"optional dependency missing ({exc})", None
+    except Exception as exc:
+        return ExportStatus.FAILED, f"{type(exc).__name__}: {exc}", traceback.format_exc()
+    finally:
+        # Conversion peaks well above the model's resident size, so release
+        # after every backend, not just before the first one.
+        _release_memory()
+    return ExportStatus.SUCCEEDED, None, None
+
+
+def _export_worker(conn: Connection, skip: list[str], spec: TrainingJobSpec, output_dir: str) -> None:
+    """Export the selected checkpoint; the child-process side of :func:`run_exports_isolated`.
+
+    Speaks the :data:`~training.export.ExportWorker` protocol over ``conn``.
+    Reloads the checkpoint :func:`resolve_checkpoint` picks rather than
+    receiving the trained policy, so a crash here never touches the weights the
+    parent already published.
+    """
+    import faulthandler
+    import traceback
+
+    # Print the Python stack if a native converter crashes this process.
+    faulthandler.enable()
+    model_dir = Path(output_dir)
+    try:
         try:
-            logger.info("Exporting model to %s format", name)
-            report(99, f"Exporting to {name} format", {})
-            policy.export(output_dir / EXPORTS_DIRNAME / name, backend=backend)
-        except ImportError as exc:
-            # An optional backend dependency is missing (e.g. executorch on xpu
-            # builds). Skip it without a traceback so the run isn't mistaken
-            # for a failure; the remaining backends still export.
-            logger.warning("Skipping %s export: optional dependency missing (%s)", name, exc)
-        except Exception:
-            # Export is best-effort: one failing backend must not abort the job.
-            logger.exception("Failed exporting model to %s format", name)
-        finally:
-            # Conversion peaks well above the model's resident size, so release
-            # after every backend — not just before the first one.
-            _release_memory()
+            policy = _export_policy(spec, model_dir)
+        except Exception as exc:
+            conn.send(
+                ("error", f"could not reload the checkpoint ({type(exc).__name__}: {exc})", traceback.format_exc())
+            )
+            return
+        backends = _plan_exports(policy, spec.export_backends)
+        conn.send(("plan", [_backend_name(backend) for backend in backends]))
+        for backend in backends:
+            name = _backend_name(backend)
+            if name in skip:
+                continue
+            conn.send(("start", name))
+            # Planning returns backends only for an ExportablePolicyMixin.
+            status, error, details = _export_backend(cast("ExportablePolicyMixin", policy), model_dir, backend)
+            conn.send(("result", name, status.value, error, details))
+        conn.send(("done",))
+    finally:
+        conn.close()

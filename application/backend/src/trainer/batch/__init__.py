@@ -84,6 +84,7 @@ def run(storage: JobStorage, settings: BatchSettings, *, stop: threading.Event |
         reporter.finish(TrainerJobStatus.RUNNING, progress=0, message="Dataset ready")
 
         from training import run_training_job
+        from training.export import export_completion_message
 
         run_training_job(
             spec,
@@ -99,7 +100,11 @@ def run(storage: JobStorage, settings: BatchSettings, *, stop: threading.Event |
 
         model_archive = archive_model(settings.job_id, model_dir, report=reporter.report)
         storage.put_artifact(model_archive)
-        reporter.finish(TrainerJobStatus.COMPLETED, progress=100, message="Model uploaded")
+        reporter.finish(
+            TrainerJobStatus.COMPLETED,
+            progress=100,
+            message=export_completion_message(model_dir, "Model uploaded"),
+        )
         return EXIT_OK
     except Exception as exc:
         logger.opt(exception=True).error("Batch training failed")
