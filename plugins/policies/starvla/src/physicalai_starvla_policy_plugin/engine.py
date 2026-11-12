@@ -207,9 +207,28 @@ def _checkpoint(source: Run | str | Path) -> Path:
 
 
 def _device_env(device: str) -> dict[str, str]:
+    """Pin the worker to one GPU, treating ``cuda:N`` as an index into the caller's visible devices.
+
+    ``cuda:N`` is logical: with ``CUDA_VISIBLE_DEVICES=2,3`` already set, ``cuda:1`` is physical
+    GPU 3. Replacing the mask with ``N`` would move the worker onto a GPU the caller excluded.
+
+    Returns:
+        Worker environment overrides; empty to inherit the caller's devices.
+
+    Raises:
+        ValueError: If the device is not CUDA or the index is outside the caller's visible devices.
+    """
     if device in {"auto", "cuda", "gpu"}:
         return {}
-    if device.startswith("cuda:") and device.removeprefix("cuda:").isdigit():
-        return {"CUDA_VISIBLE_DEVICES": device.removeprefix("cuda:")}
-    msg = "StarVLA training requires a CUDA device."
-    raise ValueError(msg)
+    index = device.removeprefix("cuda:")
+    if not device.startswith("cuda:") or not index.isdigit():
+        msg = "StarVLA training requires a CUDA device."
+        raise ValueError(msg)
+    mask = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if mask is None:
+        return {"CUDA_VISIBLE_DEVICES": index}
+    visible = [entry.strip() for entry in mask.split(",") if entry.strip()]
+    if int(index) >= len(visible):
+        msg = f"{device} is outside CUDA_VISIBLE_DEVICES={mask!r}, which exposes {len(visible)} device(s)."
+        raise ValueError(msg)
+    return {"CUDA_VISIBLE_DEVICES": visible[int(index)]}

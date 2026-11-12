@@ -12,7 +12,9 @@ from pathlib import Path
 from physicalai.isolate import BundledProject, Environment, SyncProfile, prepare
 
 FRAMEWORK = "starvla"
+# Mirrors env/pyproject.toml and env/uv.lock; test_duplicated_pins_agree keeps them in sync.
 REVISION = "13d8ad43eb4128554c57227507055ecf9c3a62a2"
+STARVLA_VERSION = "1.0.1"
 PACKAGE = resources.files("physicalai_starvla_policy_plugin")
 SOURCE = BundledProject(PACKAGE / "env")
 ENVIRONMENT = Environment(source=SOURCE, profile=SyncProfile(python="3.10", extras=("cu128",)))
