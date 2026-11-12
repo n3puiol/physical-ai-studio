@@ -4,11 +4,12 @@
 """Engine discovery and native training/export routing without provisioning CUDA."""
 
 import json
+import tomllib
 from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
-from physicalai.engine import Engine, Run
+from physicalai.engine import Engine, Run, to_isolate_environment
 
 from physicalai_starvla_policy_plugin import engine, environments
 from physicalai_starvla_policy_plugin.package import ARTIFACT, RUN_INFO, IoSpec, load_descriptor
@@ -23,7 +24,60 @@ def test_entry_point_and_pins() -> None:
     assert len(environments.REVISION) == 40
 
 
+def test_duplicated_pins_agree() -> None:
+    """The commit, version and environment are declared in several places; keep them in sync."""
+    project = Path(str(environments.PACKAGE / "env"))
+    pyproject = tomllib.loads((project / "pyproject.toml").read_text())
+    lock = tomllib.loads((project / "uv.lock").read_text())
+    (starvla,) = [package for package in lock["package"] if package["name"] == "starvla"]
+
+    assert pyproject["tool"]["uv"]["sources"]["starvla"]["rev"] == environments.REVISION
+    assert starvla["source"]["git"].endswith(f"#{environments.REVISION}")
+    assert str(engine.WORKER_ENV.pinned()) == environments.STARVLA_VERSION
+    # Training (engine) and Runtime (isolate) must resolve to one cached worker environment.
+    assert to_isolate_environment(engine.WORKER_ENV, "cu128").key() == environments.ENVIRONMENT.key()
+
+
+@pytest.mark.parametrize(
+    ("mask", "device", "expected"),
+    [
+        (None, "cuda:2", {"CUDA_VISIBLE_DEVICES": "2"}),
+        ("1", "cuda:0", {"CUDA_VISIBLE_DEVICES": "1"}),
+        ("2,3", "cuda:1", {"CUDA_VISIBLE_DEVICES": "3"}),
+        ("GPU-aaa, GPU-bbb", "cuda:1", {"CUDA_VISIBLE_DEVICES": "GPU-bbb"}),
+        ("1", "cuda", {}),
+        ("1", "auto", {}),
+    ],
+)
+def test_cuda_index_selects_within_an_existing_device_mask(
+    monkeypatch: pytest.MonkeyPatch,
+    mask: str | None,
+    device: str,
+    expected: dict[str, str],
+) -> None:
+    """``cuda:N`` is a logical index, so it must index the caller's mask, not replace it."""
+    if mask is None:
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    else:
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", mask)
+
+    assert engine._device_env(device) == expected
+
+
+@pytest.mark.parametrize(("mask", "device"), [("1", "cuda:1"), ("", "cuda:0"), ("2,3", "cuda:2")])
+def test_cuda_index_outside_the_device_mask_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+    mask: str,
+    device: str,
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", mask)
+
+    with pytest.raises(ValueError, match="CUDA_VISIBLE_DEVICES"):
+        engine._device_env(device)
+
+
 def test_headless_settings_are_overridden_by_studio(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     config = tmp_path / "train.yaml"
     config.write_text("{}")
     runner = Mock(return_value=Run("starvla", tmp_path, None))
