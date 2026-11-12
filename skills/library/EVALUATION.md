@@ -176,6 +176,36 @@ Expected behavior:
 - Adds a clear error or docstring noting the missing support.
 - Cross-checks `references/executorch.md` and `references/export-contract.md`.
 
+## `physicalai-train-adding-a-vla`
+
+### Scenario 16: A VLA LeRobot already implements
+
+> "Add X-VLA support to Studio."
+
+Expected behavior:
+
+- Lists LeRobot's policy types (importing `lerobot.policies` first), finds `xvla`, and takes the LeRobot path instead of creating a plugin.
+- Follows `references/lerobot-path.md`: part A for `envs/xvla/`, part B for a 20-step run checked with `scripts/inspect_vla.py`.
+
+### Scenario 17: A VLA from its own repository
+
+> "Integrate OpenVLA from its GitHub repo so it trains and runs through Runtime."
+
+Expected behavior:
+
+- Confirms it is not a LeRobot policy type, then follows `references/repository-plugin.md`, copying from `plugins/policies/gr00t/`.
+- Uses `BundledProject` with a pinned git dependency when the repo has no `uv.lock`, keeps the plugin's host dependencies to Runtime/numpy/uv, and registers `physicalai.engines` and `physicalai.inference.adapters` entry points.
+- Implements the abstract `TrainingEngine` methods and a lazily registered Runtime adapter, with network/GPU tests opt-in.
+
+### Scenario 18: Choosing in-process or out-of-process inference
+
+> "The new VLA needs transformers 4.x but Runtime needs 5.x. How should its Runtime adapter work?"
+
+Expected behavior:
+
+- Chooses an out-of-process inference worker (GR00T pattern) over importing the framework in Runtime.
+- Mentions the two `_Worker` issues to fix when copying (`request()` failure leaves stale replies; `_stop()` must kill before closing pipes).
+
 ## Running the evaluations
 
 1. Reset the agent context between scenarios.

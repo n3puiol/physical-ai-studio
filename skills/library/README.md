@@ -13,6 +13,7 @@ Run commands from `library/` unless noted otherwise (`uv sync`, `uv run --no-syn
 | `physicalai-train-benchmarking-a-policy`    | `Benchmark(...).evaluate(...)`, `physicalai benchmark`, gym rollouts, `results.json`/`.csv`, adding a Benchmark. |
 | `physicalai-train-working-with-datasets`    | `LeRobotDataModule`, direct dataloader inspection, `repo_id`, format conversion, observation Features.           |
 | `physicalai-train-exporting-and-validating` | `policy.export(...)`, `physicalai export`, ONNX/OpenVINO/Torch/ExecuTorch, parity, the export/load contract.     |
+| `physicalai-train-adding-a-vla`             | Add a VLA: LeRobot engine path, or a new repository plugin modelled on GR00T (environment, engine, Runtime).     |
 
 New library skills must pass at least three scenarios in [`EVALUATION.md`](EVALUATION.md).
 
