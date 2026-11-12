@@ -77,7 +77,7 @@ worker.identity = lambda: {{"framework": "starvla", "package": "starvla", "versi
 worker.main()
 """)
     monkeypatch.setattr(environments, "INFER_WORKER", script)
-    monkeypatch.setattr(environments, "interpreter_path", lambda _: Path(sys.executable))
+    monkeypatch.setattr(environments, "interpreter_path", lambda *_: Path(sys.executable))
 
 
 def test_runtime_manifest_load_predict_reset(package: Path, fake_worker: None, observation: dict) -> None:

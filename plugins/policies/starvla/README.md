@@ -17,11 +17,20 @@ From `library/`:
 
 ```bash
 uv sync --extra starvla
-uv run physicalai engine prepare starvla --accelerator cu128
+uv run physicalai engine prepare starvla --policy QwenGR00T --accelerator cu128
 uv run physicalai train starvla --help
 ```
 
-The worker locks StarVLA to
+Each StarVLA framework has its own locked worker project under
+`src/physicalai_starvla_policy_plugin/envs/<name>/`, declared in `environments.POLICY_ENVIRONMENTS`
+and mapped through `StarVLAEngine.policy_envs`. Training, export and Runtime pick the environment
+from `framework.name` in the training YAML (a `framework.name=...` override wins), so frameworks
+with different dependencies never share a resolution. There is no default environment: a framework
+without an entry is rejected. To add one, copy `envs/qwengr00t/`, change its dependencies, lock it
+with `library/.venv/bin/uv lock --project <dir>`, and add a `PolicyEnvironment` entry;
+`test_duplicated_pins_agree` checks each entry against its project and lock.
+
+The QwenGR00T worker (`envs/qwengr00t/`) locks StarVLA to
 `13d8ad43eb4128554c57227507055ecf9c3a62a2`. Upstream's wheel includes its
 benchmark dataset registries and deployment wrapper. No downstream code patches
 are applied. Transformers 4.57.1 and PyTorch 2.7.1/torchvision 0.22.1 provide the

@@ -10,12 +10,14 @@ import shutil
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import environments
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
 BACKEND = "starvla"
-POLICY = "QwenGR00T"
 ARTIFACT = "policy.starvla"
 RUN_INFO = "physicalai_run.json"
 BACKBONE_DIR = "Qwen3-VL"
@@ -96,6 +98,26 @@ class IoSpec:
         return cls(**value)
 
 
+def framework_from_config(config_yaml: str | Path | None, overrides: Sequence[str] = ()) -> str | None:
+    """Return ``framework.name`` from a StarVLA YAML file, letting ``framework.name=...`` overrides win.
+
+    Returns:
+        The framework name, or ``None`` when neither the overrides nor the file set one.
+    """
+    for token in reversed(overrides):
+        key, _, value = token.removeprefix("--").partition("=")
+        if key == "framework.name" and value.strip():
+            return value.strip().strip("'\"")
+    if config_yaml is None:
+        return None
+    import yaml  # ruff: ignore[import-outside-top-level]  # Only needed when reading training configs.
+
+    data = yaml.safe_load(Path(config_yaml).expanduser().read_text(encoding="utf-8"))
+    framework = data.get("framework") if isinstance(data, dict) else None
+    name = framework.get("name") if isinstance(framework, dict) else None
+    return name if isinstance(name, str) and name else None
+
+
 def contained_file(root: Path, relative: object) -> Path:
     """Resolve a package file, rejecting absolute paths and symlink escapes.
 
@@ -129,11 +151,11 @@ def load_descriptor(artifact: Path) -> dict[str, Any]:
         not isinstance(descriptor, dict)
         or type(descriptor.get("format_version")) is not int
         or descriptor["format_version"] != 1
-        or descriptor.get("policy") != POLICY
+        or descriptor.get("policy") not in environments.POLICY_ENVIRONMENTS
     ):
         msg = "Unsupported StarVLA package descriptor."
         raise ValueError(msg)
-    if descriptor.get("environment") != environments.provenance():
+    if descriptor.get("environment") != environments.for_policy(descriptor["policy"]).provenance():
         msg = "StarVLA environment pins differ; install the plugin version that exported this package."
         raise ValueError(msg)
     if not isinstance(descriptor.get("unnorm_key"), str) or not descriptor["unnorm_key"]:
@@ -177,6 +199,7 @@ def write_package(
     run_dir = checkpoint.parents[1]
     for name in ("config.yaml", "dataset_statistics.json"):
         contained_file(run_dir, name)
+    spec = environments.for_policy(framework_from_config(run_dir / "config.yaml") or "")
     stats = json.loads((run_dir / "dataset_statistics.json").read_text())
     if not isinstance(stats, dict) or unnorm_key not in stats:
         msg = "unnorm_key is not present in the checkpoint's dataset statistics."
@@ -206,15 +229,15 @@ def write_package(
         _copy_backbone(backbone, artifact / BACKBONE_DIR)
         descriptor = {
             "format_version": 1,
-            "policy": POLICY,
-            "environment": environments.provenance(),
+            "policy": spec.policy,
+            "environment": spec.provenance(),
             "checkpoint": "model/checkpoints/model.safetensors",
             "unnorm_key": unnorm_key,
             "io": asdict(io),
         }
         (artifact / "package.json").write_text(json.dumps(descriptor, indent=2) + "\n")
         load_descriptor(artifact)
-        _write_manifest(staged)
+        _write_manifest(staged, spec.policy)
         staged.rename(output)
     return output
 
@@ -233,7 +256,7 @@ def _copy_backbone(source: Path, destination: Path) -> None:
         shutil.copy2(resolved, target)
 
 
-def _write_manifest(package: Path) -> None:
+def _write_manifest(package: Path, policy: str) -> None:
     from physicalai.inference.manifest import (  # ruff: ignore[import-outside-top-level]  # Packaging-only Runtime imports.
         ComponentSpec,
         Manifest,
@@ -244,7 +267,7 @@ def _write_manifest(package: Path) -> None:
     )
 
     Manifest(
-        policy=PolicySpec(name=POLICY, source=PolicySource()),
+        policy=PolicySpec(name=policy, source=PolicySource()),
         model=ModelSpec(
             artifacts={BACKEND: ARTIFACT},
             callbacks=[

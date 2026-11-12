@@ -68,13 +68,14 @@ class StarVLARuntimeAdapter(RuntimeAdapter):
         artifact = Path(model_path).expanduser().resolve(strict=True)
         descriptor = load_descriptor(artifact)
         io = IoSpec.from_dict(descriptor["io"])
-        worker = _Worker(environments.interpreter_path(self._interpreter))
+        spec = environments.for_policy(descriptor["policy"])
+        worker = _Worker(environments.interpreter_path(spec, self._interpreter))
         try:
             hello = worker.request({"op": "hello"})
             if (
                 hello.get("framework") != "starvla"
                 or hello.get("package") != "starvla"
-                or hello.get("version") != environments.STARVLA_VERSION
+                or hello.get("version") != spec.version
             ):
                 msg = "Worker is not the pinned StarVLA distribution."
                 raise RuntimeError(msg)  # ruff: ignore[raise-within-try]  # Failed handshakes must close the worker.
