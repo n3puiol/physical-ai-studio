@@ -176,6 +176,66 @@ Expected behavior:
 - Adds a clear error or docstring noting the missing support.
 - Cross-checks `references/executorch.md` and `references/export-contract.md`.
 
+## `physicalai-train-training-a-lerobot-vla`
+
+### Scenario 16: Fine-tune a Hub VLA on a single-camera dataset
+
+> "Fine-tune `lerobot/smolvla_base` on `lerobot/pusht` with the LeRobot engine. Just make sure it trains."
+
+Expected behavior:
+
+- Runs `scripts/inspect_vla.py lerobot/smolvla_base lerobot/pusht` and uses its `--rename_map={"observation.image": "observation.images.camera1"}`.
+- Prepares the `smolvla` environment with `physicalai engine prepare lerobot --policy smolvla`.
+- Runs a 20-step smoke run with `--policy.push_to_hub=false` before suggesting a long run, and checks `checkpoints/000020/pretrained_model/` exists.
+
+### Scenario 17: Training dies on Intel XPU
+
+> "My `pai train lerobot --policy.path=lerobot/smolvla_base ...` run on the Intel GPU dies after a minute with UR_RESULT_ERROR_DEVICE_LOST."
+
+Expected behavior:
+
+- Finds the row in `references/troubleshooting.md` and sets `UR_L0_V2_FORCE_DISABLE_COPY_OFFLOAD=1`.
+- Resumes from the last checkpoint with `--config_path=.../train_config.json --resume=true` instead of restarting.
+
+### Scenario 18: Evaluate a trained checkpoint
+
+> "Evaluate my engine-trained SmolVLA checkpoint on PushT and tell me if it learned anything."
+
+Expected behavior:
+
+- Runs `scripts/eval_pusht.py native <run>/checkpoints/last/pretrained_model --episodes 50`.
+- Compares `avg_max_reward` with the hold-still baseline (~0.14) rather than only `pc_success`.
+
+## `physicalai-train-adding-a-lerobot-policy-env`
+
+### Scenario 19: A LeRobot VLA fails on a missing import
+
+> "`pai train lerobot --policy.type=eo1 ...` fails with `ModuleNotFoundError: No module named 'qwen_vl_utils'`. Fix it properly."
+
+Expected behavior:
+
+- Identifies that `eo1` has no family environment and adds `envs/eo1/` with `lerobot[training,eo1]`, seeded from `env/uv.lock` and locked with `library/.venv/bin/uv lock --project ...`.
+- Maps `"eo1"` in `LeRobotEngine.policy_envs` and updates the packaging and engine tests.
+- Does not add `qwen-vl-utils` to the default `env/` project.
+
+### Scenario 20: Add a VLA whose type and extra names differ
+
+> "Give `vla_jepa` its own worker environment."
+
+Expected behavior:
+
+- Uses the `vla-jepa` extra for the `vla_jepa` policy type, and names the environment directory and `_worker_env("...")` consistently.
+- Runs `physicalai engine prepare lerobot --policy vla_jepa` and an in-environment import check.
+
+### Scenario 21: Keep packaging correct
+
+> "I added `envs/xvla/`; make sure it ships in the plugin wheel."
+
+Expected behavior:
+
+- Builds the wheel and lists `physicalai_lerobot_policy_plugin/envs/xvla/` in it.
+- Does not add `envs/` to hatch `force-include` (duplicate-file build error).
+
 ## Running the evaluations
 
 1. Reset the agent context between scenarios.
