@@ -8,7 +8,7 @@ count and a memory estimate, the checkpoint's and the dataset's camera keys, and
 ``--rename_map``. Reads only metadata (config.json, safetensors headers, dataset info).
 
 Usage (from library/):
-    .venv/bin/python ../skills/library/physicalai-train-training-a-lerobot-vla/scripts/inspect_vla.py \
+    .venv/bin/python ../skills/library/physicalai-train-adding-a-vla/scripts/inspect_vla.py \
         lerobot/smolvla_base lerobot/pusht
 """
 

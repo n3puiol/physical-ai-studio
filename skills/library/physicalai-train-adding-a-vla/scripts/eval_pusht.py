@@ -13,7 +13,7 @@ Reference points (SmolVLA from lerobot/smolvla_base, 10k steps, batch 8): native
 Protocol: PushTGym(obs_type="pixels_agent_pos"), seeds start..start+N-1, 300 max steps.
 Reports pc_success and avg_max_reward (max coverage, the Diffusion Policy PushT metric).
 
-Usage (from library/; SKILL is skills/library/physicalai-train-training-a-lerobot-vla):
+Usage (from library/; SKILL is skills/library/physicalai-train-adding-a-vla):
   .venv/bin/python ../$SKILL/scripts/eval_pusht.py native <run>/checkpoints/last/pretrained_model
   .venv/bin/python ../$SKILL/scripts/eval_pusht.py first-party <run>/.../last.ckpt
 """
