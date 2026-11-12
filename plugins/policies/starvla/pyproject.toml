@@ -24,16 +24,8 @@ starvla = "physicalai_starvla_policy_plugin.inference:register"
 [tool.hatch.build.targets.wheel]
 packages = ["src/physicalai_starvla_policy_plugin"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"src/physicalai_starvla_policy_plugin/env/pyproject.toml" = "physicalai_starvla_policy_plugin/env/pyproject.toml"
-"src/physicalai_starvla_policy_plugin/env/uv.lock" = "physicalai_starvla_policy_plugin/env/uv.lock"
-
 [tool.hatch.build.targets.sdist]
 include = ["/README.md", "/pyproject.toml", "/configs/**", "/src/physicalai_starvla_policy_plugin/**", "/tests/**"]
-
-[tool.hatch.build.targets.sdist.force-include]
-"src/physicalai_starvla_policy_plugin/env/pyproject.toml" = "src/physicalai_starvla_policy_plugin/env/pyproject.toml"
-"src/physicalai_starvla_policy_plugin/env/uv.lock" = "src/physicalai_starvla_policy_plugin/env/uv.lock"
 
 [tool.uv.sources]
 physicalai = { git = "https://github.com/samet-akcay/physicalai", branch = "feat/physicalai-isolate" }

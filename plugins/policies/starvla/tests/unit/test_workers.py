@@ -29,7 +29,7 @@ def train_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNames
     monkeypatch.setattr(worker, "identity", lambda: {"framework": "starvla", "package": "starvla", "version": "1.0.1"})
     monkeypatch.setattr(worker, "disable_remote_code", lambda: None)
     monkeypatch.setattr(worker, "start_cancel_listener", lambda: cancelled)
-    monkeypatch.setenv("PHYSICALAI_STARVLA_PROVENANCE", json.dumps(environments.provenance()))
+    monkeypatch.setenv("PHYSICALAI_STARVLA_PROVENANCE", json.dumps(environments.QWENGR00T.provenance()))
     backbone = tmp_path / "Qwen3-VL"
     backbone.mkdir()
     (backbone / "config.json").write_text('{"model_type": "qwen3_vl"}')
@@ -82,7 +82,7 @@ def test_training_events_and_record(train_worker: SimpleNamespace) -> None:
     assert train_worker.trainer._train_step is original_step
     assert train_worker.cfg.trainer.save_format == "safetensors"
     record = json.loads((output / "physicalai_run.json").read_text())
-    assert record["environment"] == environments.provenance()
+    assert record["environment"] == environments.QWENGR00T.provenance()
     assert record["unnorm_key"] == "franka"
     assert (output / "config.yaml").read_text() == "full config"
 

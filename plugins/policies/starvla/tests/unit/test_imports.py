@@ -18,7 +18,7 @@ class BlockTraining(importlib.abc.MetaPathFinder):
 sys.meta_path.insert(0, BlockTraining())
 from physicalai.inference import InferenceModel
 from physicalai_starvla_policy_plugin import environments, inference, package, runtime
-assert environments.provenance()["revision"]
+assert environments.QWENGR00T.provenance()["revision"]
 assert runtime.StarVLARuntimeAdapter().output_names == ["action"]
 """
     result = subprocess.run(  # ruff: ignore[subprocess-without-shell-equals-true]  # No untrusted arguments.
