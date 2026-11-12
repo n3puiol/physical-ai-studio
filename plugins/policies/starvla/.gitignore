@@ -1,0 +1,2 @@
+# The locked worker is source, not a local virtual environment.
+!src/physicalai_starvla_policy_plugin/env/
