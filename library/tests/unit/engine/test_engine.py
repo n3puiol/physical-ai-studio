@@ -288,7 +288,7 @@ def test_policy_without_any_environment_is_reported(tmp_path: Path) -> None:
         policy_envs: ClassVar[Mapping[str, WorkerEnv]] = {"smol": _policy_env(tmp_path, "smol")}
 
     assert _OnlyPolicyEnv.environment_for_policy("smol").name == "smol"
-    with pytest.raises(ValueError, match="does not use a managed worker environment"):
+    with pytest.raises(ValueError, match="no default worker environment; choose a policy: smol"):
         _OnlyPolicyEnv.environment_for_policy("tiny")
 
 
