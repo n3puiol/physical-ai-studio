@@ -143,7 +143,11 @@ class Engine(ABC):
         """
         if name is None:
             if cls.env is None:
-                msg = f"Engine {cls.framework!r} does not use a managed worker environment."
+                if cls.policy_envs:
+                    policies = ", ".join(sorted(cls.policy_envs))
+                    msg = f"Engine {cls.framework!r} has no default worker environment; choose a policy: {policies}."
+                else:
+                    msg = f"Engine {cls.framework!r} does not use a managed worker environment."
                 raise ValueError(msg)
             return cls.env
         for enablement in cls.enablements:

@@ -1,0 +1,25 @@
+{
+  "cameras": {
+    "video.primary_image": "front",
+    "video.wrist_image": "wrist"
+  },
+  "state": {
+    "state.x": [0, 1],
+    "state.y": [1, 2],
+    "state.z": [2, 3],
+    "state.roll": [3, 4],
+    "state.pitch": [4, 5],
+    "state.yaw": [5, 6],
+    "state.pad": [6, 7],
+    "state.gripper": [7, 8]
+  },
+  "action": {
+    "action.x": [0, 1],
+    "action.y": [1, 2],
+    "action.z": [2, 3],
+    "action.roll": [3, 4],
+    "action.pitch": [4, 5],
+    "action.yaw": [5, 6],
+    "action.gripper": [6, 7]
+  }
+}
