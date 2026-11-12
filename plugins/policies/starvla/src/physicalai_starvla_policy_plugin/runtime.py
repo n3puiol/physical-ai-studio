@@ -74,7 +74,7 @@ class StarVLARuntimeAdapter(RuntimeAdapter):
             if (
                 hello.get("framework") != "starvla"
                 or hello.get("package") != "starvla"
-                or hello.get("version") != "1.0.1"
+                or hello.get("version") != environments.STARVLA_VERSION
             ):
                 msg = "Worker is not the pinned StarVLA distribution."
                 raise RuntimeError(msg)  # ruff: ignore[raise-within-try]  # Failed handshakes must close the worker.
