@@ -17,9 +17,10 @@ class BlockTraining(importlib.abc.MetaPathFinder):
             raise AssertionError("Runtime imported training dependency: " + fullname)
 sys.meta_path.insert(0, BlockTraining())
 from physicalai.inference import InferenceModel
-from physicalai_starvla_policy_plugin import environments, inference, package, runtime
+from physicalai_starvla_policy_plugin import environments, inference, openvino_runtime, package, runtime
 assert environments.QWENGR00T.provenance()["revision"]
 assert runtime.StarVLARuntimeAdapter().output_names == ["action"]
+assert openvino_runtime.StarVLAOpenVINOAdapter().default_device() == "CPU"
 """
     result = subprocess.run(  # ruff: ignore[subprocess-without-shell-equals-true]  # No untrusted arguments.
         [sys.executable, "-c", code],

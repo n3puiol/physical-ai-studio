@@ -1,0 +1,39 @@
+[project]
+name = "physicalai-starvla-openvino-export-worker"
+version = "0.0.0"
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "starvla==1.0.1",
+    "transformers==4.57.1",
+    "accelerate==1.5.2",
+    "numpy==1.26.4",
+    "pydantic==2.10.6",
+    "numpydantic==1.6.9",
+    "pyarrow==14.0.1",
+    "av==12.3.0",
+    "albumentations==1.4.18",
+    "pipablepytorch3d==0.7.6",
+    "omegaconf>=2.3,<2.4",
+    "qwen-vl-utils",
+    "diffusers>=0.35,<0.36",
+    "einops", "scipy", "pandas", "pillow", "tqdm", "rich", "wandb", "timm",
+    # OpenVINO export only: IR conversion and optional INT8 weight compression.
+    "openvino==2026.4.1",
+    "nncf>=2.19",
+]
+
+[project.optional-dependencies]
+cu128 = ["torch==2.7.1", "torchvision==0.22.1"]
+
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+starvla = { git = "https://github.com/starVLA/starVLA", rev = "13d8ad43eb4128554c57227507055ecf9c3a62a2" }
+torch = { index = "pytorch-cu128", extra = "cu128" }
+torchvision = { index = "pytorch-cu128", extra = "cu128" }

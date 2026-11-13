@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from physicalai.engine import Run, TrainingEngine, WorkerEnv, run_worker
 
 from . import environments
+from .openvino_package import write_openvino_package
 from .package import RUN_INFO, IoSpec, framework_from_config, write_package
 
 if TYPE_CHECKING:
@@ -57,7 +58,7 @@ class StarVLAEngine(TrainingEngine):
         {policy: _worker_env(spec) for policy, spec in environments.POLICY_ENVIRONMENTS.items()},
     )
     training_accelerators: ClassVar[tuple[str, ...]] = (environments.ACCELERATOR,)
-    stock_export_formats: ClassVar[tuple[str, ...]] = ("native",)
+    stock_export_formats: ClassVar[tuple[str, ...]] = ("native", "openvino")
 
     @classmethod
     def cli(cls, argv: Sequence[str], *, interpreter: str | Path | None = None) -> int:
@@ -135,8 +136,10 @@ class StarVLAEngine(TrainingEngine):
     def export(cls, source: Run | str | Path, output_path: str | Path, backend: str | None = "native") -> Path:
         """Export using physicalai_run.json and an explicit io.json beside the run.
 
-        Use export_native for checkpoints trained outside the plugin or to supply
-        a different robot mapping or materialized local backbone.
+        ``backend="openvino"`` converts on CPU in the locked OpenVINO export environment with
+        fp16 weights and the camera resolution of the training dataset. Use export_native for
+        checkpoints trained outside the plugin, a different robot mapping, backbone, camera
+        resolution, or OpenVINO weight format.
 
         Returns:
             Runtime package directory.
@@ -170,17 +173,37 @@ class StarVLAEngine(TrainingEngine):
         io: IoSpec,
         unnorm_key: str,
         backend: str | None = "native",
+        openvino_weights: str = "fp16",
+        image_size: tuple[int, int] | None = None,
+        interpreter: str | Path | None = None,
     ) -> Path:
-        """Package native weights, normalization, robot mapping, and the local backbone.
+        """Package native weights, or convert them to OpenVINO, with normalization and robot mapping.
+
+        ``native`` copies the checkpoint and local backbone for the isolated CUDA worker.
+        ``openvino`` converts in the locked export environment (``interpreter`` overrides it) and
+        validates against PyTorch; the package then runs in-process on any OpenVINO device.
+        ``openvino_weights`` is one of ``fp32``, ``fp16`` or ``int8``. ``image_size`` (height,
+        width) fixes the camera resolution; by default it is read from the training dataset.
 
         Returns:
             Runtime package directory.
 
         Raises:
-            ValueError: If the requested backend is not native.
+            ValueError: If the requested backend is unsupported.
         """
+        if backend == "openvino":
+            return write_openvino_package(
+                _checkpoint(source),
+                Path(output_path),
+                backbone=Path(backbone_path),
+                io=io,
+                unnorm_key=unnorm_key,
+                weights=openvino_weights,
+                image_size=image_size,
+                interpreter=interpreter,
+            )
         if backend not in {None, "native"}:
-            msg = "StarVLA supports native Runtime packages only."
+            msg = "StarVLA exports native or openvino Runtime packages."
             raise ValueError(msg)
         return write_package(
             _checkpoint(source),
