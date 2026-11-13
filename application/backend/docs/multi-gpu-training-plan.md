@@ -189,6 +189,12 @@ Manual: start the service from the branch (`uv run --no-sync physicalai-trainer`
 curl to `POST /jobs` with `all_devices: true`. Upload the dataset as Studio does, then check the
 job reaches `COMPLETED` and `GET /jobs/<id>` shows progress.
 
+**Result (2026-11-13, 2× RTX 3090, ACT, batch 32/GPU, 1 epoch):** Step 4 run by hand under torchrun
+and Step 5 through the trainer API (`POST /jobs`, streamed `PUT /dataset` with `curl -T`) both
+completed; the archive held `model.ckpt` and `exports/torch`, and `ddp/`, `datasets/`, `cache/` were
+empty afterwards. A cancel sent right after upload ended the job `canceled` with no process, GPU
+memory, or files left behind. Not yet exercised: a cancel mid-epoch.
+
 ---
 
 ## Step 6 — Studio backend: request plumbing
