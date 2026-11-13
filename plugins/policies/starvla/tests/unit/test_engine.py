@@ -25,21 +25,41 @@ def test_entry_point_and_pins() -> None:
     assert len(environments.QWENGR00T.revision) == 40
 
 
-@pytest.mark.parametrize("spec", list(environments.POLICY_ENVIRONMENTS.values()), ids=lambda spec: spec.policy)
+@pytest.mark.parametrize(
+    "spec",
+    [*environments.POLICY_ENVIRONMENTS.values(), *environments.OPENVINO_EXPORT_ENVIRONMENTS.values()],
+    ids=lambda spec: spec.name,
+)
 def test_duplicated_pins_agree(spec: environments.PolicyEnvironment) -> None:
     """Each framework's commit, version and environment are declared in several places; keep them in sync."""
     project = Path(str(spec.project))
     pyproject = tomllib.loads((project / "pyproject.toml").read_text())
     lock = tomllib.loads((project / "uv.lock").read_text())
     (starvla,) = [package for package in lock["package"] if package["name"] == "starvla"]
-    env = engine.StarVLAEngine.environment_for_policy(spec.policy)
-
-    assert project.name == spec.name == env.name
+    assert project.name == spec.name
     assert pyproject["tool"]["uv"]["sources"]["starvla"]["rev"] == spec.revision
     assert starvla["source"]["git"].endswith(f"#{spec.revision}")
-    assert str(env.pinned()) == spec.version
-    # Training (engine) and Runtime (isolate) must resolve to one cached worker environment.
-    assert to_isolate_environment(env, "cu128").key() == spec.environment.key()
+    assert starvla["version"] == spec.version
+    if spec.policy in engine.StarVLAEngine.policy_envs and spec is environments.POLICY_ENVIRONMENTS[spec.policy]:
+        env = engine.StarVLAEngine.environment_for_policy(spec.policy)
+        assert env.name == spec.name
+        assert str(env.pinned()) == spec.version
+        # Training (engine) and Runtime (isolate) must resolve to one cached worker environment.
+        assert to_isolate_environment(env, "cu128").key() == spec.environment.key()
+
+
+def test_openvino_export_environment_only_adds_the_converter() -> None:
+    """Every package shared with the training environment keeps its locked version."""
+    for policy, export in environments.OPENVINO_EXPORT_ENVIRONMENTS.items():
+        train = environments.POLICY_ENVIRONMENTS[policy]
+        locks = [
+            {p["name"]: p["version"] for p in tomllib.loads((Path(str(s.project)) / "uv.lock").read_text())["package"]}
+            for s in (train, export)
+        ]
+        shared = set(locks[0]) & set(locks[1])
+        assert {name for name in shared if locks[0][name] != locks[1][name]} == set()
+        assert {"openvino", "nncf"} <= set(locks[1]) - set(locks[0])
+        assert set(locks[0]) - set(locks[1]) == {"physicalai-starvla-worker"}
 
 
 def test_each_framework_has_its_own_environment_and_no_default() -> None:
@@ -179,14 +199,14 @@ def test_export_from_run(checkpoint: Path, backbone: Path, io: IoSpec, tmp_path:
     )
     exported = engine.StarVLAEngine.export(Run("starvla", root, checkpoint), tmp_path / "out")
     assert load_descriptor(exported / ARTIFACT)["unnorm_key"] == "franka"
-    with pytest.raises(ValueError, match="native"):
+    with pytest.raises(ValueError, match="native or openvino"):
         engine.StarVLAEngine.export_native(
             checkpoint,
-            tmp_path / "ov",
+            tmp_path / "onnx",
             backbone_path=backbone,
             io=io,
             unnorm_key="franka",
-            backend="openvino",
+            backend="onnx",
         )
 
 

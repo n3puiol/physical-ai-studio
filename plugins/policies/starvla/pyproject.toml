@@ -40,3 +40,5 @@ src = ["src", "tests"]
 "src/physicalai_starvla_policy_plugin/_worker/*.py" = ["implicit-namespace-package", "print", "import-outside-top-level"]
 # Upstream exposes no public callbacks; hooks wrap its pinned trainer methods.
 "src/physicalai_starvla_policy_plugin/_worker/starvla_train_worker.py" = ["private-member-access"]
+# Converts untyped upstream torch/StarVLA objects and reads their private normalizer and wrapper state.
+"src/physicalai_starvla_policy_plugin/_worker/starvla_openvino_export.py" = ["any-type", "private-member-access", "import-private-name"]

@@ -25,6 +25,7 @@ FRAMEWORK = "starvla"
 PACKAGE = resources.files("physicalai_starvla_policy_plugin")
 TRAIN_WORKER = PACKAGE / "_worker" / "starvla_train_worker.py"
 INFER_WORKER = PACKAGE / "_worker" / "starvla_infer_worker.py"
+OPENVINO_EXPORT_WORKER = PACKAGE / "_worker" / "starvla_openvino_export.py"
 PYTHON = "3.10"
 ACCELERATOR = "cu128"
 
@@ -73,6 +74,16 @@ QWENGR00T = PolicyEnvironment(
 )
 POLICY_ENVIRONMENTS: dict[str, PolicyEnvironment] = {QWENGR00T.policy: QWENGR00T}
 
+# Conversion only: the training project plus OpenVINO and NNCF, with every shared package at the
+# same locked version. Kept separate so adding the converter never changes training pins.
+QWENGR00T_OPENVINO = PolicyEnvironment(
+    policy="QwenGR00T",
+    name="qwengr00t-openvino",
+    revision=QWENGR00T.revision,
+    version=QWENGR00T.version,
+)
+OPENVINO_EXPORT_ENVIRONMENTS: dict[str, PolicyEnvironment] = {QWENGR00T_OPENVINO.policy: QWENGR00T_OPENVINO}
+
 
 def for_policy(policy: str | None) -> PolicyEnvironment:
     """Return the worker environment for a StarVLA framework.
@@ -91,6 +102,22 @@ def for_policy(policy: str | None) -> PolicyEnvironment:
         return POLICY_ENVIRONMENTS[policy]
     supported = ", ".join(sorted(POLICY_ENVIRONMENTS))
     msg = f"StarVLA framework {policy!r} has no worker environment; supported: {supported}."
+    raise ValueError(msg)
+
+
+def for_openvino_export(policy: str) -> PolicyEnvironment:
+    """Return the OpenVINO conversion environment for a StarVLA framework.
+
+    Returns:
+        The framework's export environment declaration.
+
+    Raises:
+        ValueError: If the framework has no OpenVINO export.
+    """
+    if policy in OPENVINO_EXPORT_ENVIRONMENTS:
+        return OPENVINO_EXPORT_ENVIRONMENTS[policy]
+    supported = ", ".join(sorted(OPENVINO_EXPORT_ENVIRONMENTS))
+    msg = f"StarVLA framework {policy!r} has no OpenVINO export; supported: {supported}."
     raise ValueError(msg)
 
 

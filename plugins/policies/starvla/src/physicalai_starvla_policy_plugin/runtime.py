@@ -26,6 +26,8 @@ from .package import IoSpec, load_descriptor
 if TYPE_CHECKING:
     from physicalai.inference.model import InferenceModel
 
+    from .openvino_runtime import StarVLAOpenVINOAdapter
+
 _VECTOR_BATCH_RANK = 2
 _IMAGE_RANK = 3
 _BATCHED_IMAGE_RANK = 4
@@ -128,20 +130,24 @@ class StarVLARuntimeAdapter(RuntimeAdapter):
 
 
 class StarVLAResetCallback(Callback):
-    """Forward Runtime episode resets to the StarVLA adapter."""
+    """Forward Runtime episode resets to a StarVLA adapter (native worker or OpenVINO)."""
 
     def __init__(self) -> None:
         """Create an unbound callback."""
-        self._adapter: StarVLARuntimeAdapter | None = None
+        self._adapter: StarVLARuntimeAdapter | StarVLAOpenVINOAdapter | None = None
 
     def on_load(self, model: InferenceModel) -> None:
-        """Bind only to this plugin's adapter.
+        """Bind only to this plugin's adapters.
 
         Raises:
             TypeError: If Runtime loaded a different adapter.
         """
-        if not isinstance(model.adapter, StarVLARuntimeAdapter):
-            msg = "StarVLA reset callback requires the StarVLA Runtime adapter."
+        from .openvino_runtime import (  # ruff: ignore[import-outside-top-level]  # openvino_runtime imports this module.
+            StarVLAOpenVINOAdapter,
+        )
+
+        if not isinstance(model.adapter, (StarVLARuntimeAdapter, StarVLAOpenVINOAdapter)):
+            msg = "StarVLA reset callback requires a StarVLA Runtime adapter."
             raise TypeError(msg)
         self._adapter = model.adapter
 
