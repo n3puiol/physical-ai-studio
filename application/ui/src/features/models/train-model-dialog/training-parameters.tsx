@@ -60,6 +60,8 @@ interface TrainingParametersProps {
     onAugmentImagesChange: (value: boolean) => void;
     isAutoScaleBatchDisabled: boolean;
     deviceType: string | undefined;
+    /** GPUs training together; above 1 the batch size is per GPU. */
+    deviceCount?: number;
     /** False for policies without a LoRA/DoRA mixin; hides the LoRA controls entirely. */
     isLoraSupported: boolean;
     loraEnabled: boolean;
@@ -98,6 +100,7 @@ export const TrainingParameters = ({
     onAugmentImagesChange,
     isAutoScaleBatchDisabled,
     deviceType,
+    deviceCount = 1,
     isLoraSupported,
     loraEnabled,
     onLoraEnabledChange,
@@ -163,6 +166,12 @@ export const TrainingParameters = ({
                 </Flex>
             </Flex>
         </Flex>
+        {deviceCount > 1 && !autoScaleBatchSize && (
+            <Text>
+                Batch size is per GPU: each training step uses {(batchSize * deviceCount).toLocaleString()} samples
+                across {deviceCount} GPUs. Training on all GPUs does not support Auto batch size.
+            </Text>
+        )}
         <Flex direction='row' gap='size-150' width='100%'>
             <NumberField
                 label='Max Epochs'
