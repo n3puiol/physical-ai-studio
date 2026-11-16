@@ -3770,6 +3770,31 @@ requires-dist = [
 provides-extras = ["train", "tests"]
 
 [[package]]
+name = "physicalai-starvla-policy-plugin"
+version = "0.1.0"
+source = { editable = "../plugins/policies/starvla" }
+dependencies = [
+    { name = "numpy" },
+    { name = "physicalai" },
+    { name = "uv" },
+]
+
+[package.optional-dependencies]
+train = [
+    { name = "physicalai-train" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "numpy", specifier = ">=1.26" },
+    { name = "physicalai", git = "https://github.com/samet-akcay/physicalai?branch=feat%2Fphysicalai-isolate" },
+    { name = "physicalai-train", marker = "extra == 'train'", editable = "." },
+    { name = "pytest", marker = "extra == 'tests'", specifier = ">=9.0.3" },
+    { name = "uv", specifier = ">=0.10,<0.11" },
+]
+provides-extras = ["train", "tests"]
+
+[[package]]
 name = "physicalai-train"
 version = "0.3.0"
 source = { editable = "." }
@@ -3888,6 +3913,9 @@ smolvla = [
     { name = "safetensors" },
     { name = "transformers" },
 ]
+starvla = [
+    { name = "physicalai-starvla-policy-plugin", extra = ["train"] },
+]
 tests = [
     { name = "diffusers" },
     { name = "httpx" },
@@ -3947,6 +3975,7 @@ requires-dist = [
     { name = "physicalai", git = "https://github.com/samet-akcay/physicalai?branch=feat%2Fphysicalai-isolate" },
     { name = "physicalai-gr00t-policy-plugin", extras = ["train"], marker = "extra == 'gr00t'", editable = "../plugins/policies/gr00t" },
     { name = "physicalai-lerobot-policy-plugin", extras = ["train"], marker = "extra == 'lerobot'", editable = "../plugins/policies/lerobot" },
+    { name = "physicalai-starvla-policy-plugin", extras = ["train"], marker = "extra == 'starvla'", editable = "../plugins/policies/starvla" },
     { name = "physicalai-train", extras = ["cosmos3"], marker = "extra == 'policies'" },
     { name = "physicalai-train", extras = ["diffusion"], marker = "extra == 'policies'" },
     { name = "physicalai-train", extras = ["lerobot"], marker = "extra == 'all'" },
@@ -3993,7 +4022,7 @@ requires-dist = [
     { name = "uv", specifier = ">=0.10,<0.11" },
     { name = "wandb", marker = "extra == 'loggers'", specifier = ">=0.22" },
 ]
-provides-extras = ["cpu", "cu128", "xpu", "tests", "loggers", "libero", "lerobot", "gr00t", "diffusion", "pi05", "smolvla", "molmoact2", "rldx1", "cosmos3", "nncf", "xr0", "executorch", "executorch-openvino", "policies", "all"]
+provides-extras = ["cpu", "cu128", "xpu", "tests", "loggers", "libero", "lerobot", "gr00t", "starvla", "diffusion", "pi05", "smolvla", "molmoact2", "rldx1", "cosmos3", "nncf", "xr0", "executorch", "executorch-openvino", "policies", "all"]
 
 [package.metadata.requires-dev]
 dev = [
