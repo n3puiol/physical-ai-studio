@@ -78,11 +78,41 @@ class TestTrainingJobSpec:
         with pytest.raises(ValidationError):
             TrainingJobSpec(policy="act", all_devices=True, **invalid)
 
+    def test_device_indices_are_accepted_for_cuda_and_sorted(self) -> None:
+        spec = TrainingJobSpec(policy="act", device_type="cuda", device_indices=[3, 0, 2])
+
+        assert spec.device_indices == [0, 2, 3]
+        assert spec.is_multi_device
+        assert TrainingJobSpec.model_validate_json(spec.model_dump_json()) == spec
+
+    @pytest.mark.parametrize(
+        "invalid",
+        [
+            {"device_type": "xpu", "device_indices": [0, 1]},
+            {"device_type": None, "device_indices": [0, 1]},
+            {"device_type": "cuda", "device_indices": [0]},
+            {"device_type": "cuda", "device_indices": []},
+            {"device_type": "cuda", "device_indices": [0, 0]},
+            {"device_type": "cuda", "device_indices": [-1, 0]},
+            {"device_type": "cuda", "device_indices": [0, 1], "device_index": 0},
+            {"device_type": "cuda", "device_indices": [0, 1], "all_devices": True},
+            {"device_type": "cuda", "device_indices": [0, 1], "auto_scale_batch_size": True},
+        ],
+    )
+    def test_device_indices_rejects_combinations_it_cannot_honour(self, invalid: dict) -> None:
+        with pytest.raises(ValidationError):
+            TrainingJobSpec(policy="act", **invalid)
+
+    def test_single_device_specs_are_not_multi_device(self) -> None:
+        assert not TrainingJobSpec(policy="act", device_type="cuda", device_index=1).is_multi_device
+        assert TrainingJobSpec(policy="act", device_type="cuda", all_devices=True).is_multi_device
+
     def test_a_spec_without_all_devices_still_parses(self) -> None:
         """Older Studios send no ``all_devices``; the trainer must keep accepting them."""
         spec = TrainingJobSpec.model_validate_json('{"policy": "act", "device_type": "cuda", "device_index": 0}')
 
         assert spec.all_devices is False
+        assert spec.device_indices is None
 
     def test_unknown_field_is_rejected(self) -> None:
         """A stray field over the wire is a version mismatch, not a value to drop."""
@@ -479,6 +509,13 @@ class TestRunTrainingJob:
             "ddp_find_unused_parameters_true",
             -1,
         )
+
+    def test_device_indices_train_on_every_visible_cuda_device(self, tmp_path: Path) -> None:
+        """The launcher limits visibility to the chosen devices, so training asks for all visible ones."""
+        trainer_class = _run(TrainingJobSpec(policy="act", device_type="cuda", device_indices=[1, 3]), tmp_path)
+
+        kwargs = trainer_class.call_args.kwargs
+        assert (kwargs["strategy"], kwargs["devices"]) == ("ddp_find_unused_parameters_true", -1)
 
     def test_dataset_is_loaded_from_the_local_root(self, tmp_path: Path) -> None:
         spec = TrainingJobSpec(policy="act", batch_size=16, num_workers=2, val_split=0.25)
