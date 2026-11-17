@@ -340,6 +340,48 @@ class TestTraining:
             assert job_service.update_job_status.call_args_list[0].kwargs["status"] == JobStatus.COMPLETED
 
     @pytest.mark.anyio
+    async def test_failed_export_completes_the_job_and_names_the_backend(self, worker, tmp_path):
+        """Training that finished is delivered even when an export backend failed."""
+        from training.export import ExportReport, ExportStatus
+
+        payload = _make_payload(compile_model=False)
+        model = _make_model(tmp_path)
+        job = _make_job(payload)
+
+        async def train(context) -> None:
+            report = ExportReport(planned=True, finished=True)
+            report.record("torch", ExportStatus.SUCCEEDED)
+            report.record("openvino", ExportStatus.FAILED, "export process crashed (SIGSEGV) while exporting")
+            report.save(context.output_dir)
+
+        backend = MagicMock()
+        backend.train = AsyncMock(side_effect=train)
+        dispatcher = MagicMock()
+        dispatcher.is_alive = MagicMock(return_value=False)
+
+        with (
+            patch(f"{MODULE}.get_settings", return_value=_make_settings(tmp_path)),
+            patch(f"{MODULE}.get_training_backend", AsyncMock(return_value=backend)),
+            patch(f"{MODULE}.TrainingTrackingDispatcher", return_value=dispatcher),
+            patch(f"{MODULE}.JobService") as MockJobService,
+            patch(f"{MODULE}.ModelService") as MockModelService,
+        ):
+            job_service = MockJobService.return_value
+            job_service.update_job_status = AsyncMock(return_value=MagicMock())
+            job_service.update_job = AsyncMock(return_value=MagicMock())
+            MockModelService.return_value.create_model = AsyncMock(return_value=model)
+
+            await worker._train_model(job, model, _make_snapshot(tmp_path), payload, base_model=None)
+
+            MockModelService.return_value.create_model.assert_awaited_once_with(model)
+            final = job_service.update_job_status.call_args_list[0].kwargs
+            assert final["status"] == JobStatus.COMPLETED
+            assert final["message"] == "Training finished; OpenVINO export failed"
+        [issue] = model.export_issues
+        assert issue.title == "OpenVINO export failed"
+        assert issue.detail == "OpenVINO export failed: export process crashed (SIGSEGV) while exporting"
+
+    @pytest.mark.anyio
     async def test_context_passes_output_and_cache_dirs(self, worker, tmp_path):
         """The worker builds a context pointing at the model and cache directories."""
         payload = _make_payload(compile_model=False)

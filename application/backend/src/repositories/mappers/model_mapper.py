@@ -6,13 +6,20 @@ from schemas import Model
 class ModelMapper(IBaseMapper):
     @staticmethod
     def to_schema(db_schema: Model) -> ModelDB:
-        # available_backends, lora_enabled, lora_use_dora, and snapflow_enabled are computed
-        # fields derived from the filesystem / properties, not their own ModelDB columns.
+        # available_backends, export_issues, lora_enabled, lora_use_dora, and snapflow_enabled are
+        # computed fields derived from the filesystem / properties, not their own ModelDB columns.
         # Keep UUIDs JSON-serialized, but pass DateTime columns their Python values.
         return ModelDB(
             **db_schema.model_dump(
                 mode="json",
-                exclude={"available_backends", "lora_enabled", "lora_use_dora", "snapflow_enabled", "created_at"},
+                exclude={
+                    "available_backends",
+                    "export_issues",
+                    "lora_enabled",
+                    "lora_use_dora",
+                    "snapflow_enabled",
+                    "created_at",
+                },
             ),
             created_at=db_schema.created_at,
         )

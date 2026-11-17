@@ -117,3 +117,73 @@ def test_cleanup_job_outputs_removes_the_model_and_cache(storage) -> None:
 
     assert not model_dir.exists()
     assert not cache_dir.exists()
+
+
+def _interrupted_export(model_dir: Path) -> None:
+    """Leave a model directory as a trainer killed mid-export would: torch done, openvino half-written."""
+    from training.export import EXPORTS_DIRNAME, ExportReport, ExportStatus
+
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.ckpt").write_bytes(b"weights")
+    for name in ("torch", "openvino"):
+        (model_dir / EXPORTS_DIRNAME / name).mkdir(parents=True)
+        (model_dir / EXPORTS_DIRNAME / name / "model.bin").write_bytes(b"x")
+    report = ExportReport()
+    report.plan(["torch", "openvino"])
+    report.record("torch", ExportStatus.SUCCEEDED)
+    report.save(model_dir)
+
+
+def test_salvage_archives_a_model_whose_training_finished(storage) -> None:
+    """A job that died while exporting still delivers its checkpoint and finished exports."""
+    from training.export import ExportReport
+
+    model_dir = storage.models_dir / _JOB_ID
+    _interrupted_export(model_dir)
+
+    archive = TrainerRunner.salvage(_JOB_ID, "Trainer process exited unexpectedly (-11)", report=MagicMock())
+
+    assert archive is not None
+    with zipfile.ZipFile(archive) as zf:
+        names = set(zf.namelist())
+    assert {"model.ckpt", "exports/torch/model.bin", "export_report.json"} <= names
+    assert not any(name.startswith("exports/openvino") for name in names)
+    report = ExportReport.load(model_dir)
+    assert report is not None and report.finished
+    assert report.failures[0].backend == "openvino"
+    assert report.failures[0].error == "export did not finish (Trainer process exited unexpectedly (-11))"
+    assert TrainerRunner.completion_message(_JOB_ID) == "Training finished; OpenVINO export failed"
+
+
+def test_salvage_leaves_a_finished_export_report_untouched(storage) -> None:
+    """Dying after export (e.g. while archiving) just archives again."""
+    from training.export import ExportReport, ExportStatus
+
+    model_dir = storage.models_dir / _JOB_ID
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.ckpt").write_bytes(b"weights")
+    report = ExportReport(planned=True, finished=True)
+    report.record("torch", ExportStatus.SUCCEEDED)
+    report.save(model_dir)
+
+    assert TrainerRunner.salvage(_JOB_ID, "boom", report=MagicMock()) is not None
+    assert ExportReport.load(model_dir) == report
+
+
+def test_salvage_declines_a_run_that_never_finished_training(storage) -> None:
+    """No export report means training never published a checkpoint: nothing to deliver."""
+    model_dir = storage.models_dir / _JOB_ID
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.ckpt").write_bytes(b"weights")
+
+    assert TrainerRunner.salvage(_JOB_ID, "boom", report=MagicMock()) is None
+
+
+def test_salvage_declines_a_model_without_a_checkpoint(storage) -> None:
+    from training.export import ExportReport
+
+    model_dir = storage.models_dir / _JOB_ID
+    model_dir.mkdir(parents=True)
+    ExportReport().save(model_dir)
+
+    assert TrainerRunner.salvage(_JOB_ID, "boom", report=MagicMock()) is None

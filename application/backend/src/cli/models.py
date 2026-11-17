@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
     from schemas import Model, TrainJob
     from schemas.dataset import Dataset
+    from training.export import ExportStatus
 
 
 @click.group()
@@ -108,6 +109,7 @@ def _export_requested_backends(policy: "Policy", model_dir: Path, requested: lis
     """Export every requested backend, failing the CLI if any export is unavailable or fails."""
     from physicalai.export import ExportablePolicyMixin
 
+    from training.export import ExportStatus
     from training.job import EXPORTS_DIRNAME, _backend_name, _release_memory
 
     if not isinstance(policy, ExportablePolicyMixin):
@@ -115,6 +117,7 @@ def _export_requested_backends(policy: "Policy", model_dir: Path, requested: lis
 
     supported = {_backend_name(backend): backend for backend in policy.get_supported_export_backends()}
     failures: dict[str, str] = {}
+    outcomes: dict[str, tuple[ExportStatus, str | None]] = {}
     for name in dict.fromkeys(requested):
         if name not in supported:
             failures[name] = "unsupported by this policy"
@@ -125,10 +128,13 @@ def _export_requested_backends(policy: "Policy", model_dir: Path, requested: lis
             click.echo(f"Exporting to {name} format")
             policy.export(model_dir / EXPORTS_DIRNAME / name, backend=supported[name])
         except ImportError as exc:
+            # Nothing was written, so whatever the report says about this backend still holds.
             failures[name] = f"optional dependency missing ({exc})"
         except Exception as exc:
             failures[name] = str(exc)
+            outcomes[name] = (ExportStatus.FAILED, failures[name])
         else:
+            outcomes[name] = (ExportStatus.SUCCEEDED, None)
             click.echo(f"Export to {name} succeeded")
         finally:
             # Keep conversion memory cleanup without training's best-effort error handling.
@@ -137,9 +143,29 @@ def _export_requested_backends(policy: "Policy", model_dir: Path, requested: lis
         if name in failures:
             click.echo(f"Export to {name} failed: {failures[name]}", err=True)
 
+    _record_exports(model_dir, outcomes)
+
     if failures:
         details = "; ".join(f"{name}: {reason}" for name, reason in failures.items())
         raise click.ClickException(f"Requested exports failed: {details}")
+
+
+def _record_exports(model_dir: Path, outcomes: "dict[str, tuple[ExportStatus, str | None]]") -> None:
+    """Update the model's export report so a successful re-export clears its export issue.
+
+    Only backends this command attempted are recorded; one the policy does not
+    support was never meant to exist and is not an issue on the model.
+    """
+    from training.export import ExportReport, discard_unfinished_exports
+
+    report = ExportReport.load(model_dir) or ExportReport(planned=True)
+    # The checkpoint just loaded, so a recorded reload failure no longer holds.
+    report.error = None
+    report.finished = True
+    for name, (status, error) in outcomes.items():
+        report.record(name, status, error)
+    discard_unfinished_exports(model_dir, report)
+    report.save(model_dir)
 
 
 @models.command("export")

@@ -33,6 +33,8 @@ def manager(db_path: Path):
     with patch(f"{QUEUE}.get_settings", return_value=settings):
         mgr = QueueManager()
     mgr._runner = MagicMock()
+    mgr._runner.completion_message.return_value = "Training finished"
+    mgr._runner.salvage.return_value = None
     with patch(f"{QUEUE}.gpu_busy", return_value=False), patch(f"{QUEUE}.get_training_devices", return_value=[]):
         yield mgr
 
@@ -204,6 +206,60 @@ def test_run_job_completes_and_records_artifact(manager, sample_request: SubmitJ
     assert state.status == TrainerJobStatus.COMPLETED
     assert state.progress == 100
     assert manager.store.get_artifact(job_id) == str(archive)
+
+
+def test_run_job_completion_names_failed_exports(manager, sample_request: SubmitJobRequest, tmp_path: Path) -> None:
+    job_id = manager.store.create(sample_request)
+    manager._runner.run = MagicMock(return_value=tmp_path / "model.zip")
+    manager._runner.completion_message.return_value = "Training finished; OpenVINO export failed"
+
+    asyncio.run(manager._run_job(job_id))
+
+    state = manager.store.get(job_id)
+    assert state.status == TrainerJobStatus.COMPLETED
+    assert state.message == "Training finished; OpenVINO export failed"
+
+
+def test_a_job_that_dies_after_training_is_delivered_not_wiped(
+    manager, sample_request: SubmitJobRequest, tmp_path: Path
+) -> None:
+    """The SmolVLA incident: training finished, the process died exporting, and the weights were deleted."""
+    job_id = manager.store.create(sample_request)
+    archive = tmp_path / "model.zip"
+    manager._runner.run = MagicMock(side_effect=RuntimeError("Trainer process exited unexpectedly (-11)"))
+    manager._runner.salvage.return_value = archive
+    manager._runner.completion_message.return_value = "Training finished; OpenVINO export failed"
+
+    asyncio.run(manager._run_job(job_id))
+
+    state = manager.store.get(job_id)
+    assert state.status == TrainerJobStatus.COMPLETED
+    assert state.message == "Training finished; OpenVINO export failed"
+    assert manager.store.get_artifact(job_id) == str(archive)
+    assert manager._runner.salvage.call_args.args == (job_id, "Trainer process exited unexpectedly (-11)")
+    manager._runner.cleanup_job_outputs.assert_not_called()
+
+
+def test_a_failure_that_cannot_be_salvaged_still_fails(manager, sample_request: SubmitJobRequest) -> None:
+    job_id = manager.store.create(sample_request)
+    manager._runner.run = MagicMock(side_effect=RuntimeError("boom"))
+    manager._runner.salvage.side_effect = OSError("disk full")
+
+    asyncio.run(manager._run_job(job_id))
+
+    assert manager.store.get(job_id).status == TrainerJobStatus.FAILED
+    manager._runner.cleanup_job_outputs.assert_called_once_with(job_id)
+
+
+def test_a_canceled_job_that_fails_is_not_salvaged(manager, sample_request: SubmitJobRequest) -> None:
+    job_id = manager.store.create(sample_request)
+    manager._runner.run = MagicMock(side_effect=RuntimeError("boom"))
+    manager._cancel_requested.add(job_id)
+
+    asyncio.run(manager._run_job(job_id))
+
+    assert manager.store.get(job_id).status == TrainerJobStatus.CANCELED
+    manager._runner.salvage.assert_not_called()
 
 
 def test_run_job_failure_marks_failed(manager, sample_request: SubmitJobRequest) -> None:

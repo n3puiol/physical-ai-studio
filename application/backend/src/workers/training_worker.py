@@ -30,6 +30,7 @@ from services.training_backends import (
 )
 from services.training_service import TrainingTrackingDispatcher
 from settings import get_settings
+from training.export import export_completion_message
 from workers.base import ProcessWorker
 
 if TYPE_CHECKING:
@@ -220,9 +221,14 @@ class TrainingWorker(ProcessWorker[None]):
                     job_id=job.id, status=JobStatus.CANCELED, message="Training canceled"
                 )
         else:
+            # Export failures never fail a trained job; they ride along in the
+            # model's export report and are named in the completion message.
+            message = export_completion_message(model.path)
+            if message != "Training finished":
+                logger.warning("{}; the model is delivered with the exports that succeeded", message)
             async with get_async_db_session_ctx() as session:
                 job = await JobService(session, RemoteTrainerService(session)).update_job_status(
-                    job_id=job.id, status=JobStatus.COMPLETED, message="Training finished"
+                    job_id=job.id, status=JobStatus.COMPLETED, message=message
                 )
                 model = await ModelService(session).create_model(model)
             self.queue.put((EventType.MODEL_UPDATE, model))

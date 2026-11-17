@@ -65,11 +65,52 @@ class TrainerRunner:
             shutil.rmtree(dataset_dir, ignore_errors=True)
 
     @staticmethod
+    def salvage(job_id: str, reason: str, *, report: ProgressFn) -> Path | None:
+        """Archive a job's model if training finished before the job failed.
+
+        Training publishes its checkpoint and writes the export report before
+        any export starts, so a report beside a checkpoint means the run's
+        weights are complete even though the job died afterwards (typically
+        while exporting). Exports still pending are recorded as failed for
+        ``reason`` and their partial output removed, so the model ships with
+        the exports that finished.
+
+        Args:
+            job_id: The failed job.
+            reason: Why the job failed, recorded against unfinished exports.
+            report: Progress sink for archiving.
+
+        Returns:
+            The model archive, or ``None`` when training itself did not finish.
+        """
+        from training.export import ExportReport, discard_unfinished_exports
+        from training.job import resolve_checkpoint
+
+        model_dir = get_settings().models_dir / job_id
+        export_report = ExportReport.load(model_dir)
+        if export_report is None or not resolve_checkpoint(model_dir).is_file():
+            return None
+        if not export_report.finished:
+            export_report.abort(f"export did not finish ({reason})")
+            discard_unfinished_exports(model_dir, export_report)
+            export_report.save(model_dir)
+        return archive_model(job_id, model_dir, report=report)
+
+    @staticmethod
+    def completion_message(job_id: str) -> str:
+        """Return the message for a completed job, naming any export that failed."""
+        from training.export import export_completion_message
+
+        return export_completion_message(get_settings().models_dir / job_id)
+
+    @staticmethod
     def cleanup_job_outputs(job_id: str) -> None:
         """Remove a job's model output and checkpoint cache from disk.
 
         Called for jobs that end up FAILED or CANCELED: they have no artifact
-        worth keeping, so nothing should be left behind on the trainer's disk.
+        worth keeping (a job whose training finished is salvaged as COMPLETED
+        instead, see :meth:`salvage`), so nothing should be left behind on the
+        trainer's disk.
         A job canceled mid-training in particular can leave its checkpoint
         cache directory unmoved since the move only happens on a successful
         finish, so this must clean up both directories.
