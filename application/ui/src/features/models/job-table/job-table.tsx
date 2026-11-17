@@ -68,6 +68,8 @@ const TrainerCell = ({ job }: { job: SchemaTrainJob }) => {
             <Text>{remoteId && trainer !== 'Remote' ? `Remote · ${trainer}` : trainer || '-'}</Text>
             {remoteId && selected?.all_devices ? (
                 <Text>{`All ${allGpuCount > 1 ? `${allGpuCount} ` : ''}${selected.type.toUpperCase()} GPUs`}</Text>
+            ) : remoteId && selected?.indices ? (
+                <Text>{`${selected.type.toUpperCase()} ${selected.indices.join(', ')}`}</Text>
             ) : (
                 showDevice && (
                     <Text>{`${device.type.toUpperCase()} ${device.index}${gpu ? ` · ${gpu.name}` : ''}`}</Text>

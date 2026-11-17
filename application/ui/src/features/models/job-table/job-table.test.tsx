@@ -264,6 +264,20 @@ describe('TrainingRow', () => {
         expect(trainerCell).not.toHaveTextContent('CUDA null');
     });
 
+    it('labels a job that trains on chosen GPUs of its trainer', () => {
+        renderTrainingRow({
+            payload: {
+                ...localJob.payload,
+                training_target: 'remote',
+                remote_trainer_id: remoteTrainer.id,
+                remote_trainer_name: remoteTrainer.name,
+                device: { type: 'cuda', index: null, all_devices: false, indices: [0, 2, 3] },
+            },
+        });
+
+        expect(screen.getByTestId('trainer-cell')).toHaveTextContent('CUDA 0, 2, 3');
+    });
+
     it.each([undefined, 1])(
         'shows remote trainer and selected GPU when multiple GPUs exist (index %s)',
         async (index) => {
