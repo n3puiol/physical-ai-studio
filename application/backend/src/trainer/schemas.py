@@ -18,7 +18,7 @@ from training import TrainingJobSpec
 
 _DEFAULT_PROTOCOL_VERSION = 1
 
-TRAINER_CAPABILITIES: tuple[str, ...] = ("all_devices",)
+TRAINER_CAPABILITIES: tuple[str, ...] = ("all_devices", "device_indices")
 """Optional features this trainer image supports, reported by ``/health``.
 
 Lets Studio offer a feature only to trainers that can run it, without a
@@ -26,6 +26,8 @@ protocol bump: an image that predates a feature simply does not list it.
 
 - ``all_devices``: trains one job on every CUDA device with DDP
   (``TrainingJobSpec.all_devices``).
+- ``device_indices``: trains one job on a chosen set of CUDA devices with
+  DDP (``TrainingJobSpec.device_indices``).
 """
 
 
