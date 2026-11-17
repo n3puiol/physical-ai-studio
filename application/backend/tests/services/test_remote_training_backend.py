@@ -841,7 +841,7 @@ class TestHttpDatasetTransfer:
         body = await _submitted_body(settings, context)
 
         expected = build_spec(context).model_dump(
-            mode="json", exclude={"run_options", "snapflow_start_epoch", "all_devices"}
+            mode="json", exclude={"run_options", "snapflow_start_epoch", "all_devices", "device_indices"}
         ) | {
             "device_type": None,
             "device_index": None,
@@ -890,6 +890,7 @@ class TestHttpDatasetTransfer:
         body = await _submitted_body(_settings(), _context(tmp_path))
 
         assert "all_devices" not in body["spec"]
+        assert "device_indices" not in body["spec"]
 
     @pytest.mark.anyio
     async def test_submit_sends_a_distillation_boundary_when_one_is_asked_for(self, tmp_path):
@@ -974,6 +975,50 @@ class TestHttpDatasetTransfer:
             backend._device = TrainingDevice(type="cuda", all_devices=True)
             backend.get_training_devices = AsyncMock(return_value=[DeviceInfo(type="cuda", name="GPU 0", index=0)])
             with pytest.raises(RemoteTrainingError, match="update its trainer image"):
+                await backend.submit_job(context)
+
+    @pytest.mark.anyio
+    async def test_device_indices_are_sent_only_when_the_trainer_reports_each_gpu(self, tmp_path):
+        settings = _settings()
+        context = _context(tmp_path)
+        controller = _Controller(states=[])
+        with (
+            patch(f"{REMOTE}.get_settings", return_value=settings),
+            patch(f"{REMOTE}.httpx.AsyncClient", lambda **kw: _FakeClient(controller, **kw)),
+        ):
+            backend = _backend(settings)
+            backend._device = TrainingDevice(type="cuda", indices=[1, 3])
+            backend.get_training_devices = AsyncMock(
+                return_value=[DeviceInfo(type="cuda", name=f"GPU {i}", index=i) for i in range(4)]
+            )
+            await backend.submit_job(context)
+            spec = controller.posted_bodies[-1]["spec"]
+            assert (spec["device_type"], spec["device_index"], spec["device_indices"]) == ("cuda", None, [1, 3])
+            assert "all_devices" not in spec
+            backend.get_training_devices.return_value = [DeviceInfo(type="cuda", name="GPU 1", index=1)]
+            with pytest.raises(RemoteTrainingError, match="device 3 is no longer available"):
+                await backend.submit_job(context)
+        assert len(controller.posted_bodies) == 1
+
+    @pytest.mark.anyio
+    async def test_an_old_trainer_rejecting_device_indices_gets_a_clear_error(self, tmp_path):
+        settings = _settings()
+        context = _context(tmp_path)
+        controller = _Controller(states=[])
+        rejected = _FakeResponse(
+            status_code=422, text='{"detail":[{"loc":["body","spec","device_indices"],"msg":"Extra inputs"}]}'
+        )
+        with (
+            patch(f"{REMOTE}.get_settings", return_value=settings),
+            patch(f"{REMOTE}.httpx.AsyncClient", lambda **kw: _FakeClient(controller, **kw)),
+            patch.object(_FakeClient, "post", AsyncMock(return_value=rejected)),
+        ):
+            backend = _backend(settings)
+            backend._device = TrainingDevice(type="cuda", indices=[0, 1])
+            backend.get_training_devices = AsyncMock(
+                return_value=[DeviceInfo(type="cuda", name=f"GPU {i}", index=i) for i in range(2)]
+            )
+            with pytest.raises(RemoteTrainingError, match="chosen GPUs yet; update its trainer image"):
                 await backend.submit_job(context)
 
     @pytest.mark.anyio

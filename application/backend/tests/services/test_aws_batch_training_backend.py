@@ -115,6 +115,9 @@ async def test_batch_catalog_and_preparation_do_not_use_http(connection, monkeyp
     all_gpus = payload.model_copy(update={"device": TrainingDevice(type="cuda", all_devices=True)})
     with pytest.raises(RemoteAllDevicesUnsupportedError, match="AWS Batch"):
         await RemoteTrainingTargetHandler(service).prepare(all_gpus)
+    chosen_gpus = payload.model_copy(update={"device": TrainingDevice(type="cuda", indices=[0, 1])})
+    with pytest.raises(RemoteAllDevicesUnsupportedError, match="AWS Batch"):
+        await RemoteTrainingTargetHandler(service).prepare(chosen_gpus)
     assert backend._connection == connection
     http.assert_not_called()
 

@@ -297,7 +297,8 @@ class RemoteTrainerHealth(BaseModel):
         default_factory=list,
         description=(
             "Optional features the trainer image reports in /health, e.g. 'all_devices' for training one job "
-            "on every CUDA device. Empty for trainers that predate capability reporting or are not reachable."
+            "on every CUDA device, or 'device_indices' for training it on a chosen set of them. Empty for "
+            "trainers that predate capability reporting or are not reachable."
         ),
     )
     issues: list[OperationalIssue] | None = Field(

@@ -137,6 +137,35 @@ async def test_all_gpus_is_rejected_before_queueing_when_the_trainer_cannot_run_
         await RemoteTrainingTargetHandler(service).prepare(payload)
 
 
+@pytest.mark.asyncio
+async def test_chosen_gpus_are_accepted_by_a_trainer_that_reports_them() -> None:
+    service, payload = _all_gpus_submission(_health(capabilities=["all_devices", "device_indices"], cuda=4))
+    payload.device = TrainingDevice(type="cuda", indices=[1, 3])
+
+    prepared = await RemoteTrainingTargetHandler(service).prepare(payload)
+
+    assert prepared.device.indices == [1, 3]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "capabilities", "cuda", "reason"),
+    [
+        ("healthy", ["all_devices"], 4, "update the trainer image"),
+        ("starting", ["device_indices"], 4, "isn't ready"),
+        ("healthy", ["device_indices"], 3, "no CUDA GPU 3"),
+    ],
+)
+async def test_chosen_gpus_are_rejected_before_queueing_when_the_trainer_cannot_run_them(
+    status: str, capabilities: list[str], cuda: int, reason: str
+) -> None:
+    service, payload = _all_gpus_submission(_health(status=status, capabilities=capabilities, cuda=cuda))
+    payload.device = TrainingDevice(type="cuda", indices=[1, 3])
+
+    with pytest.raises(RemoteAllDevicesUnsupportedError, match=reason):
+        await RemoteTrainingTargetHandler(service).prepare(payload)
+
+
 def test_trainer_reports_its_own_policy_extras(monkeypatch) -> None:
     installed_version = metadata.version
 

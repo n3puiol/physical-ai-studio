@@ -174,6 +174,15 @@ def test_cancellation_signals_only_the_assigned_training_process(scheduler):
         ("remote:trainer:cuda:0", {"remote:trainer:cuda:0": None}, True),
         ("remote:trainer", {"remote:trainer:cuda:0": None}, True),
         ("remote:trainer:cuda:1", {"remote:trainer": None}, True),
+        ("remote:trainer:cuda:2,3", {"remote:trainer:cuda:0,1": None}, False),
+        ("remote:trainer:cuda:1,2", {"remote:trainer:cuda:0,1": None}, True),
+        ("remote:trainer:cuda:3", {"remote:trainer:cuda:0,1": None}, False),
+        ("remote:trainer:cuda:0", {"remote:trainer:cuda:0,1": None}, True),
+        ("remote:trainer:cuda:0,1", {"remote:trainer:cuda:1": None}, True),
+        ("remote:trainer:cuda:0,1", {"remote:trainer": None}, True),
+        ("remote:trainer", {"remote:trainer:cuda:2,3": None}, True),
+        ("remote:trainer:cuda:0,1", {"remote:other:cuda:0,1": None}, False),
+        ("remote:trainer:cuda:0,1", {"batch:trainer:act": None, "local": None}, False),
     ],
 )
 def test_target_reservations(target, active, busy):
@@ -382,3 +391,19 @@ def test_worker_registry_imports_only_the_assigned_job_type(job_type):
         _run_job(job_type, job_id, stop, cancel, queue)
     create_worker.assert_called_once_with(job_id, stop, cancel, queue)
     create_worker.return_value.run.assert_called_once()
+
+
+def test_a_device_indices_job_reserves_only_its_gpus():
+    from services.job_handlers import TrainingJobHandler
+
+    trainer_id = uuid4()
+    job = _training_job(trainer_id=trainer_id)
+    job.payload.device = TrainingDevice(type="cuda", indices=[3, 1])
+    key = target_key(job.payload)
+
+    assert key == f"remote:{trainer_id}:cuda:1,3"
+    handler = TrainingJobHandler()
+    assert handler.resource_is_busy(target_key(_training_job(trainer_id=trainer_id, gpu=3).payload), {key: object()})
+    assert not handler.resource_is_busy(
+        target_key(_training_job(trainer_id=trainer_id, gpu=2).payload), {key: object()}
+    )

@@ -45,6 +45,10 @@ class RemoteTrainingTargetHandler:
         is_batch = isinstance(remote_trainer.connection, AwsBatchConnection)
         if payload.device is not None and payload.device.all_devices:
             await self._require_all_devices_support(payload.remote_trainer_id, is_batch=is_batch)
+        elif payload.device is not None and payload.device.indices is not None:
+            await self._require_device_indices_support(
+                payload.remote_trainer_id, payload.device.indices, is_batch=is_batch
+            )
         if isinstance(remote_trainer.connection, AwsBatchConnection):
             try:
                 await asyncio.to_thread(_make_session, remote_trainer.connection)
@@ -94,6 +98,35 @@ class RemoteTrainingTargetHandler:
         if sum(1 for device in health.devices if device.type == "cuda") < 2:
             raise RemoteAllDevicesUnsupportedError("This trainer doesn't have several CUDA GPUs.")
 
+    async def _require_device_indices_support(
+        self, remote_trainer_id: UUID, indices: list[int], *, is_batch: bool
+    ) -> None:
+        """Reject a job on chosen GPUs the trainer cannot run, before it is queued.
+
+        Raises:
+            RemoteAllDevicesUnsupportedError: On AWS Batch, when the trainer's
+                image does not list the ``device_indices`` capability, when its
+                health cannot be confirmed right now, or when it does not report
+                every chosen CUDA GPU.
+        """
+        if is_batch:
+            raise RemoteAllDevicesUnsupportedError("Training on several GPUs is not available on AWS Batch trainers.")
+        health = await self.remote_trainer_service.check_remote_trainer(remote_trainer_id)
+        if health.status not in {"healthy", "degraded"}:
+            raise RemoteAllDevicesUnsupportedError(
+                "Can't confirm that this trainer supports training on chosen GPUs because it isn't ready."
+            )
+        if "device_indices" not in health.capabilities:
+            raise RemoteAllDevicesUnsupportedError(
+                "This trainer's image doesn't support training on chosen GPUs yet; update the trainer image."
+            )
+        reported = {device.index for device in health.devices if device.type == "cuda"}
+        missing = [index for index in indices if index not in reported]
+        if missing:
+            raise RemoteAllDevicesUnsupportedError(
+                f"This trainer has no CUDA GPU {', '.join(str(index) for index in missing)}."
+            )
+
     @staticmethod
     def target_key(payload: TrainJobPayload) -> str:
         if not isinstance(payload, RemoteTrainJobPayload):
@@ -105,4 +138,8 @@ class RemoteTrainingTargetHandler:
         # `TrainingJobHandler.resource_is_busy`), so an all-device job takes the whole trainer.
         if payload.device is None or payload.device.all_devices:
             return trainer_key
+        # Chosen GPUs list every index, e.g. `remote:<id>:cuda:0,2,3`; jobs on the same
+        # trainer conflict when their index sets overlap (see `TrainingJobHandler.resource_is_busy`).
+        if payload.device.indices is not None:
+            return f"{trainer_key}:{payload.device.type}:{','.join(str(index) for index in payload.device.indices)}"
         return f"{trainer_key}:{payload.device.type}:{payload.device.index}"

@@ -148,7 +148,7 @@ class RemoteResumeUnsupportedError(BaseException):
 
 
 class RemoteAllDevicesUnsupportedError(BaseException):
-    """Raised when a job asks for every GPU of a remote trainer that cannot provide it.
+    """Raised when a job asks for every GPU, or a chosen set of GPUs, of a remote trainer that cannot provide it.
 
     Rejected at submission so the training dialog shows why, instead of the job
     failing later on the trainer.

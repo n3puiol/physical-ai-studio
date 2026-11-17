@@ -62,6 +62,19 @@ class TrainingDevice(BaseModel):
             "batch size then applies per device."
         ),
     )
+    indices: list[int] | None = Field(
+        default=None,
+        min_length=2,
+        description=(
+            "Train on these CUDA devices of a remote trainer (two or more indices) with DDP. Requires type 'cuda', "
+            "no index, and not all_devices; batch size then applies per device."
+        ),
+    )
+
+    @property
+    def is_multi_device(self) -> bool:
+        """Whether the job trains with DDP on several devices (``all_devices`` or ``indices``)."""
+        return self.all_devices or self.indices is not None
 
     @model_validator(mode="after")
     def validate_index_for_device_type(self) -> "TrainingDevice":
@@ -69,14 +82,24 @@ class TrainingDevice(BaseModel):
 
         Indexed types (cuda, xpu) default to index 0 when omitted.
         Non-indexed types (cpu, npu) ignore a supplied index with a warning.
-        ``all_devices`` requires CUDA and no index.
+        ``all_devices`` and ``indices`` require CUDA and no index; ``indices``
+        must be distinct, non-negative, and is stored sorted.
         """
         device_type_str = str(self.type).lower()
-        if self.all_devices:
+        if self.is_multi_device:
+            option = "all_devices" if self.all_devices else "indices"
+            if self.all_devices and self.indices is not None:
+                raise ValueError("all_devices and indices are alternatives; set only one")
             if device_type_str != "cuda":
-                raise ValueError(f"all_devices requires device type 'cuda', got {device_type_str!r}")
+                raise ValueError(f"{option} requires device type 'cuda', got {device_type_str!r}")
             if self.index is not None:
-                raise ValueError("all_devices trains on every device; it cannot be combined with an index")
+                raise ValueError(f"{option} trains on several devices; it cannot be combined with an index")
+            if self.indices is not None:
+                if any(index < 0 for index in self.indices):
+                    raise ValueError(f"indices must be zero-based device indices, got {self.indices}")
+                if len(set(self.indices)) != len(self.indices):
+                    raise ValueError(f"indices must not repeat a device, got {self.indices}")
+                self.indices = sorted(self.indices)
             return self
         indexed_types = {"cuda", "xpu"}
         non_indexed_types = {"cpu", "npu"}
@@ -377,10 +400,10 @@ class LocalTrainJobPayload(TrainJobPayloadBase):
     training_target: Literal[TrainingTarget.LOCAL] = TrainingTarget.LOCAL
 
     @model_validator(mode="after")
-    def reject_all_devices(self) -> "LocalTrainJobPayload":
+    def reject_multi_device(self) -> "LocalTrainJobPayload":
         """Multi-device training needs a launcher Studio's own process does not provide."""
-        if self.device is not None and self.device.all_devices:
-            raise ValueError("Training on all GPUs is only available on a remote trainer")
+        if self.device is not None and self.device.is_multi_device:
+            raise ValueError("Training on several GPUs is only available on a remote trainer")
         return self
 
 
