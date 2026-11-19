@@ -5,6 +5,7 @@
 
 import importlib
 import json
+import subprocess  # ruff: ignore[suspicious-subprocess-import]  # Fixed interpreter and worker path.
 import sys
 import threading
 from pathlib import Path
@@ -180,3 +181,22 @@ def test_inference_applies_state_transforms_once(
     })
     np.testing.assert_array_equal(predict.call_args.kwargs["examples"][0]["state"], [[4, 2]])
     assert result["action.arm"].shape == (3, 2)
+
+
+@pytest.mark.parametrize(
+    "worker",
+    [environments.TRAIN_WORKER, environments.INFER_WORKER, environments.OPENVINO_EXPORT_WORKER],
+    ids=lambda path: Path(str(path)).stem,
+)
+def test_worker_finds_its_sibling_modules_without_its_folder_on_sys_path(worker: object, tmp_path: Path) -> None:
+    """Isolated launches keep the worker's folder off ``sys.path``; its own imports must still resolve."""
+    script = str(Path(str(worker)))
+    load = "import runpy, sys; runpy.run_path(sys.argv[1], run_name='worker_import_check')"
+    result = subprocess.run(  # ruff: ignore[subprocess-without-shell-equals-true]  # No untrusted arguments.
+        [sys.executable, "-I", "-c", load, script],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
