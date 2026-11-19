@@ -10,11 +10,15 @@ import json
 import os
 import re
 import shutil
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from torch import Tensor
+
+# Isolated workers run without their folder on sys.path; the sibling modules live there.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from starvla_worker_common import (
     CancelledError,

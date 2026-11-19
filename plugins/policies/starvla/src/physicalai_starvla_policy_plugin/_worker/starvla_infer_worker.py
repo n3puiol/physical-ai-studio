@@ -7,10 +7,15 @@ from __future__ import annotations
 
 import os
 import random
+import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+# Isolated workers run without their folder on sys.path; the sibling modules live there.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import starvla_worker_protocol as protocol
 from starvla_worker_common import disable_remote_code, identity
 

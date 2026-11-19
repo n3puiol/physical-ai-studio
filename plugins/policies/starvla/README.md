@@ -6,10 +6,11 @@ live in a separate locked Python 3.10/CUDA 12.8 environment. Neither the host no
 a Runtime-only install imports `physicalai-train` to perform inference.
 
 This initial integration supports single-GPU QwenGR00T, upstream registered
-LeRobot dataset mixtures, one observation per camera, and native safetensors
-packages. Other StarVLA frameworks, custom executable dataset registrations,
-DeepSpeed/multi-GPU launching, and ONNX/OpenVINO conversion are not enabled.
-Training and inference require CUDA; CPU/XPU are not advertised.
+LeRobot dataset mixtures, one observation per camera, native safetensors
+packages (CUDA inference in the isolated worker), and OpenVINO packages (in-process
+inference on CPU or another OpenVINO device, without StarVLA or PyTorch). Other
+StarVLA frameworks, custom executable dataset registrations, DeepSpeed/multi-GPU
+launching, and ONNX conversion are not enabled. Training requires CUDA.
 
 ## Install and prepare
 
@@ -168,6 +169,78 @@ once the worker environment is prepared, and existing exports are never
 overwritten. `.pt`/pickle checkpoints and executable package files are refused.
 Materialize Hugging Face cache symlinks before export.
 
+## OpenVINO export
+
+`export_native(..., backend="openvino")` (or `export(run, out, backend="openvino")`) converts the
+checkpoint on CPU in a second locked environment, `envs/qwengr00t-openvino/`: the training
+project plus OpenVINO 2026.4.1 and NNCF, with every shared package at the same locked version.
+Training pins are unchanged, so existing runs and native packages stay valid.
+
+```python
+package = Engine.get("starvla").export_native(
+    "/absolute/path/to/runs/starvla/final_model/model.safetensors",
+    "exports/starvla-openvino",
+    backbone_path="/absolute/path/to/Qwen3-VL-4B-Instruct",
+    io=io,
+    unnorm_key="franka",
+    backend="openvino",
+    openvino_weights="fp16",  # fp32 | fp16 | int8 (INT8 text model, fp16 vision and head)
+    image_size=(256, 256),  # optional: default is the training dataset's camera resolution
+)
+```
+
+The package holds three graphs and the data needed to run them without StarVLA:
+
+- `vision.xml`: the Qwen3-VL vision tower, with the camera grid for `image_size` baked in.
+- `llm.xml`: the text model, returning the **pre-norm** last hidden state (StarVLA conditions on
+  `hidden_states[-1]`, before the final RMSNorm).
+- `head.xml`: the 4-step flow-matching action head, unrolled, with the noise as an input.
+- The token embedding table, `tokenizer.json`, and `package.json` with the prompt template, image
+  preprocessing, mRoPE settings, and the state/action normalization statistics.
+
+The checkpoint, backbone weights and Python code are not included. Numpy glue
+(`_worker/starvla_openvino_pipeline.py`) reproduces the Qwen3-VL image preprocessing, chat prompt,
+multimodal RoPE ids, image-token scatter and StarVLA's normalization. Before writing `validation`
+into `package.json`, the export worker runs that pipeline on a synthetic observation and requires it
+to match StarVLA's PyTorch `predict_action`:
+
+- Token ids, position ids, pixel values and normalization must match exactly.
+- Normalized actions must match within the weight format's tolerance.
+
+The export fails rather than writing an unvalidated package.
+
+| Weights | Package | Actions vs PyTorch (validation) | CPU latency per chunk¹ |
+|---|---|---|---|
+| fp32 | 17 GB | max 3e-5 | 1.09 s |
+| fp16 | 8.6 GB | max 9e-3, cosine 0.99999 | 1.08 s |
+| int8 | 5.2 GB | max 5e-2, cosine 0.9995 | 0.86 s |
+
+¹ i9-10920X, 12 cores, 10,000-step LIBERO checkpoint; PyTorch fp32 on the same CPU takes 1.9 s.
+
+INT8 vision weights were accurate on real frames but drifted on out-of-distribution inputs, so
+`int8` compresses only the text model.
+
+On the same 30-episode LIBERO-goal benchmark as the native package, the fp16 OpenVINO package scored
+**7/30** on CPU, against **8/30** for native CUDA bf16. The checkpoint, seeds, initial states,
+observation handling and action conversion were identical. The noise stream (numpy vs torch) was not,
+so episodes differ individually; per task the scores were within one success, and the totals are
+statistically indistinguishable. The run took 23 minutes on the CPU, against 6 minutes for native on
+an RTX 3090. INT8 and fp32 packages have not been benchmarked closed-loop. Current limitations:
+
+- Fixed camera resolution per export; images of another size are rejected.
+- Proprioceptive state is required.
+- Checkpoints trained with `obs_image_size`, rotation state transforms, or batch size above one
+  are not supported.
+
+```python
+model = InferenceModel("exports/starvla-openvino", device="CPU", seed=42)  # or GPU / NPU
+```
+
+The OpenVINO adapter (`starvla_openvino` backend) runs in the Runtime process. It needs only
+`physicalai` and this plugin, imports no PyTorch or StarVLA, and samples noise with numpy: a seed
+gives a reproducible sequence that `reset()` restarts. Its predictions are not bit-identical to the
+native CUDA worker, which samples noise with PyTorch and runs the VLM in bf16.
+
 ## Runtime-only inference
 
 Install `physicalai` and this plugin (without its `[train]` extra) on the Runtime
@@ -228,7 +301,7 @@ Verified with 55 CPU contract tests and a real GPU smoke run on one RTX 3090
 - Training, checkpointing, export, native reference, and Runtime validation took
   69 seconds, excluding environment preparation and model/dataset downloads.
 
-Both wheel and source distributions include the locked worker project. The plugin
+Both wheel and source distributions include the locked worker projects. The plugin
 handles Qwen3's tied embedding/head tensors when writing safetensors, keeping
 both keys. The CPU suite also covers override parsing, state normalization,
 transport errors, and Runtime-only imports.
