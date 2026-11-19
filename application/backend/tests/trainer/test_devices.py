@@ -97,3 +97,21 @@ def test_devices_endpoint_returns_device_list(monkeypatch) -> None:
     assert response.status_code == 200
     body = response.json()
     assert body == [{"type": "cuda", "name": "NVIDIA A100", "memory": 42949672960, "index": 0, "busy": None}]
+
+
+class TestVisibleDevicesFor:
+    def test_without_a_parent_list_the_indices_are_used_as_is(self) -> None:
+        assert devices_module.visible_devices_for([0, 2, 3], None) == "0,2,3"
+
+    def test_indices_are_mapped_through_the_parent_list(self) -> None:
+        assert devices_module.visible_devices_for([0, 1], "4,5,6,7") == "4,5"
+        assert devices_module.visible_devices_for([1, 3], " 2, 3,0 ,1") == "3,1"
+
+    def test_uuids_in_the_parent_list_are_passed_on(self) -> None:
+        assert devices_module.visible_devices_for([1], "GPU-aaa,GPU-bbb") == "GPU-bbb"
+
+    def test_an_index_outside_the_parent_list_is_rejected(self) -> None:
+        import pytest
+
+        with pytest.raises(ValueError, match="CUDA device 2"):
+            devices_module.visible_devices_for([0, 2], "4,5")

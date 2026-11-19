@@ -104,6 +104,8 @@ class RemoteTrainingBackend:
         label = trainer_name or self._base_url
         if device is not None and device.all_devices:
             label += f" · all {device.type.upper()} devices"
+        elif device is not None and device.indices is not None:
+            label += f" · {device.type.upper()} {','.join(str(index) for index in device.indices)}"
         elif device is not None:
             label += f" · {device.type.upper()}{f' {device.index}' if device.index is not None else ''}"
 
@@ -334,6 +336,29 @@ class RemoteTrainingBackend:
             round(uploaded_bytes / total_bytes * SNAPSHOT_UPLOAD_PROGRESS),
         )
 
+    async def _check_device_still_reported(self) -> None:
+        """Fail before uploading when the trainer no longer reports the selected device(s).
+
+        Raises:
+            RemoteTrainingError: If the selected device, any chosen device, or
+                (for an all-device job) any device of the selected type is gone.
+        """
+        if self._device is None:
+            return
+        devices = await self.get_training_devices()
+        if self._device.all_devices:
+            if not any(device.type == self._device.type for device in devices):
+                raise RemoteTrainingError(f"The trainer no longer reports any {self._device.type} device")
+            return
+        reported = {device.index for device in devices if device.type == self._device.type}
+        wanted = self._device.indices if self._device.indices is not None else [self._device.index]
+        missing = [index for index in wanted if index not in reported]
+        if missing:
+            raise RemoteTrainingError(
+                f"Selected {self._device.type} device {', '.join(str(index) for index in missing)} "
+                "is no longer available on the trainer"
+            )
+
     async def submit_job(self, context: TrainingContext) -> uuid.UUID:
         """Submit the training job and return the remote job id.
 
@@ -355,20 +380,12 @@ class RemoteTrainingBackend:
                 "device_type": str(self._device.type),
                 "device_index": self._device.index,
                 "all_devices": self._device.all_devices,
+                "device_indices": self._device.indices,
             }
             if self._device is not None
-            else {"device_type": None, "device_index": None, "all_devices": False}
+            else {"device_type": None, "device_index": None, "all_devices": False, "device_indices": None}
         )
-        if self._device is not None and self._device.all_devices:
-            devices = await self.get_training_devices()
-            if not any(device.type == self._device.type for device in devices):
-                raise RemoteTrainingError(f"The trainer no longer reports any {self._device.type} device")
-        elif self._device is not None:
-            devices = await self.get_training_devices()
-            if not any(device.type == self._device.type and device.index == self._device.index for device in devices):
-                raise RemoteTrainingError(
-                    f"Selected {self._device.type} device {self._device.index} is no longer available on the trainer"
-                )
+        await self._check_device_still_reported()
         spec = build_spec(context).model_copy(update=device_update)
         hf_token = resolve_hf_token()
 
@@ -379,6 +396,8 @@ class RemoteTrainingBackend:
         # run stays submittable to a trainer image that predates multi-device support.
         if not spec.all_devices:
             excluded.add("all_devices")
+        if spec.device_indices is None:
+            excluded.add("device_indices")
         body: dict[str, Any] = {
             "spec": spec.model_dump(mode="json", exclude=excluded),
             "dataset_transfer": "http",
@@ -390,6 +409,10 @@ class RemoteTrainingBackend:
             if spec.all_devices and response.status_code == 422 and "all_devices" in response.text:
                 raise RemoteTrainingError(
                     "This remote trainer does not support training on all GPUs yet; update its trainer image"
+                )
+            if spec.device_indices is not None and response.status_code == 422 and "device_indices" in response.text:
+                raise RemoteTrainingError(
+                    "This remote trainer does not support training on chosen GPUs yet; update its trainer image"
                 )
             response.raise_for_status()
             data = response.json()

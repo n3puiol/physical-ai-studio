@@ -49,25 +49,25 @@ def resolve_accelerator(device_type: str | None = None) -> str:
 
 
 MULTI_DEVICE_STRATEGY = "ddp_find_unused_parameters_true"
-"""Lightning strategy for a run on every device (``all_devices``).
+"""Lightning strategy for a run on several devices (``all_devices`` or ``device_indices``).
 
 DDP with unused-parameter detection: policies such as SmolVLA and Pi0.5 freeze
 parts of the model, so not every parameter receives a gradient each step, and
 plain DDP fails on the first step. Named explicitly because the library only
-infers it from an explicit device count, and an all-device run asks for
+infers it from an explicit device count, and a multi-device run asks for
 ``devices=-1``.
 """
 
 
-def resolve_strategy(device_type: str | None = None, *, all_devices: bool = False) -> str:
+def resolve_strategy(device_type: str | None = None, *, multi_device: bool = False) -> str:
     """Return the Lightning strategy string for a training run.
 
-    XPU needs its own single-device strategy, a run on every device needs
+    XPU needs its own single-device strategy, a run on several devices needs
     :data:`MULTI_DEVICE_STRATEGY`, and everything else is covered by ``"auto"``.
 
     Args:
         device_type: Explicit accelerator, or None to auto-detect.
-        all_devices: Whether the run trains on every visible device.
+        multi_device: Whether the run trains with DDP on every visible device.
 
     Returns:
         The strategy name to pass to the trainer.
@@ -75,25 +75,29 @@ def resolve_strategy(device_type: str | None = None, *, all_devices: bool = Fals
     Example:
         >>> resolve_strategy("cpu")
         'auto'
-        >>> resolve_strategy("cuda", all_devices=True)
+        >>> resolve_strategy("cuda", multi_device=True)
         'ddp_find_unused_parameters_true'
     """
-    if all_devices:
+    if multi_device:
         return MULTI_DEVICE_STRATEGY
     return "xpu_single" if resolve_accelerator(device_type) == "xpu" else "auto"
 
 
-def resolve_devices(device_index: int | None = None, *, all_devices: bool = False) -> list[int] | int:
+def resolve_devices(device_index: int | None = None, *, multi_device: bool = False) -> list[int] | int:
     """Return the Lightning ``devices`` value for a training run.
+
+    A multi-device run trains on every *visible* device: for a chosen subset
+    (``device_indices``), the launcher sets ``CUDA_VISIBLE_DEVICES`` so only
+    those devices are visible (see :func:`trainer.devices.visible_devices_for`).
 
     Args:
         device_index: Zero-based index of the accelerator to train on, or None
             to let Lightning pick one device.
-        all_devices: Train on every visible device. Takes precedence over
+        multi_device: Train on every visible device. Takes precedence over
             ``device_index``.
 
     Returns:
-        ``-1`` (every visible device) when ``all_devices`` is set,
+        ``-1`` (every visible device) when ``multi_device`` is set,
         ``[device_index]`` when an index is given, otherwise ``1``.
 
     Example:
@@ -101,9 +105,9 @@ def resolve_devices(device_index: int | None = None, *, all_devices: bool = Fals
         [2]
         >>> resolve_devices()
         1
-        >>> resolve_devices(all_devices=True)
+        >>> resolve_devices(multi_device=True)
         -1
     """
-    if all_devices:
+    if multi_device:
         return -1
     return [device_index] if device_index is not None else 1

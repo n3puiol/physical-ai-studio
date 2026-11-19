@@ -15,6 +15,7 @@ import { supportsLora } from '../shared/peft';
 import { supportsSnapflow } from '../shared/snapflow';
 import { ExportStep } from './export-step';
 import { FeatureMappingStep } from './feature-mapping-step';
+import { gpuKey, GpuSelection, resolveGpuSelection } from './gpu-selection';
 import { formatBytes } from './policies';
 import { SetupStep } from './setup-step';
 import { TrainingDeviceInfo } from './training-device-info';
@@ -57,14 +58,10 @@ const DEFAULT_SNAPFLOW_DISTILL_EPOCHS = 3;
 /** Strip the `trainer:` prefix off a training-target option id. */
 const targetRawId = (id: string): string => id.split(':', 2)[1] ?? id;
 
-/** GPU picker key for training one job on every CUDA GPU of a remote trainer. */
-export const ALL_GPUS_KEY = 'cuda:all';
-
 export const TrainModelDialog = ({ baseModel, close, defaultMaxEpochs = 5 }: TrainModelDialogProps) => {
     const bestDevice = useBestTrainingDevice();
     const { data: remoteTrainers = [] } = $api.useQuery('get', '/api/remote-trainers');
     const { data: jobs = [] } = $api.useQuery('get', '/api/jobs');
-    const gpuKey = (device: SchemaDeviceInfo) => `${device.type}:${device.index}`;
     // Trainer memory telemetry also sees jobs from other Studio installations.
     const busyGpuKeysFor = (trainerId: string, devices: SchemaDeviceInfo[]) =>
         new Set([
@@ -76,7 +73,9 @@ export const TrainModelDialog = ({ baseModel, close, defaultMaxEpochs = 5 }: Tra
                 job.payload.remote_trainer_id === trainerId
                     ? job.payload.device?.all_devices
                         ? devices.map(gpuKey)
-                        : [`${job.payload.device?.type ?? devices[0]?.type}:${job.payload.device?.index ?? 0}`]
+                        : job.payload.device?.indices
+                          ? job.payload.device.indices.map((index) => `${job.payload.device?.type}:${index}`)
+                          : [`${job.payload.device?.type ?? devices[0]?.type}:${job.payload.device?.index ?? 0}`]
                     : []
             ),
         ]);
@@ -171,7 +170,10 @@ export const TrainModelDialog = ({ baseModel, close, defaultMaxEpochs = 5 }: Tra
     const [snapflowEnabled, setSnapflowEnabled] = useState<boolean>(false);
     const [snapflowDistillEpochs, setSnapflowDistillEpochs] = useState<number>(DEFAULT_SNAPFLOW_DISTILL_EPOCHS);
     const [augmentImages, setAugmentImages] = useState<boolean>(false);
-    const [selectedGpuKey, setSelectedGpuKey] = useState<Key | null>(null);
+    /** The GPUs ticked by the user; `null` until they tick one, which means the first free GPU. */
+    const [selectedGpuKeys, setSelectedGpuKeys] = useState<string[] | null>(null);
+    /** Train on every CUDA GPU that is free when the job is submitted. */
+    const [autoSelectGpus, setAutoSelectGpus] = useState<boolean>(false);
     const selectedTarget = trainingTargetOptions.find((option) => option.id === targetId) ?? null;
     const isRemoteTarget = selectedTarget?.kind === 'trainer';
     const isLoraSupported = supportsLora(selectedPolicy);
@@ -218,47 +220,72 @@ export const TrainModelDialog = ({ baseModel, close, defaultMaxEpochs = 5 }: Tra
         ) === true;
     const remoteDevices = isBatchTarget ? [] : (remoteTrainerHealth?.devices ?? []);
     const busyGpuKeys = busyGpuKeysFor(targetRawId(selectedTarget?.id ?? ''), remoteDevices);
-    // Training on every GPU is opt-in, and only offered by trainers with several CUDA GPUs
-    // whose image reports it can (older trainer images reject the request).
+    const remoteCapabilities = remoteTrainerHealth?.capabilities ?? [];
     const remoteCudaDevices = remoteDevices.filter((device) => device.type === 'cuda');
-    const trainerSupportsAllGpus = remoteTrainerHealth?.capabilities?.includes('all_devices') === true;
-    const allGpusCount =
-        isRemoteTarget && !isBatchTarget && trainerSupportsAllGpus && remoteCudaDevices.length > 1
-            ? remoteCudaDevices.length
-            : 0;
-    const isAllGpus = isRemoteTarget && !isBatchTarget && selectedGpuKey === ALL_GPUS_KEY;
-    const trainingDeviceCount = isAllGpus ? remoteCudaDevices.length : 1;
-    // With every GPU selected, the first one stands in for "the device" wherever a
-    // single one is described (precision, memory hints): they train in lockstep.
-    const selectedRemoteDevice = isAllGpus
-        ? (remoteCudaDevices[0] ?? null)
-        : selectedGpuKey === null
-          ? (remoteDevices.find((device) => !busyGpuKeys.has(gpuKey(device))) ?? remoteDevices[0] ?? null)
-          : (remoteDevices.find((device) => gpuKey(device) === selectedGpuKey) ?? null);
-    const selectedGpuUnavailable =
-        isRemoteTarget &&
-        !isBatchTarget &&
-        selectedGpuKey !== null &&
-        (isAllGpus ? allGpusCount === 0 : selectedRemoteDevice === null);
-    const selectedGpuBusy = isAllGpus
-        ? remoteCudaDevices.some((device) => busyGpuKeys.has(gpuKey(device)))
-        : selectedRemoteDevice !== null && busyGpuKeys.has(gpuKey(selectedRemoteDevice));
+    const canSelectGpus = isRemoteTarget && !isBatchTarget;
+    // Picking "every free GPU" lands on an arbitrary set of them, so it needs a
+    // trainer image that can train on a chosen set.
+    const canAutoSelectGpus =
+        canSelectGpus && remoteCapabilities.includes('device_indices') && remoteCudaDevices.length > 1;
+    const isAutoSelectingGpus = autoSelectGpus && canAutoSelectGpus;
+    // The GPUs a job would train on, given the trainer's devices and which are busy.
+    // Training on several GPUs is opt-in: by default the job takes the first free GPU,
+    // or the first GPU when all are occupied (it then waits for it).
+    const gpuKeysFor = (devices: SchemaDeviceInfo[], busyKeys: Set<string>): string[] => {
+        if (isAutoSelectingGpus) {
+            return devices.filter((device) => device.type === 'cuda' && !busyKeys.has(gpuKey(device))).map(gpuKey);
+        }
+        if (selectedGpuKeys !== null) {
+            return selectedGpuKeys;
+        }
+        const firstFree = devices.find((device) => !busyKeys.has(gpuKey(device))) ?? devices[0];
+        return firstFree ? [gpuKey(firstFree)] : [];
+    };
+    // `null` leaves the device to the trainer (it reports none, or the user hasn't chosen).
+    const gpuSelectionFor = (
+        devices: SchemaDeviceInfo[],
+        busyKeys: Set<string>,
+        capabilities: readonly string[]
+    ): GpuSelection | null => {
+        const keys = gpuKeysFor(devices, busyKeys);
+        if (isAutoSelectingGpus && keys.length === 0) {
+            return {
+                kind: 'invalid',
+                devices: [],
+                message: 'Every GPU is busy right now. Untick auto-select to queue the job on chosen GPUs.',
+            };
+        }
+        if (keys.length === 0 && selectedGpuKeys === null) {
+            return null;
+        }
+        return resolveGpuSelection(keys, devices, capabilities);
+    };
+    const shownGpuKeys = canSelectGpus ? gpuKeysFor(remoteDevices, busyGpuKeys) : [];
+    const gpuSelection = canSelectGpus ? gpuSelectionFor(remoteDevices, busyGpuKeys, remoteCapabilities) : null;
+    const gpuSelectionError = gpuSelection?.kind === 'invalid' ? gpuSelection.message : null;
+    const isAllGpus = gpuSelection?.kind === 'all';
+    const isChosenGpus = gpuSelection?.kind === 'indices';
+    const isMultiGpu = isAllGpus || isChosenGpus;
+    const trainingDeviceCount = isMultiGpu ? gpuSelection.devices.length : 1;
+    // With several GPUs, the first one stands in for "the device" wherever a single
+    // one is described (precision, memory hints): they train in lockstep.
+    const selectedRemoteDevice = gpuSelection?.devices[0] ?? null;
+    const selectedGpuBusy = (gpuSelection?.devices ?? []).some((device) => busyGpuKeys.has(gpuKey(device)));
     // Batch size applies per GPU, so each step covers `trainingDeviceCount` batches.
-    const trainingSteps = useMemo(
-        () =>
-            selectedDatasetEpisodes === undefined
-                ? undefined
-                : getEstimatedTrainingSteps(
-                      selectedDatasetEpisodes.map(({ length }) => length),
-                      batchSize * trainingDeviceCount,
-                      maxEpochs + (isSnapflowRequested ? snapflowDistillEpochs : 0)
-                  ),
-        [selectedDatasetEpisodes, batchSize, trainingDeviceCount, maxEpochs, isSnapflowRequested, snapflowDistillEpochs]
-    );
+    // Left to the React Compiler to memoize: the GPU selection it depends on is
+    // derived from state through closures a manual dependency list can't vouch for.
+    const trainingSteps =
+        selectedDatasetEpisodes === undefined
+            ? undefined
+            : getEstimatedTrainingSteps(
+                  selectedDatasetEpisodes.map(({ length }) => length),
+                  batchSize * trainingDeviceCount,
+                  maxEpochs + (isSnapflowRequested ? snapflowDistillEpochs : 0)
+              );
     // Default to the first free GPU, or the first GPU when all are occupied.
     const activeDevice = isRemoteTarget ? selectedRemoteDevice : bestDevice;
     // Auto batch size is CUDA-only, and Lightning cannot tune the batch size of a distributed run.
-    const isAutoScaleBatchDisabled = activeDevice?.type !== 'cuda' || isAllGpus;
+    const isAutoScaleBatchDisabled = activeDevice?.type !== 'cuda' || isMultiGpu;
     const effectiveAutoScaleBatchSize = autoScaleBatchSize && !isAutoScaleBatchDisabled;
 
     useEffect(() => {
@@ -304,7 +331,7 @@ export const TrainModelDialog = ({ baseModel, close, defaultMaxEpochs = 5 }: Tra
         !availablePolicies.some((policy) => policy.id === selectedPolicy) ||
         targetId === null ||
         remoteUnavailable ||
-        selectedGpuUnavailable ||
+        gpuSelectionError !== null ||
         policyAccessBlocksTraining;
 
     // A policy without a fixed camera order has no feature-mapping step at all,
@@ -333,10 +360,12 @@ export const TrainModelDialog = ({ baseModel, close, defaultMaxEpochs = 5 }: Tra
     const summaryDevice =
         activeDevice === null || activeDevice === undefined
             ? trainingTargetLabel
-            : isAllGpus
-              ? `${trainingTargetLabel} — all ${trainingDeviceCount} GPUs (${activeDevice.name}${
-                    activeDevice.memory ? `, ${formatBytes(activeDevice.memory)} each` : ''
-                })`
+            : isMultiGpu
+              ? `${trainingTargetLabel} — ${
+                    isAllGpus
+                        ? `all ${trainingDeviceCount} GPUs`
+                        : `GPUs ${gpuSelection.devices.map((device) => device.index).join(', ')}`
+                } (${activeDevice.name}${activeDevice.memory ? `, ${formatBytes(activeDevice.memory)} each` : ''})`
               : `${trainingTargetLabel} — ${activeDevice.name}${
                     activeDevice.memory ? `, ${formatBytes(activeDevice.memory)}` : ''
                 }`;
@@ -373,7 +402,7 @@ export const TrainModelDialog = ({ baseModel, close, defaultMaxEpochs = 5 }: Tra
                 setSubmitError('Export formats are still loading. Try again in a moment.');
                 return;
             }
-            let submissionDevice = selectedRemoteDevice;
+            let submissionSelection = gpuSelection;
             if (isRemoteTarget) {
                 // Final guard: the remote trainer may have gone offline since the last
                 // poll, so re-check availability right before submitting the job.
@@ -390,32 +419,18 @@ export const TrainModelDialog = ({ baseModel, close, defaultMaxEpochs = 5 }: Tra
                     setSubmitError("Can't reach the remote trainer right now. Make sure it's running, then try again.");
                     return;
                 }
+                // Re-resolve against fresh health: GPUs, their busy state and the image's
+                // capabilities may all have changed since the dialog last polled.
                 const latestDevices = isBatchTarget ? [] : (latestHealth.devices ?? []);
-                const latestBusyGpuKeys = busyGpuKeysFor(targetRawId(selectedTarget.id), latestDevices);
-                if (isAllGpus) {
-                    const latestCudaDevices = latestDevices.filter((device) => device.type === 'cuda');
-                    if (latestHealth.capabilities?.includes('all_devices') !== true) {
-                        setSubmitError(
-                            "This trainer's image doesn't support training on all GPUs yet. " +
-                                'Choose a single GPU instead.'
-                        );
-                        return;
-                    }
-                    if (latestCudaDevices.length < 2) {
-                        setSubmitError('This trainer no longer has several CUDA GPUs. Choose a single GPU instead.');
-                        return;
-                    }
-                    submissionDevice = latestCudaDevices[0];
-                } else {
-                    submissionDevice =
-                        selectedGpuKey === null
-                            ? (latestDevices.find((device) => !latestBusyGpuKeys.has(gpuKey(device))) ??
-                              latestDevices[0] ??
-                              null)
-                            : (latestDevices.find((device) => gpuKey(device) === selectedGpuKey) ?? null);
-                }
-                if (selectedGpuKey !== null && submissionDevice === null) {
-                    setSubmitError('The selected GPU is no longer available on this trainer. Choose another GPU.');
+                submissionSelection = isBatchTarget
+                    ? null
+                    : gpuSelectionFor(
+                          latestDevices,
+                          busyGpuKeysFor(targetRawId(selectedTarget.id), latestDevices),
+                          latestHealth.capabilities ?? []
+                      );
+                if (submissionSelection?.kind === 'invalid') {
+                    setSubmitError(submissionSelection.message);
                     return;
                 }
             }
@@ -460,17 +475,28 @@ export const TrainModelDialog = ({ baseModel, close, defaultMaxEpochs = 5 }: Tra
                       ...commonPayload,
                       training_target: 'remote',
                       remote_trainer_id: targetRawId(selectedTarget.id),
-                      ...(isAllGpus
+                      ...(submissionSelection?.kind === 'all'
                           ? { device: { type: 'cuda' as const, index: null, all_devices: true } }
-                          : submissionDevice
+                          : submissionSelection?.kind === 'indices'
                             ? {
                                   device: {
-                                      type: submissionDevice.type,
-                                      index: submissionDevice.index,
+                                      type: 'cuda' as const,
+                                      index: null,
                                       all_devices: false,
+                                      indices: submissionSelection.devices
+                                          .flatMap((device) => (typeof device.index === 'number' ? [device.index] : []))
+                                          .sort((a, b) => a - b),
                                   },
                               }
-                            : {}),
+                            : submissionSelection?.kind === 'single'
+                              ? {
+                                    device: {
+                                        type: submissionSelection.devices[0].type,
+                                        index: submissionSelection.devices[0].index,
+                                        all_devices: false,
+                                    },
+                                }
+                              : {}),
                   }
                 : { ...commonPayload, training_target: 'local' };
 
@@ -532,14 +558,26 @@ export const TrainModelDialog = ({ baseModel, close, defaultMaxEpochs = 5 }: Tra
                                 targetId={targetId}
                                 onTargetIdChange={(value) => {
                                     setTargetId(value);
-                                    setSelectedGpuKey(null);
+                                    setSelectedGpuKeys(null);
+                                    setAutoSelectGpus(false);
                                 }}
-                                remoteDevices={isRemoteTarget ? remoteDevices : []}
+                                remoteDevices={canSelectGpus ? remoteDevices : []}
                                 busyGpuKeys={busyGpuKeys}
-                                allGpusCount={allGpusCount}
-                                selectedGpuKey={selectedGpuKey}
-                                onSelectedGpuKeyChange={setSelectedGpuKey}
-                                selectedGpuUnavailable={selectedGpuUnavailable}
+                                showGpuSelection={
+                                    canSelectGpus && (remoteDevices.length > 1 || selectedGpuKeys !== null)
+                                }
+                                selectedGpuKeys={shownGpuKeys}
+                                onSelectedGpuKeysChange={setSelectedGpuKeys}
+                                canAutoSelectGpus={canAutoSelectGpus}
+                                autoSelectGpus={isAutoSelectingGpus}
+                                onAutoSelectGpusChange={(enabled) => {
+                                    // Unticking keeps the GPUs auto-select had picked, ready to adjust.
+                                    if (!enabled) {
+                                        setSelectedGpuKeys(shownGpuKeys);
+                                    }
+                                    setAutoSelectGpus(enabled);
+                                }}
+                                gpuSelectionError={gpuSelectionError}
                                 remoteUnavailable={remoteUnavailable}
                                 selectedPolicy={selectedPolicy}
                                 availablePolicies={availablePolicies}

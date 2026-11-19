@@ -173,6 +173,15 @@ class TrainingJobSpec(BaseModel):
             "and no device_index; batch_size then applies per device."
         ),
     )
+    device_indices: list[int] | None = Field(
+        default=None,
+        min_length=2,
+        description=(
+            "Train with DDP across these CUDA devices (two or more zero-based indices) instead of one. "
+            "Requires device_type='cuda', no device_index, and not all_devices; batch_size then applies per "
+            "device. The launcher makes only these devices visible to training."
+        ),
+    )
     lora_enabled: bool = Field(
         default=False,
         description=(
@@ -215,28 +224,47 @@ class TrainingJobSpec(BaseModel):
             raise ValueError(msg)
         return self
 
+    @property
+    def is_multi_device(self) -> bool:
+        """Whether the run trains with DDP on several devices (``all_devices`` or ``device_indices``)."""
+        return self.all_devices or self.device_indices is not None
+
     @model_validator(mode="after")
-    def validate_all_devices(self) -> TrainingJobSpec:
-        """Reject a multi-device request the run cannot honour.
+    def validate_multi_device(self) -> TrainingJobSpec:
+        """Reject a multi-device request the run cannot honour, and sort ``device_indices``.
 
         Returns:
             The validated spec.
 
         Raises:
-            ValueError: If ``all_devices`` is combined with a non-CUDA
-                accelerator, a single device index, or batch size search.
+            ValueError: If ``all_devices`` or ``device_indices`` is combined
+                with a non-CUDA accelerator, a single device index, the other
+                multi-device option, or batch size search, or if
+                ``device_indices`` repeats or has a negative index.
         """
-        if not self.all_devices:
+        if not self.is_multi_device:
             return self
+        option = "all_devices" if self.all_devices else "device_indices"
+        if self.all_devices and self.device_indices is not None:
+            msg = "all_devices and device_indices are alternatives; set only one."
+            raise ValueError(msg)
         if self.device_type != "cuda":
-            msg = f"all_devices requires device_type='cuda', got {self.device_type!r}."
+            msg = f"{option} requires device_type='cuda', got {self.device_type!r}."
             raise ValueError(msg)
         if self.device_index is not None:
-            msg = "all_devices trains on every device; it cannot be combined with device_index."
+            msg = f"{option} trains on several devices; it cannot be combined with device_index."
             raise ValueError(msg)
         if self.auto_scale_batch_size:
-            msg = "auto_scale_batch_size is not supported with all_devices: Lightning cannot tune distributed runs."
+            msg = f"auto_scale_batch_size is not supported with {option}: Lightning cannot tune distributed runs."
             raise ValueError(msg)
+        if self.device_indices is not None:
+            if any(index < 0 for index in self.device_indices):
+                msg = f"device_indices must be zero-based device indices, got {self.device_indices}."
+                raise ValueError(msg)
+            if len(set(self.device_indices)) != len(self.device_indices):
+                msg = f"device_indices must not repeat a device, got {self.device_indices}."
+                raise ValueError(msg)
+            self.device_indices = sorted(self.device_indices)
         return self
 
     @model_validator(mode="after")
@@ -403,7 +431,7 @@ def run_training_job(
     export, and export conversion (OpenVINO in particular) can need several GB
     on top of that.
 
-    Under DDP (``spec.all_devices``) every rank calls this function. All ranks
+    Under DDP (``spec.is_multi_device``) every rank calls this function. All ranks
     train and finalize checkpoints together; only global rank 0 reports
     progress, publishes ``output_dir``, and exports. The other ranks return
     once checkpoints are final, leaving ``output_dir`` untouched.
@@ -442,7 +470,7 @@ def run_training_job(
             train_batch_size=spec.batch_size,
             num_workers=spec.num_workers,
             val_split=spec.val_split,
-            val_split_seed=DDP_VAL_SPLIT_SEED if spec.all_devices else None,
+            val_split_seed=DDP_VAL_SPLIT_SEED if spec.is_multi_device else None,
             # Applied to the train split only; the datamodule leaves validation
             # images untouched so eval loss stays comparable across runs.
             image_transforms=DefaultImageAugmentations() if spec.augment_images else None,
@@ -465,8 +493,8 @@ def run_training_job(
             logger=CSVLogger(cache_dir.parent, name=cache_dir.stem),
             callbacks=callbacks,
             accelerator=accelerator,
-            strategy=resolve_strategy(spec.device_type, all_devices=spec.all_devices),
-            devices=resolve_devices(spec.device_index, all_devices=spec.all_devices),
+            strategy=resolve_strategy(spec.device_type, multi_device=spec.is_multi_device),
+            devices=resolve_devices(spec.device_index, multi_device=spec.is_multi_device),
             max_epochs=spec.max_epochs,
             auto_scale_batch_size=spec.auto_scale_batch_size,
             precision=spec.precision,

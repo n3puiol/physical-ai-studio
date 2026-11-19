@@ -10,10 +10,15 @@ local CPU. Mirrors the studio backend's device enumeration.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from loguru import logger
 
 from trainer.schemas import DeviceInfo
 from trainer.settings import get_settings
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
 def gpu_busy(device_type: str, index: int) -> bool | None:
@@ -76,3 +81,37 @@ def get_training_devices() -> list[DeviceInfo]:
         logger.warning("Failed to enumerate CUDA devices: {}", exc)
 
     return devices
+
+
+def visible_devices_for(indices: Sequence[int], parent: str | None) -> str:
+    """Return the ``CUDA_VISIBLE_DEVICES`` value that exposes exactly ``indices`` to a child process.
+
+    ``indices`` are the indices this trainer reports (torch's numbering in this
+    process). When the trainer itself runs with ``CUDA_VISIBLE_DEVICES`` set,
+    those indices point into that list, so they are mapped through it; its
+    entries may be numbers or ``GPU-…``/``MIG-…`` UUIDs and are passed on as is.
+
+    Args:
+        indices: The devices the child may use, in the order it should number them.
+        parent: This process's ``CUDA_VISIBLE_DEVICES``, or None when unset.
+
+    Returns:
+        A comma-separated device list for the child's environment.
+
+    Raises:
+        ValueError: If an index is outside the parent's visible devices.
+
+    Example:
+        >>> visible_devices_for([0, 2], None)
+        '0,2'
+        >>> visible_devices_for([0, 1], "4,5,6,7")
+        '4,5'
+    """
+    if parent is None:
+        return ",".join(str(index) for index in indices)
+    entries = [entry.strip() for entry in parent.split(",") if entry.strip()]
+    missing = [index for index in indices if not 0 <= index < len(entries)]
+    if missing:
+        msg = f"CUDA device {missing[0]} is not among this trainer's visible devices ({parent!r})"
+        raise ValueError(msg)
+    return ",".join(entries[index] for index in indices)

@@ -5,8 +5,9 @@
 
 A single asyncio loop polls the store for queued jobs and reserves each GPU for
 one job. Parallel training runs in separate processes so process-global state
-(including HF_TOKEN) cannot leak between jobs. A multi-device job reserves every
-GPU and runs as its own ``torchrun`` process group (see :mod:`trainer.ddp_entry`).
+(including HF_TOKEN) cannot leak between jobs. A multi-device job reserves the
+GPUs it trains on (or every GPU) and runs as its own ``torchrun`` process group
+(see :mod:`trainer.ddp_entry`).
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from typing import Any
 from loguru import logger
 
 from trainer import ddp_entry
-from trainer.devices import get_training_devices, gpu_busy
+from trainer.devices import get_training_devices, gpu_busy, visible_devices_for
 from trainer.runner import JobCanceledError, TrainerRunner
 from trainer.schemas import SubmitJobRequest, TrainerJobStatus
 from trainer.settings import get_settings
@@ -37,11 +38,65 @@ _DDP_TERMINATE_GRACE_S = 30.0
 """How long a canceled multi-device job gets to exit after SIGTERM before SIGKILL."""
 
 
-def _job_device(request: SubmitJobRequest | None) -> tuple[str, int] | None:
-    """Return the single GPU a job trains on, or None when it may use (or uses) every device."""
+DeviceSet = frozenset[tuple[str, int]]
+"""The ``(device_type, index)`` GPUs a running or queued job holds."""
+
+
+def _job_devices(request: SubmitJobRequest | None) -> DeviceSet | None:
+    """Return the GPUs a job trains on, or None when it may use (or uses) every device."""
     if request is None or request.spec.all_devices or request.spec.device_type not in {"cuda", "xpu"}:
         return None
-    return request.spec.device_type, request.spec.device_index or 0
+    if request.spec.device_indices is not None:
+        return frozenset((request.spec.device_type, index) for index in request.spec.device_indices)
+    return frozenset({(request.spec.device_type, request.spec.device_index or 0)})
+
+
+def _overlaps(first: DeviceSet | None, second: DeviceSet | None) -> bool:
+    """Whether two jobs would share a GPU; None (the whole trainer) overlaps everything."""
+    return first is None or second is None or not first.isdisjoint(second)
+
+
+def _describe(devices: DeviceSet) -> str:
+    """Name a set of GPUs for a queue message, e.g. ``CUDA 0, 2, 3``."""
+    by_type: dict[str, list[int]] = {}
+    for device_type, index in sorted(devices):
+        by_type.setdefault(device_type, []).append(index)
+    return " and ".join(
+        f"{device_type.upper()} {', '.join(str(index) for index in indices)}"
+        for device_type, indices in by_type.items()
+    )
+
+
+def _ddp_launch(request: SubmitJobRequest) -> tuple[int, dict[str, str]]:
+    """Return the process count and environment for a multi-device job's ``torchrun``.
+
+    An ``all_devices`` job gets one process per CUDA device. A ``device_indices``
+    job gets one per chosen device, and ``CUDA_VISIBLE_DEVICES`` hides the rest.
+
+    Raises:
+        RuntimeError: If the trainer reports no CUDA device, or not every
+            chosen one.
+    """
+    reported = sorted(device.index for device in get_training_devices() if device.type == "cuda")
+    env = dict(os.environ)
+    indices = request.spec.device_indices
+    if indices is None:
+        if not reported:
+            msg = "Multi-device training needs CUDA devices, but the trainer reports none"
+            raise RuntimeError(msg)
+        return len(reported), env
+    missing = [index for index in indices if index not in reported]
+    if missing:
+        msg = (
+            f"The trainer has no CUDA device {', '.join(str(index) for index in missing)} "
+            f"(it reports {', '.join(str(index) for index in reported) or 'none'})"
+        )
+        raise RuntimeError(msg)
+    try:
+        env["CUDA_VISIBLE_DEVICES"] = visible_devices_for(indices, os.environ.get("CUDA_VISIBLE_DEVICES"))
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    return len(indices), env
 
 
 async def _terminate_process_group(process: asyncio.subprocess.Process, grace_s: float) -> None:
@@ -88,7 +143,7 @@ class QueueManager:
         self._ddp_dir = settings.storage_dir / "ddp"
         self._cancel_requested: set[str] = set()
         self._active: dict[str, asyncio.Task] = {}
-        self._active_devices: dict[str, tuple[str, int] | None] = {}
+        self._active_devices: dict[str, DeviceSet | None] = {}
         self._stopped = asyncio.Event()
         self._loop_task: asyncio.Task | None = None
 
@@ -120,27 +175,30 @@ class QueueManager:
             self.store.update(job_id, status=TrainerJobStatus.CANCELED, message="Canceled before start")
             self.store.discard_secret(job_id)
 
-    def _next_runnable(self) -> tuple[str, tuple[str, int] | None] | None:
+    def _next_runnable(self) -> tuple[str, DeviceSet | None] | None:
         # Scan the small queue; index by device if queued job counts grow.
         next_job = None
         for job_id in self.store.queued():
             request = self.store.get_request(job_id)
-            # Legacy auto-selection may use any GPU, and a multi-device job uses
-            # every GPU: both reserve the entire trainer.
-            device = _job_device(request)
+            # Legacy auto-selection may use any GPU, and an all-device job uses
+            # every GPU: both reserve the entire trainer. Other jobs hold a set
+            # of GPUs and may run alongside any job whose set is disjoint.
+            devices = _job_devices(request)
             all_devices = request is not None and request.spec.all_devices
-            reserved = (device is None and bool(self._active)) or any(
-                active_device is None or active_device == device for active_device in self._active_devices.values()
+            reserved = (devices is None and bool(self._active)) or any(
+                _overlaps(active_devices, devices) for active_devices in self._active_devices.values()
             )
             # Unknown telemetry is not treated as busy; older setups still work.
             busy = reserved or (
-                gpu_busy(*device) if device is not None else any(gpu.busy for gpu in get_training_devices())
+                any(gpu_busy(*device) for device in sorted(devices))
+                if devices is not None
+                else any(gpu.busy for gpu in get_training_devices())
             )
             message = (
                 "Waiting for all GPUs to become available"
                 if busy and all_devices
-                else f"Waiting for {device[0].upper()} {device[1]} to become available"
-                if busy and device is not None
+                else f"Waiting for {_describe(devices)} to become available"
+                if busy and devices is not None
                 else "Waiting for a training slot to become available"
                 if busy and reserved
                 else "Waiting for a GPU to become available"
@@ -151,7 +209,7 @@ class QueueManager:
             if state is not None and state.status == TrainerJobStatus.QUEUED and state.message != message:
                 self.store.update(job_id, message=message)
             if not busy and next_job is None:
-                next_job = job_id, device
+                next_job = job_id, devices
         return next_job
 
     async def _dispatch_loop(self) -> None:
@@ -160,14 +218,14 @@ class QueueManager:
                 next_job = self._next_runnable()
                 if next_job is None:
                     break
-                job_id, device = next_job
+                job_id, devices = next_job
                 state = self.store.get(job_id)
                 if state is None or state.status != TrainerJobStatus.QUEUED:
                     continue
                 self.store.update(job_id, status=TrainerJobStatus.RUNNING, progress=0, message="Starting")
                 task = asyncio.create_task(self._run_job(job_id))
                 self._active[job_id] = task
-                self._active_devices[job_id] = device
+                self._active_devices[job_id] = devices
             # Keep queued-job reasons current even when all training slots are occupied.
             if len(self._active) >= self._max_concurrent_jobs:
                 self._next_runnable()
@@ -191,7 +249,7 @@ class QueueManager:
             def _should_stop() -> bool:
                 return job_id in self._cancel_requested or self._stopped.is_set()
 
-            if request.spec.all_devices:
+            if request.spec.is_multi_device:
                 archive_path = await self._run_ddp(job_id, request, _report, _should_stop)
             elif self._max_concurrent_jobs == 1:
                 archive_path = await asyncio.to_thread(
@@ -260,26 +318,31 @@ class QueueManager:
         its HF token, which travels in the child's environment instead.
         Cancellation stops the whole process group.
 
+        An ``all_devices`` job trains on every CUDA device. A ``device_indices``
+        job starts one process per chosen device, and ``CUDA_VISIBLE_DEVICES``
+        makes only those devices visible to it.
+
         Raises:
             JobCanceledError: If cancellation was requested.
-            RuntimeError: If there is no CUDA device, or the job fails.
+            RuntimeError: If the trainer lacks the CUDA devices the job needs,
+                or the job fails.
         """
-        nproc = sum(1 for device in get_training_devices() if device.type == "cuda")
-        if nproc == 0:
-            msg = "Multi-device training needs CUDA devices, but the trainer reports none"
-            raise RuntimeError(msg)
-
+        nproc, env = _ddp_launch(request)
+        indices = request.spec.device_indices
         job_dir = self._ddp_dir / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
         request_path, events_path = job_dir / "request.json", job_dir / "events.jsonl"
         request_path.write_text(request.model_dump_json(exclude={"spec": {"run_options"}}), encoding="utf-8")
         events_path.unlink(missing_ok=True)
-        env = dict(os.environ)
         if request.spec.run_options.hf_token is not None:
             env["HF_TOKEN"] = request.spec.run_options.hf_token.get_secret_value()
 
         command = ddp_entry.build_command(job_id, request_path, events_path, nproc=nproc)
-        logger.info("Starting multi-device job on {} CUDA devices", nproc)
+        logger.info(
+            "Starting multi-device job on {} CUDA devices{}",
+            nproc,
+            f" (CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']})" if indices is not None else "",
+        )
         process = await asyncio.create_subprocess_exec(*command, env=env, start_new_session=True)
         events = ddp_entry.EventReader(events_path)
         archive: Path | None = None

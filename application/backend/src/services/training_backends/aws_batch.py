@@ -156,9 +156,9 @@ class AwsBatchTrainingBackend:
         s3.put_object(
             Bucket=self._connection.bucket,
             Key=f"{prefix}/spec.json",
-            # Omit the multi-device default so the spec stays readable by a Batch image
-            # that predates it (the trainer forbids unknown spec fields).
-            Body=spec.model_dump_json(exclude={"run_options", "all_devices"}).encode(),
+            # Omit the multi-device defaults so the spec stays readable by a Batch image
+            # that predates them (the trainer forbids unknown spec fields).
+            Body=spec.model_dump_json(exclude={"run_options", "all_devices", "device_indices"}).encode(),
             ContentType="application/json",
         )
 

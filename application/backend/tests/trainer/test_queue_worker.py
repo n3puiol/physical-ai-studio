@@ -52,15 +52,15 @@ def test_queue_skips_busy_gpu_and_reserves_legacy_auto_jobs(manager, sample_requ
     other_gpu = add_job(1)
     auto = add_job(None)
     manager._active[first] = MagicMock()
-    manager._active_devices[first] = ("cuda", 0)
-    assert manager._next_runnable() == (other_gpu, ("cuda", 1))
+    manager._active_devices[first] = frozenset({("cuda", 0)})
+    assert manager._next_runnable() == (other_gpu, frozenset({("cuda", 1)}))
     manager.store.update(first, status=TrainerJobStatus.RUNNING)
     manager._active[other_gpu] = MagicMock()
-    manager._active_devices[other_gpu] = ("cuda", 1)
+    manager._active_devices[other_gpu] = frozenset({("cuda", 1)})
     assert manager._next_runnable() is None
     manager._active.clear()
     manager._active_devices.clear()
-    assert manager._next_runnable() == (same_gpu, ("cuda", 0))
+    assert manager._next_runnable() == (same_gpu, frozenset({("cuda", 0)}))
     manager.store.update(same_gpu, status=TrainerJobStatus.RUNNING)
     manager.store.update(other_gpu, status=TrainerJobStatus.RUNNING)
     assert manager._next_runnable() == (auto, None)
@@ -77,7 +77,7 @@ def test_queue_waits_for_gpu_used_by_another_trainer(manager, sample_request: Su
     assert manager.store.get(job_id).status == TrainerJobStatus.QUEUED
     assert manager.store.get(job_id).message == "Waiting for CUDA 0 to become available"
     monkeypatch.setattr(queue_worker, "gpu_busy", lambda *_: False)
-    assert manager._next_runnable() == (job_id, ("cuda", 0))
+    assert manager._next_runnable() == (job_id, frozenset({("cuda", 0)}))
     assert manager.store.get(job_id).message == "Queued"
 
 
@@ -318,7 +318,7 @@ class TestAllDevicesReservation:
         running = _add_job(manager, sample_request, device_type="cuda", device_index=1)
         manager.store.update(running, status=TrainerJobStatus.RUNNING)
         manager._active[running] = MagicMock()
-        manager._active_devices[running] = ("cuda", 1)
+        manager._active_devices[running] = frozenset({("cuda", 1)})
         ddp = _add_job(manager, sample_request, device_type="cuda", all_devices=True)
 
         assert manager._next_runnable() is None
@@ -369,6 +369,88 @@ class TestAllDevicesReservation:
         assert manager.store.get(ddp).status == TrainerJobStatus.COMPLETED
 
 
+def _gpus(*indices: int) -> frozenset[tuple[str, int]]:
+    return frozenset(("cuda", index) for index in indices)
+
+
+class TestDeviceSetReservation:
+    @pytest.mark.parametrize(
+        ("running", "queued", "runs"),
+        [
+            ({"device_indices": [0, 1]}, {"device_indices": [2, 3]}, True),
+            ({"device_indices": [0, 1]}, {"device_indices": [1, 2]}, False),
+            ({"device_indices": [0, 1]}, {"device_index": 3}, True),
+            ({"device_indices": [0, 1]}, {"device_index": 0}, False),
+            ({"device_index": 2}, {"device_indices": [0, 1]}, True),
+            ({"device_index": 1}, {"device_indices": [0, 1]}, False),
+            ({"all_devices": True}, {"device_indices": [2, 3]}, False),
+            ({"device_indices": [0, 1]}, {"all_devices": True}, False),
+        ],
+    )
+    def test_jobs_share_the_trainer_only_when_their_gpus_are_disjoint(
+        self, manager, sample_request: SubmitJobRequest, running: dict, queued: dict, runs: bool
+    ) -> None:
+        from trainer.queue_worker import _job_devices
+
+        first = _add_job(manager, sample_request, device_type="cuda", **running)
+        manager.store.update(first, status=TrainerJobStatus.RUNNING)
+        manager._active[first] = MagicMock()
+        manager._active_devices[first] = _job_devices(manager.store.get_request(first))
+        second = _add_job(manager, sample_request, device_type="cuda", **queued)
+
+        next_job = manager._next_runnable()
+
+        assert (next_job is not None and next_job[0] == second) is runs
+
+    def test_a_legacy_auto_job_waits_for_a_running_subset(self, manager, sample_request: SubmitJobRequest) -> None:
+        running = _add_job(manager, sample_request, device_type="cuda", device_indices=[0, 1])
+        manager.store.update(running, status=TrainerJobStatus.RUNNING)
+        manager._active[running] = MagicMock()
+        manager._active_devices[running] = _gpus(0, 1)
+        _add_job(manager, sample_request, device_type=None)
+
+        assert manager._next_runnable() is None
+
+    def test_a_queued_subset_names_the_gpus_it_waits_for(self, manager, sample_request: SubmitJobRequest) -> None:
+        running = _add_job(manager, sample_request, device_type="cuda", device_index=2)
+        manager.store.update(running, status=TrainerJobStatus.RUNNING)
+        manager._active[running] = MagicMock()
+        manager._active_devices[running] = _gpus(2)
+        subset = _add_job(manager, sample_request, device_type="cuda", device_indices=[0, 2, 3])
+
+        assert manager._next_runnable() is None
+        assert manager.store.get(subset).message == "Waiting for CUDA 0, 2, 3 to become available"
+
+    def test_a_subset_waits_while_another_workload_uses_one_of_its_gpus(
+        self, manager, sample_request: SubmitJobRequest, monkeypatch
+    ) -> None:
+        from trainer import queue_worker
+
+        monkeypatch.setattr(queue_worker, "gpu_busy", lambda _type, index: index == 3)
+        subset = _add_job(manager, sample_request, device_type="cuda", device_indices=[2, 3])
+        free = _add_job(manager, sample_request, device_type="cuda", device_indices=[0, 1])
+
+        assert manager._next_runnable() == (free, _gpus(0, 1))
+        assert manager.store.get(subset).message == "Waiting for CUDA 2, 3 to become available"
+
+    def test_run_job_sends_subset_jobs_to_torchrun(
+        self, manager, sample_request: SubmitJobRequest, tmp_path: Path
+    ) -> None:
+        subset = _add_job(manager, sample_request, device_type="cuda", device_indices=[0, 1])
+        seen = []
+
+        async def fake_run_ddp(job_id, request, report, should_stop):
+            seen.append(job_id)
+            return tmp_path / "model.zip"
+
+        manager._run_ddp = fake_run_ddp
+
+        asyncio.run(manager._run_job(subset))
+
+        assert seen == [subset]
+        assert manager.store.get(subset).status == TrainerJobStatus.COMPLETED
+
+
 # Plays rank 0 of a torchrun job: argv is [request_path, events_path, mode].
 _FAKE_RANK_ZERO = r"""
 import json, os, subprocess, sys, time
@@ -383,6 +465,9 @@ if mode == "complete":
 elif mode == "fail":
     emit({"type": "failed", "error": "CUDA out of memory"})
     sys.exit(1)
+elif mode == "visible":
+    emit({"type": "progress", "progress": 1, "message": os.environ.get("CUDA_VISIBLE_DEVICES"), "extra_info": None})
+    emit({"type": "completed", "archive": "/tmp/job.zip"})
 elif mode == "crash":
     sys.exit(3)
 elif mode == "hang":
@@ -425,7 +510,7 @@ class TestRunDdp:
 
         with (
             patch(f"{QUEUE}.ddp_entry.build_command", side_effect=fake_command),
-            patch(f"{QUEUE}.get_training_devices", return_value=_cuda_devices(2)),
+            patch(f"{QUEUE}.get_training_devices", return_value=_cuda_devices(4)),
         ):
             yield manager, mode
 
@@ -448,7 +533,7 @@ class TestRunDdp:
         )
 
         assert str(archive) == "/tmp/job.zip"
-        assert mode["nproc"] == 2
+        assert mode["nproc"] == 4
         (progress, token_seen, spec_on_disk) = reported[0]
         assert progress == 40
         assert token_seen == "hf-secret"  # via the environment
@@ -456,6 +541,57 @@ class TestRunDdp:
         assert spec_on_disk["all_devices"] is True
         assert not (tmp_path / "ddp" / "job-1").exists()
         manager._runner.cleanup_uploaded_dataset.assert_called_once_with("job-1")
+
+    @staticmethod
+    def _subset_request(sample_request: SubmitJobRequest, indices: list[int]) -> SubmitJobRequest:
+        spec = sample_request.spec.model_copy(update={"device_type": "cuda", "device_indices": indices})
+        return sample_request.model_copy(update={"spec": spec})
+
+    def test_a_subset_runs_one_process_per_chosen_gpu_and_sees_only_those(
+        self, ddp, sample_request: SubmitJobRequest, monkeypatch
+    ) -> None:
+        manager, mode = ddp
+        mode["value"] = "visible"
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+        reported = []
+
+        asyncio.run(
+            manager._run_ddp(
+                "job-1", self._subset_request(sample_request, [1, 3]), lambda *a: reported.append(a), lambda: False
+            )
+        )
+
+        assert mode["nproc"] == 2
+        assert reported[0][1] == "1,3"
+
+    def test_a_subset_is_mapped_through_the_trainers_own_visible_devices(
+        self, ddp, sample_request: SubmitJobRequest, monkeypatch
+    ) -> None:
+        manager, mode = ddp
+        mode["value"] = "visible"
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4,5,6,7")
+        reported = []
+
+        asyncio.run(
+            manager._run_ddp(
+                "job-1", self._subset_request(sample_request, [0, 2]), lambda *a: reported.append(a), lambda: False
+            )
+        )
+
+        assert reported[0][1] == "4,6"
+
+    def test_a_subset_with_a_gpu_the_trainer_lacks_fails_before_starting(
+        self, ddp, sample_request: SubmitJobRequest, tmp_path: Path
+    ) -> None:
+        manager, mode = ddp
+
+        with pytest.raises(RuntimeError, match="no CUDA device 5"):
+            asyncio.run(
+                manager._run_ddp("job-1", self._subset_request(sample_request, [0, 5]), MagicMock(), lambda: False)
+            )
+
+        assert "nproc" not in mode
+        assert not (tmp_path / "ddp" / "job-1").exists()
 
     def test_rank_zeros_error_becomes_the_failure_message(self, ddp, sample_request: SubmitJobRequest) -> None:
         manager, mode = ddp

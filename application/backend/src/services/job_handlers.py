@@ -110,6 +110,28 @@ class JobHandler(ABC):
         )
 
 
+def _parse_remote_key(key: str) -> tuple[str, frozenset[tuple[str, str]] | None] | None:
+    """Split a direct remote trainer's scheduling key into its trainer and the GPUs it holds.
+
+    ``remote:<id>`` holds the whole trainer (None); ``remote:<id>:<type>:<index>``
+    one device; ``remote:<id>:<type>:<i>,<j>,...`` several (see
+    :meth:`RemoteTrainingTargetHandler.target_key`). Any other key is not a
+    direct remote trainer key (None).
+
+    Example:
+        >>> _parse_remote_key("remote:t1:cuda:0,2")
+        ('t1', frozenset({('cuda', '0'), ('cuda', '2')}))
+        >>> _parse_remote_key("remote:t1")
+        ('t1', None)
+    """
+    parts = key.split(":")
+    if parts[0] != "remote" or len(parts) not in {2, 4}:
+        return None
+    if len(parts) == 2:
+        return parts[1], None
+    return parts[1], frozenset((parts[2], index) for index in parts[3].split(","))
+
+
 class TrainingJobHandler(JobHandler):
     job_type = JobType.TRAINING
     label = "Training"
@@ -119,10 +141,21 @@ class TrainingJobHandler(JobHandler):
         return target_key(TrainJobPayloadAdapter.validate_python(job.payload))
 
     def resource_is_busy(self, resource: str, active: Mapping[str, object]) -> bool:
-        return super().resource_is_busy(resource, active) or (
-            resource.startswith("remote:")
-            and any(key.startswith(f"{resource}:") or resource.startswith(f"{key}:") for key in active)
-        )
+        if super().resource_is_busy(resource, active):
+            return True
+        claim = _parse_remote_key(resource)
+        if claim is None:
+            return False
+        trainer, devices = claim
+        for key in active:
+            other = _parse_remote_key(key)
+            if (
+                other is not None
+                and other[0] == trainer
+                and (devices is None or other[1] is None or not devices.isdisjoint(other[1]))
+            ):
+                return True
+        return False
 
     def create_worker(
         self, job_id: UUID, stop_event: EventClass, cancel_event: EventClass | None, queue: mp.Queue

@@ -84,6 +84,31 @@ class TestAllDevices:
             LocalTrainJobPayload(**_base_kwargs(), device={"type": "cuda", "all_devices": True})
 
 
+class TestDeviceIndices:
+    def test_a_cuda_device_may_list_several_indices_which_are_sorted(self) -> None:
+        device = TrainingDevice(type="cuda", indices=[3, 0, 2])
+        assert (device.index, device.indices, device.is_multi_device) == (None, [0, 2, 3], True)
+
+    @pytest.mark.parametrize(
+        "invalid",
+        [
+            {"type": "xpu", "indices": [0, 1]},
+            {"type": "cuda", "indices": [0]},
+            {"type": "cuda", "indices": [1, 1]},
+            {"type": "cuda", "indices": [-1, 0]},
+            {"type": "cuda", "indices": [0, 1], "index": 0},
+            {"type": "cuda", "indices": [0, 1], "all_devices": True},
+        ],
+    )
+    def test_indices_reject_what_they_cannot_honour(self, invalid: dict) -> None:
+        with pytest.raises(ValidationError):
+            TrainingDevice(**invalid)
+
+    def test_a_local_job_may_not_list_several_indices(self) -> None:
+        with pytest.raises(ValidationError, match="only available on a remote trainer"):
+            LocalTrainJobPayload(**_base_kwargs(), device={"type": "cuda", "indices": [0, 1]})
+
+
 class TestCameraMapping:
     """The mapping is keyed the way the policy reads its images, not the dataset."""
 

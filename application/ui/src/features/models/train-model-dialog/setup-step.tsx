@@ -1,11 +1,12 @@
-import { Flex, Item, Key, Picker, StatusLight, Text } from '@geti-ui/ui';
+import { Checkbox, CheckboxGroup, Flex, Item, Key, Picker, StatusLight, Text } from '@geti-ui/ui';
 
 import { SchemaAvailablePolicy, SchemaDeviceInfo, SchemaProjectInput } from '../../../api/openapi-spec';
 import { InlineAlert } from '../../robots/setup-wizard/shared/inline-alert';
+import { gpuKey } from './gpu-selection';
 import { formatBytes } from './policies';
 import { PolicyAccessAlert } from './policy-access-alert';
 import { PolicySelection } from './policy-selection';
-import { ALL_GPUS_KEY, TrainingTargetOption } from './train-model-dialog';
+import { TrainingTargetOption } from './train-model-dialog';
 
 interface SetupStepProps {
     datasets: SchemaProjectInput['datasets'];
@@ -16,11 +17,17 @@ interface SetupStepProps {
     onTargetIdChange: (value: Key | null) => void;
     remoteDevices: SchemaDeviceInfo[];
     busyGpuKeys: Set<string>;
-    /** Number of CUDA GPUs one job can train on together; 0 hides the option. */
-    allGpusCount: number;
-    selectedGpuKey: Key | null;
-    onSelectedGpuKeyChange: (value: Key | null) => void;
-    selectedGpuUnavailable: boolean;
+    /** Whether the GPU checklist is shown (the trainer has several GPUs, or one was ticked). */
+    showGpuSelection: boolean;
+    /** `type:index` keys of the ticked GPUs. */
+    selectedGpuKeys: string[];
+    onSelectedGpuKeysChange: (keys: string[]) => void;
+    /** Whether "Auto-select all free GPUs" is offered (the trainer can train on a chosen set). */
+    canAutoSelectGpus: boolean;
+    autoSelectGpus: boolean;
+    onAutoSelectGpusChange: (enabled: boolean) => void;
+    /** Why the ticked GPUs can't train, if they can't. */
+    gpuSelectionError: string | null;
     remoteUnavailable: boolean;
     selectedPolicy: string;
     availablePolicies: SchemaAvailablePolicy[];
@@ -40,10 +47,13 @@ export const SetupStep = ({
     onTargetIdChange,
     remoteDevices,
     busyGpuKeys,
-    allGpusCount,
-    selectedGpuKey,
-    onSelectedGpuKeyChange,
-    selectedGpuUnavailable,
+    showGpuSelection,
+    selectedGpuKeys,
+    onSelectedGpuKeysChange,
+    canAutoSelectGpus,
+    autoSelectGpus,
+    onAutoSelectGpusChange,
+    gpuSelectionError,
     remoteUnavailable,
     selectedPolicy,
     availablePolicies,
@@ -89,51 +99,36 @@ export const SetupStep = ({
             )}
         </Picker>
 
-        {(remoteDevices.length > 1 || selectedGpuKey !== null) && (
-            <Picker
-                label='GPU'
-                selectedKey={selectedGpuKey ?? (activeDevice ? `${activeDevice.type}:${activeDevice.index}` : null)}
-                onSelectionChange={onSelectedGpuKeyChange}
-                width='100%'
-                items={[
-                    ...remoteDevices.map((device) => ({
-                        key: `${device.type}:${device.index}`,
-                        label: `${device.type.toUpperCase()} ${device.index} — ${device.name}${
-                            device.memory ? ` (${formatBytes(device.memory)})` : ''
-                        }`,
-                        busy: busyGpuKeys.has(`${device.type}:${device.index}`),
-                    })),
-                    ...(allGpusCount > 1
-                        ? [
-                              {
-                                  key: ALL_GPUS_KEY,
-                                  label: `All GPUs (${allGpusCount})`,
-                                  busy: remoteDevices.some(
-                                      (device) =>
-                                          device.type === 'cuda' && busyGpuKeys.has(`${device.type}:${device.index}`)
-                                  ),
-                              },
-                          ]
-                        : []),
-                ]}
-            >
-                {(device) => (
-                    <Item key={device.key} textValue={device.label}>
-                        <Text>{device.label}</Text>
-                        <Text slot='icon'>
-                            <StatusLight
-                                variant={device.busy ? 'yellow' : 'positive'}
-                                role='status'
-                                aria-label={device.busy ? 'GPU busy; new jobs will wait' : 'GPU free'}
-                                marginBottom={0}
-                            />
-                        </Text>
-                    </Item>
+        {showGpuSelection && (
+            <Flex direction='column' gap='size-50' width='100%'>
+                <CheckboxGroup
+                    label='GPUs'
+                    width='100%'
+                    value={selectedGpuKeys}
+                    onChange={onSelectedGpuKeysChange}
+                    isDisabled={autoSelectGpus}
+                    validationState={gpuSelectionError === null ? undefined : 'invalid'}
+                    errorMessage={gpuSelectionError ?? undefined}
+                    description={
+                        selectedGpuKeys.length > 1 && gpuSelectionError === null
+                            ? 'The job trains on the ticked GPUs together.'
+                            : undefined
+                    }
+                >
+                    {remoteDevices.map((device) => (
+                        <Checkbox key={gpuKey(device)} value={gpuKey(device)}>
+                            {`${device.type.toUpperCase()} ${device.index} — ${device.name}${
+                                device.memory ? ` (${formatBytes(device.memory)})` : ''
+                            }${busyGpuKeys.has(gpuKey(device)) ? ' · busy' : ''}`}
+                        </Checkbox>
+                    ))}
+                </CheckboxGroup>
+                {canAutoSelectGpus && (
+                    <Checkbox isSelected={autoSelectGpus} onChange={onAutoSelectGpusChange}>
+                        Auto-select all free GPUs
+                    </Checkbox>
                 )}
-            </Picker>
-        )}
-        {selectedGpuUnavailable && (
-            <InlineAlert variant='warning'>The selected GPU is no longer available. Choose another GPU.</InlineAlert>
+            </Flex>
         )}
 
         <PolicySelection
