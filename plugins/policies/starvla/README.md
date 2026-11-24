@@ -210,10 +210,10 @@ to match StarVLA's PyTorch `predict_action`:
 The export fails rather than writing an unvalidated package.
 
 | Weights | Package | Actions vs PyTorch (validation) | CPU latency per chunk¹ |
-|---|---|---|---|
-| fp32 | 17 GB | max 3e-5 | 1.09 s |
-| fp16 | 8.6 GB | max 9e-3, cosine 0.99999 | 1.08 s |
-| int8 | 5.2 GB | max 5e-2, cosine 0.9995 | 0.86 s |
+| ------- | ------- | ------------------------------- | ---------------------- |
+| fp32    | 17 GB   | max 3e-5                        | 1.09 s                 |
+| fp16    | 8.6 GB  | max 9e-3, cosine 0.99999        | 1.08 s                 |
+| int8    | 5.2 GB  | max 5e-2, cosine 0.9995         | 0.86 s                 |
 
 ¹ i9-10920X, 12 cores, 10,000-step LIBERO checkpoint; PyTorch fp32 on the same CPU takes 1.9 s.
 
