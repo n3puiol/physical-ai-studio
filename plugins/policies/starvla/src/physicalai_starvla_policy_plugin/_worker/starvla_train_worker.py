@@ -23,10 +23,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from starvla_worker_common import (
     CancelledError,
     EventChannel,
+    WorkerHandshakeError,
     disable_remote_code,
     finite_metrics,
     identity,
     start_cancel_listener,
+    wait_for_host_acknowledgement,
 )
 
 
@@ -47,6 +49,14 @@ def train(argv: list[str] | None = None) -> tuple[Path, Path]:  # ruff: ignore[t
         parser.error("Overrides must use KEY=VALUE or --KEY=VALUE tokens.")
     channel = EventChannel()
     channel.send({"type": "hello", "protocol": 1, **identity()})
+    if channel.enabled:
+        # The host checks the version first; a rejected or cancelled worker never starts training.
+        answer = wait_for_host_acknowledgement()
+        if answer == "cancel":
+            raise CancelledError
+        if answer != "ack":
+            msg = "The host did not accept the handshake."
+            raise WorkerHandshakeError(msg)
     cancelled = start_cancel_listener()
     os.environ.setdefault("STARVLA_DISABLE_DEEPSPEED", "1")
     # Model code and weights must already be local; no mutable remote revisions.

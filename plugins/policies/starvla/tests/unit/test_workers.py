@@ -4,7 +4,9 @@
 """Worker callbacks, cancellation, and model normalization without framework imports."""
 
 import importlib
+import io
 import json
+import os
 import subprocess  # ruff: ignore[suspicious-subprocess-import]  # Fixed interpreter and worker path.
 import sys
 import threading
@@ -26,7 +28,7 @@ def train_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNames
     worker = importlib.import_module("starvla_train_worker")
     events = []
     cancelled = threading.Event()
-    monkeypatch.setattr(worker, "EventChannel", lambda: SimpleNamespace(send=events.append))
+    monkeypatch.setattr(worker, "EventChannel", lambda: SimpleNamespace(send=events.append, enabled=False))
     monkeypatch.setattr(worker, "identity", lambda: {"framework": "starvla", "package": "starvla", "version": "1.0.1"})
     monkeypatch.setattr(worker, "disable_remote_code", lambda: None)
     monkeypatch.setattr(worker, "start_cancel_listener", lambda: cancelled)
@@ -122,6 +124,48 @@ def test_unknown_framework_rejected(train_worker: SimpleNamespace) -> None:
     with pytest.raises(ValueError, match="QwenGR00T"):
         train_worker.worker.train(["--config_yaml", "unused.yaml"])
 
+
+
+def test_host_acknowledgement_reads_ack_cancel_and_closed(
+    train_worker: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    common = importlib.import_module("starvla_worker_common")
+
+    def answer(lines: bytes) -> str:
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, lines)
+        os.close(write_fd)
+        with io.TextIOWrapper(os.fdopen(read_fd, "rb"), encoding="utf-8") as stdin:
+            monkeypatch.setattr(common.sys, "stdin", stdin)
+            return common.wait_for_host_acknowledgement()
+
+    del train_worker
+    assert answer(b'not json\n{"type":"other"}\n{"type":"ack"}\n') == "ack"
+    assert answer(b'{"type":"cancel"}\n') == "cancel"
+    assert answer(b"") == "closed"
+
+
+@pytest.mark.parametrize(
+    ("answer", "error"),
+    [("closed", "WorkerHandshakeError"), ("cancel", "CancelledError")],
+)
+def test_training_waits_for_the_host_to_accept_the_handshake(
+    train_worker: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    answer: str,
+    error: str,
+) -> None:
+    """A rejected or cancelled worker stops after its hello, before StarVLA is imported."""
+    worker = train_worker.worker
+    monkeypatch.setattr(worker, "EventChannel", lambda: SimpleNamespace(send=train_worker.events.append, enabled=True))
+    monkeypatch.setattr(worker, "wait_for_host_acknowledgement", lambda: answer)
+    monkeypatch.setattr(worker, "start_cancel_listener", Mock(side_effect=AssertionError("training started")))
+
+    with pytest.raises(getattr(worker, error)):
+        worker.train(["--config_yaml", "unused.yaml"])
+
+    assert [event["type"] for event in train_worker.events] == ["hello"]
 
 def test_tied_weights_keep_both_keys_in_safetensors(tmp_path: Path, train_worker: SimpleNamespace) -> None:
     tensor = torch.arange(6).reshape(2, 3)

@@ -9,14 +9,23 @@ import importlib
 import json
 import math
 import os
+import select
 import sys
 import threading
+import time
 from importlib.metadata import version
 from typing import Any
 
 
+_ACK_TIMEOUT_SECONDS = 60.0
+
+
 class CancelledError(Exception):
     """Raised at a training step boundary on host cancellation."""
+
+
+class WorkerHandshakeError(RuntimeError):
+    """Raised when the host does not accept the worker's version handshake."""
 
 
 class EventChannel:
@@ -26,6 +35,11 @@ class EventChannel:
         """Bind to the runner, or disable events for CLI passthrough."""
         configured = os.environ.get("PHYSICALAI_WORKER_PROTOCOL_FD")
         self._fd = int(configured) if configured else None
+
+    @property
+    def enabled(self) -> bool:
+        """Whether an engine runner is listening, rather than a native CLI passthrough."""
+        return self._fd is not None
 
     def send(self, message: dict[str, Any]) -> None:
         """Send a JSON-compatible event without writing into training logs."""
@@ -39,6 +53,33 @@ class EventChannel:
 def identity() -> dict[str, str]:
     """Return the installed framework identity for the host handshake."""
     return {"framework": "starvla", "package": "starvla", "version": version("starvla")}
+
+
+def wait_for_host_acknowledgement() -> str:
+    """Block until the host accepts the handshake, so a rejected worker never starts training.
+
+    Returns:
+        ``"ack"`` when accepted, ``"cancel"`` when the host cancelled, or ``"closed"`` when the
+        host closed standard input or did not answer in time.
+    """
+    deadline = time.monotonic() + _ACK_TIMEOUT_SECONDS
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            readable, _, _ = select.select([sys.stdin], [], [], min(remaining, 0.5))
+        except (OSError, ValueError):
+            return "closed"
+        if not readable:
+            continue
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return "closed"
+        try:
+            control = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(control, dict) and control.get("type") in {"ack", "cancel"}:
+            return str(control["type"])
+    return "closed"
 
 
 def start_cancel_listener() -> threading.Event:
