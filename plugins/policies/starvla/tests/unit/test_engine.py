@@ -4,12 +4,15 @@
 """Engine discovery and native training/export routing without provisioning CUDA."""
 
 import json
+import sys
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from physicalai.engine import Engine, Run, to_isolate_environment
+from physicalai import isolate
+from physicalai.engine import Engine, Run, prune, to_isolate_environment
 
 from physicalai_starvla_policy_plugin import engine, environments
 from physicalai_starvla_policy_plugin.package import ARTIFACT, RUN_INFO, IoSpec, load_descriptor
@@ -65,7 +68,8 @@ def test_openvino_export_environment_only_adds_the_converter() -> None:
 def test_each_framework_has_its_own_environment_and_no_default() -> None:
     assert engine.StarVLAEngine.env is None
     assert [env.name for env in engine.StarVLAEngine.environments()] == [
-        spec.name for spec in environments.POLICY_ENVIRONMENTS.values()
+        *(spec.name for spec in environments.POLICY_ENVIRONMENTS.values()),
+        *(spec.name for spec in environments.OPENVINO_EXPORT_ENVIRONMENTS.values()),
     ]
     with pytest.raises(ValueError, match="no worker environment"):
         environments.for_policy("QwenOFT")
@@ -217,3 +221,77 @@ def test_cli_inherits_exit_code(monkeypatch: pytest.MonkeyPatch) -> None:
     assert engine.StarVLAEngine.cli(["--help"]) == 7
     assert call.call_args.args[0][-1] == "--help"
     assert call.call_args.kwargs["shell"] is False
+
+
+def test_openvino_export_is_an_enablement_with_its_own_environment() -> None:
+    capabilities = engine.StarVLAEngine.capabilities("QwenGR00T")
+    export = engine.StarVLAEngine.environment(environments.QWENGR00T_OPENVINO.name)
+
+    assert set(capabilities.export_formats) == {"native", "openvino"}
+    assert capabilities.enablements == (environments.QWENGR00T_OPENVINO.name,)
+    assert export.worker == environments.OPENVINO_EXPORT_WORKER
+    assert to_isolate_environment(export, "cu128").key() == environments.QWENGR00T_OPENVINO.environment.key()
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [environments.QWENGR00T, environments.QWENGR00T_OPENVINO],
+    ids=lambda spec: spec.name,
+)
+def test_environments_are_prepared_by_the_engine_with_its_labels(
+    spec: environments.PolicyEnvironment,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Training, export and Runtime prepare one labelled environment, so engine list and prune see it."""
+    prepared: list[isolate.PreparedEnvironment] = []
+
+    def fake_prepare(
+        environment: isolate.Environment,
+        *,
+        provider: isolate.UvProvider,
+        offline: bool,
+        labels: dict[str, str],
+    ) -> isolate.PreparedEnvironment:
+        del provider, offline
+        root = tmp_path / environment.key()
+        (root / "venv" / "bin").mkdir(parents=True, exist_ok=True)
+        (root / "venv" / "bin" / "python").write_bytes(b"python")
+        prepared.append(
+            isolate.PreparedEnvironment(path=root, key=environment.key(), profile=environment.profile, labels=labels),
+        )
+        return prepared[-1]
+
+    monkeypatch.setattr(isolate, "prepare", fake_prepare)
+    declared = {env.name: env for env in engine.StarVLAEngine.environments()}
+
+    python = environments.interpreter_path(spec)
+
+    (entry,) = prepared
+    assert python == entry.python
+    # The same cached environment a Runtime-only install prepares, labelled as the engine declares it.
+    assert entry.key == spec.environment.key()
+    assert entry.labels["engine.framework"] == "starvla"
+    assert entry.labels["engine.name"] == spec.name
+    assert entry.labels["engine.key"] == declared[spec.name].key()
+
+    # engine prune keeps it: the installed StarVLA engine still declares it.
+    removed: list[isolate.PreparedEnvironment] = []
+    monkeypatch.setattr(isolate, "list_prepared", lambda: list(prepared))
+    monkeypatch.setattr(isolate, "remove_prepared", removed.append)
+    assert prune() == []
+    assert removed == []
+
+
+def test_runtime_only_installs_prepare_through_isolate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Without physicalai-train, the Runtime adapter prepares the same environment through isolate."""
+    calls: list[isolate.Environment] = []
+    monkeypatch.setitem(sys.modules, "physicalai.engine", None)
+    monkeypatch.setattr(
+        environments,
+        "prepare",
+        lambda environment: calls.append(environment) or SimpleNamespace(python=tmp_path / "python"),
+    )
+
+    assert environments.interpreter_path(environments.QWENGR00T) == tmp_path / "python"
+    assert calls == [environments.QWENGR00T.environment]

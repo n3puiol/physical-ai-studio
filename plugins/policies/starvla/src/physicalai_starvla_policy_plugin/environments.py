@@ -21,6 +21,8 @@ from physicalai.isolate import BundledProject, Environment, SyncProfile, prepare
 if TYPE_CHECKING:
     from importlib.resources.abc import Traversable  # nosemgrep  # Python 3.10+ only.
 
+    from physicalai.engine import WorkerEnv
+
 FRAMEWORK = "starvla"
 PACKAGE = resources.files("physicalai_starvla_policy_plugin")
 TRAIN_WORKER = PACKAGE / "_worker" / "starvla_train_worker.py"
@@ -28,6 +30,7 @@ INFER_WORKER = PACKAGE / "_worker" / "starvla_infer_worker.py"
 OPENVINO_EXPORT_WORKER = PACKAGE / "_worker" / "starvla_openvino_export.py"
 PYTHON = "3.11"
 ACCELERATOR = "cu128"
+DISTRIBUTION = "physicalai-starvla-policy-plugin"
 
 
 @dataclass(frozen=True)
@@ -42,6 +45,7 @@ class PolicyEnvironment:
     name: str
     revision: str
     version: str
+    worker: Traversable = TRAIN_WORKER
 
     @property
     def project(self) -> Traversable:
@@ -57,6 +61,27 @@ class PolicyEnvironment:
     def environment(self) -> Environment:
         """Isolate environment: the project synced for CUDA with the pinned Python."""
         return Environment(source=self.source, profile=SyncProfile(python=PYTHON, extras=(ACCELERATOR,)))
+
+    def worker_env(self) -> WorkerEnv:
+        """Declare this environment to the engine, which then prepares the same cached environment.
+
+        Needs ``physicalai-train`` (the ``train`` extra); Runtime-only installs never call it.
+
+        Returns:
+            The engine's worker declaration for this environment.
+        """
+        from physicalai.engine import WorkerEnv  # ruff: ignore[import-outside-top-level]  # Train extra only.
+
+        return WorkerEnv(
+            framework=FRAMEWORK,
+            name=self.name,
+            project=self.source,
+            worker=self.worker,
+            distribution=DISTRIBUTION,
+            package="starvla",
+            accelerators=(ACCELERATOR,),
+            python=PYTHON,
+        )
 
     def provenance(self) -> dict[str, str]:
         """Return the pins required to interpret this framework's Runtime packages."""
@@ -81,6 +106,7 @@ QWENGR00T_OPENVINO = PolicyEnvironment(
     name="qwengr00t-openvino",
     revision=QWENGR00T.revision,
     version=QWENGR00T.version,
+    worker=OPENVINO_EXPORT_WORKER,
 )
 OPENVINO_EXPORT_ENVIRONMENTS: dict[str, PolicyEnvironment] = {QWENGR00T_OPENVINO.policy: QWENGR00T_OPENVINO}
 
@@ -124,9 +150,17 @@ def for_openvino_export(policy: str) -> PolicyEnvironment:
 def interpreter_path(spec: PolicyEnvironment, interpreter: str | Path | None = None) -> Path:
     """Resolve an explicitly managed interpreter, or provision the framework's locked CUDA worker.
 
+    With ``physicalai-train`` installed, the engine prepares the environment, with the uv installed
+    alongside Studio and the labels ``physicalai engine list`` and ``prune`` rely on. A Runtime-only
+    install prepares the same cached environment through isolate directly.
+
     Returns:
         Worker Python executable.
     """
     if interpreter is not None:
         return Path(interpreter).expanduser().resolve(strict=True)
-    return prepare(spec.environment).python
+    try:
+        from physicalai.engine import prepare_environment  # ruff: ignore[import-outside-top-level]  # Train extra only.
+    except ImportError:
+        return prepare(spec.environment).python
+    return prepare_environment(spec.worker_env(), ACCELERATOR).python

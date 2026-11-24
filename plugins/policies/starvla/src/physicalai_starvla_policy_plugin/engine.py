@@ -14,7 +14,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from physicalai.engine import Run, TrainingEngine, WorkerEnv, run_worker
+from physicalai.engine import Enablement, Run, TrainingEngine, WorkerEnv, run_worker
 
 from . import environments
 from .openvino_package import write_openvino_package
@@ -26,22 +26,16 @@ if TYPE_CHECKING:
     from physicalai.engine import TrainHooks
 
 
-def _worker_env(spec: environments.PolicyEnvironment) -> WorkerEnv:
-    """Adapt a framework's isolate declaration to the Engine API (same cached environment).
-
-    Returns:
-        The Engine worker declaration for the framework.
-    """
-    return WorkerEnv(
-        framework=environments.FRAMEWORK,
+# StarVLA has no OpenVINO path; the plugin adds one, converting in its own locked environment.
+OPENVINO_ENABLEMENTS = tuple(
+    Enablement(
         name=spec.name,
-        project=spec.source,
-        worker=environments.TRAIN_WORKER,
-        distribution="physicalai-starvla-policy-plugin",
-        package="starvla",
-        accelerators=(environments.ACCELERATOR,),
-        python=environments.PYTHON,
+        provides={policy: {"export": ("openvino",)}},
+        upstream=f"https://github.com/starVLA/starVLA@{spec.revision} + OpenVINO and NNCF",
+        env=spec.worker_env(),
     )
+    for policy, spec in environments.OPENVINO_EXPORT_ENVIRONMENTS.items()
+)
 
 
 class StarVLAEngine(TrainingEngine):
@@ -55,10 +49,11 @@ class StarVLAEngine(TrainingEngine):
     framework: ClassVar[str] = environments.FRAMEWORK
     env: ClassVar[WorkerEnv | None] = None
     policy_envs: ClassVar[Mapping[str, WorkerEnv]] = MappingProxyType(
-        {policy: _worker_env(spec) for policy, spec in environments.POLICY_ENVIRONMENTS.items()},
+        {policy: spec.worker_env() for policy, spec in environments.POLICY_ENVIRONMENTS.items()},
     )
+    enablements: ClassVar[tuple[Enablement, ...]] = OPENVINO_ENABLEMENTS
     training_accelerators: ClassVar[tuple[str, ...]] = (environments.ACCELERATOR,)
-    stock_export_formats: ClassVar[tuple[str, ...]] = ("native", "openvino")
+    stock_export_formats: ClassVar[tuple[str, ...]] = ("native",)
 
     @classmethod
     def cli(cls, argv: Sequence[str], *, interpreter: str | Path | None = None) -> int:

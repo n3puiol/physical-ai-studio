@@ -19,6 +19,7 @@ From `library/`:
 ```bash
 uv sync --extra starvla
 uv run physicalai engine prepare starvla --policy QwenGR00T --accelerator cu128
+uv run physicalai engine prepare starvla --enablement qwengr00t-openvino  # OpenVINO conversion
 uv run physicalai train starvla --help
 ```
 
