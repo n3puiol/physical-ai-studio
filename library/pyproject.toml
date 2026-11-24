@@ -255,7 +255,7 @@ explicit = false
 # Runtime main (with the task_index preprocessor, openvinotoolkit/physicalai#477) plus `physicalai.isolate`
 # (openvinotoolkit/physicalai#479, from the fork until it merges);
 # move to openvinotoolkit/physicalai once it merges.
-physicalai = { git = "https://github.com/n3puiol/physicalai.git", rev = "a81fbf611e8501dab95231163a93993721074940" }
+physicalai = { git = "https://github.com/n3puiol/physicalai.git", rev = "066d037a7253f604e45338e9357b811f7c8c5180" }
 physicalai-lerobot-policy-plugin = { path = "../plugins/policies/lerobot", editable = true }
 torchcodec = [
     { index = "pytorch-cpu", extra = "cpu" },

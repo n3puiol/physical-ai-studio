@@ -141,7 +141,7 @@ explicit = false
 [tool.uv.sources]
 # Same Runtime as the library: main plus `physicalai.isolate` (openvinotoolkit/physicalai#479);
 # move to openvinotoolkit/physicalai once it merges.
-physicalai = { git = "https://github.com/n3puiol/physicalai.git", rev = "a81fbf611e8501dab95231163a93993721074940" }
+physicalai = { git = "https://github.com/n3puiol/physicalai.git", rev = "066d037a7253f604e45338e9357b811f7c8c5180" }
 physicalai-train = { path = "../../library", editable = true }
 torchao = [
     { index = "pytorch-cpu", extra = "cpu" },
