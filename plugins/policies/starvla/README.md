@@ -2,7 +2,7 @@
 
 Train StarVLA **QwenGR00T** with its upstream trainer and run exported checkpoints
 through Physical AI Runtime. StarVLA, PyTorch, Transformers, and its dataset code
-live in a separate locked Python 3.10/CUDA 12.8 environment. Neither the host nor
+live in a separate locked Python 3.11/CUDA 12.8 environment. Neither the host nor
 a Runtime-only install imports `physicalai-train` to perform inference.
 
 This initial integration supports single-GPU QwenGR00T, upstream registered

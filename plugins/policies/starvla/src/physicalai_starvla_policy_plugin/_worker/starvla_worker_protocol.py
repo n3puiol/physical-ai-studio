@@ -9,7 +9,7 @@ placeholders. Only fixed-size numeric and boolean dtypes are accepted, so a
 peer can never make the other side execute code while decoding.
 
 This module runs on both sides of the process boundary: in the host
-(Python 3.12+, NumPy 2) and in the StarVLA worker environment (Python 3.10+,
+(Python 3.12+, NumPy 2) and in the StarVLA worker environment (Python 3.11,
 NumPy 1.26). It must only use the standard library and NumPy.
 """
 

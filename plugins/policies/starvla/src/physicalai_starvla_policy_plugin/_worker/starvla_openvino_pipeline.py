@@ -5,7 +5,7 @@
 
 Shared by the export worker, which checks it against StarVLA's PyTorch implementation, and
 by the in-process Runtime adapter. Only numpy, OpenVINO and ``tokenizers`` are imported; the
-module must stay importable on the worker's Python 3.10 and Runtime's Python 3.12+.
+module must stay importable on the worker's Python 3.11 and Runtime's Python 3.12+.
 
 The pipeline reproduces ``QwenGR00T.predict_action`` for one observation:
 

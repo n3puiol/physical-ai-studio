@@ -26,7 +26,7 @@ PACKAGE = resources.files("physicalai_starvla_policy_plugin")
 TRAIN_WORKER = PACKAGE / "_worker" / "starvla_train_worker.py"
 INFER_WORKER = PACKAGE / "_worker" / "starvla_infer_worker.py"
 OPENVINO_EXPORT_WORKER = PACKAGE / "_worker" / "starvla_openvino_export.py"
-PYTHON = "3.10"
+PYTHON = "3.11"
 ACCELERATOR = "cu128"
 
 

@@ -1,7 +1,7 @@
 [project]
 name = "physicalai-starvla-openvino-export-worker"
 version = "0.0.0"
-requires-python = ">=3.10,<3.11"
+requires-python = ">=3.11,<3.12"
 dependencies = [
     "starvla==1.0.1",
     "transformers==4.57.1",
@@ -27,6 +27,11 @@ cu128 = ["torch==2.7.1", "torchvision==0.22.1"]
 
 [tool.uv]
 package = false
+# The platforms with CUDA 12.8 torch wheels; on Linux, torch's pinned triton exists for x86-64 only.
+environments = [
+    "platform_python_implementation == 'CPython' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "platform_python_implementation == 'CPython' and sys_platform == 'win32'",
+]
 
 [[tool.uv.index]]
 name = "pytorch-cu128"
