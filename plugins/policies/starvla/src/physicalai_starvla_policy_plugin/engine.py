@@ -8,8 +8,8 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess  # ruff: ignore[suspicious-subprocess-import]  # Native CLI argv, shell disabled.
-from importlib import resources
+import subprocess  # ruff: ignore[suspicious-subprocess-import]  # Native CLI argv, shell disabled.  # nosec B404
+from importlib import resources  # nosemgrep  # Python 3.10+ only.
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -70,7 +70,7 @@ class StarVLAEngine(TrainingEngine):
         spec = environments.for_policy(_policy_from_cli(argv))
         python = environments.interpreter_path(spec, interpreter)
         with resources.as_file(environments.TRAIN_WORKER) as worker:
-            return subprocess.call(  # ruff: ignore[subprocess-without-shell-equals-true]  # No shell expansion.
+            return subprocess.call(  # ruff: ignore[subprocess-without-shell-equals-true]  # No shell expansion.  # nosec B603
                 [str(python), str(worker), *argv],
                 shell=False,
                 env={**os.environ, "PHYSICALAI_STARVLA_PROVENANCE": json.dumps(spec.provenance())},

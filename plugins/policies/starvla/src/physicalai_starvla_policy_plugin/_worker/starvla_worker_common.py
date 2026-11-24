@@ -76,7 +76,7 @@ def finite_metrics(metrics: dict[str, Any]) -> dict[str, float]:
 
 def disable_remote_code() -> None:
     """Refuse Transformers dynamic modules, including upstream's trust_remote_code defaults."""
-    dynamic = importlib.import_module("transformers.dynamic_module_utils")
+    dynamic = importlib.import_module("transformers.dynamic_module_utils")  # nosemgrep  # Fixed Transformers module name.
     original = dynamic.get_class_from_dynamic_module
     for name in (
         "configuration_auto",
@@ -87,7 +87,7 @@ def disable_remote_code() -> None:
         "feature_extraction_auto",
         "video_processing_auto",
     ):
-        importlib.import_module(f"transformers.models.auto.{name}")
+        importlib.import_module(f"transformers.models.auto.{name}")  # nosemgrep  # Fixed Transformers module names.
 
     def refuse(*_args: object, **_kwargs: object) -> None:
         msg = "Model repository Python code is disabled by the Physical AI StarVLA plugin."

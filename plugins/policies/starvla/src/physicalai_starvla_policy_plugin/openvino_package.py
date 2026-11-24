@@ -8,9 +8,9 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess  # ruff: ignore[suspicious-subprocess-import]  # Fixed worker argv, shell disabled.
+import subprocess  # ruff: ignore[suspicious-subprocess-import]  # Fixed worker argv, shell disabled.  # nosec B404
 import tempfile
-from importlib import resources
+from importlib import resources  # nosemgrep  # Python 3.10+ only.
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -110,7 +110,7 @@ def write_openvino_package(
             argv += ["--weights", weights]
             if image_size is not None:
                 argv += ["--image-size", *(str(v) for v in image_size)]
-            completed = subprocess.run(  # ruff: ignore[subprocess-without-shell-equals-true]  # No shell expansion.
+            completed = subprocess.run(  # ruff: ignore[subprocess-without-shell-equals-true]  # No shell expansion.  # nosec B603
                 argv,
                 shell=False,
                 check=False,

@@ -12,14 +12,14 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from importlib import resources
+from importlib import resources  # nosemgrep  # Python 3.10+ only.
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from physicalai.isolate import BundledProject, Environment, SyncProfile, prepare
 
 if TYPE_CHECKING:
-    from importlib.resources.abc import Traversable
+    from importlib.resources.abc import Traversable  # nosemgrep  # Python 3.10+ only.
 
 FRAMEWORK = "starvla"
 PACKAGE = resources.files("physicalai_starvla_policy_plugin")

@@ -9,7 +9,11 @@ description = "Isolated StarVLA training and Runtime inference for Physical AI"
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
 license = "Apache-2.0"
-dependencies = ["physicalai~=0.3.0", "numpy>=1.26", "uv>=0.10,<0.11"]
+dependencies = [
+    "physicalai>=0.4.1.dev0,<0.5",
+    "numpy>=1.26",
+    "uv>=0.13.4,<0.14",
+]
 
 [project.optional-dependencies]
 train = ["physicalai-train>=0.3.0"]
@@ -28,7 +32,8 @@ packages = ["src/physicalai_starvla_policy_plugin"]
 include = ["/README.md", "/pyproject.toml", "/configs/**", "/src/physicalai_starvla_policy_plugin/**", "/tests/**"]
 
 [tool.uv.sources]
-physicalai = { git = "https://github.com/samet-akcay/physicalai", branch = "feat/physicalai-isolate" }
+physicalai = { git = "https://github.com/n3puiol/physicalai.git", rev = "066d037a7253f604e45338e9357b811f7c8c5180" }
+# Keep the optional train extra on this checkout's Runtime source.
 physicalai-train = { path = "../../../library", editable = true }
 
 [tool.ruff]

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import os
-import subprocess  # ruff: ignore[suspicious-subprocess-import]  # Fixed worker argv, shell disabled.
+import subprocess  # ruff: ignore[suspicious-subprocess-import]  # Fixed worker argv, shell disabled.  # nosec B404
 import threading
 import weakref
 from collections.abc import Mapping
@@ -259,7 +259,7 @@ class _Worker:
         request_read, request_write = os.pipe()
         response_read, response_write = os.pipe()
         try:
-            self.process = subprocess.Popen(  # ruff: ignore[subprocess-without-shell-equals-true]  # No shell expansion.
+            self.process = subprocess.Popen(  # ruff: ignore[subprocess-without-shell-equals-true]  # No shell expansion.  # nosec B603
                 [str(python), str(environments.INFER_WORKER)],
                 stdin=subprocess.DEVNULL,
                 shell=False,
