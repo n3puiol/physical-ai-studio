@@ -1,14 +1,14 @@
 # StarVLA engine
 
-Train StarVLA **QwenGR00T** with its upstream trainer and run exported checkpoints
-through Physical AI Runtime. StarVLA, PyTorch, Transformers, and its dataset code
+Train StarVLA **QwenGR00T** and **QwenPI** with the upstream trainer and run exported
+checkpoints through Physical AI Runtime. StarVLA, PyTorch, Transformers, and its dataset code
 live in a separate locked Python 3.11/CUDA 12.8 environment. Neither the host nor
 a Runtime-only install imports `physicalai-train` to perform inference.
 
-This initial integration supports single-GPU QwenGR00T, upstream registered
-LeRobot dataset mixtures, one observation per camera, native safetensors
-packages (CUDA inference in the isolated worker), and OpenVINO packages (in-process
-inference on CPU or another OpenVINO device, without StarVLA or PyTorch). Other
+This integration supports single-GPU QwenGR00T and QwenPI on Qwen3-VL, upstream
+registered LeRobot dataset mixtures, one observation per camera, native safetensors
+packages (CUDA inference in the isolated worker), and, for QwenGR00T, OpenVINO packages
+(in-process inference on CPU or another OpenVINO device, without StarVLA or PyTorch). Other
 StarVLA frameworks, custom executable dataset registrations, DeepSpeed/multi-GPU
 launching, and ONNX conversion are not enabled. Training requires CUDA.
 
@@ -18,21 +18,27 @@ From `library/`:
 
 ```bash
 uv sync --extra starvla
-uv run physicalai engine prepare starvla --policy QwenGR00T --accelerator cu128
+uv run physicalai engine prepare starvla --policy QwenGR00T --accelerator cu128  # QwenPI shares it
 uv run physicalai engine prepare starvla --enablement qwengr00t-openvino  # OpenVINO conversion
 uv run physicalai train starvla --help
 ```
 
-Each StarVLA framework has its own locked worker project under
+Each StarVLA framework maps to a locked worker project under
 `src/physicalai_starvla_policy_plugin/envs/<name>/`, declared in `environments.POLICY_ENVIRONMENTS`
 and mapped through `StarVLAEngine.policy_envs`. Training, export and Runtime pick the environment
-from `framework.name` in the training YAML (a `framework.name=...` override wins), so frameworks
-with different dependencies never share a resolution. There is no default environment: a framework
-without an entry is rejected. To add one, copy `envs/qwengr00t/`, change its dependencies, lock it
-with `library/.venv/bin/uv lock --project <dir>`, and add a `PolicyEnvironment` entry;
-`test_duplicated_pins_agree` checks each entry against its project and lock.
+from `framework.name` in the training YAML (a `framework.name=...` override wins). Frameworks with
+the same dependencies share a project: QwenPI uses QwenGR00T's `envs/qwengr00t/`, so the engine
+lists and prepares it once. A framework that needs other dependencies gets its own project, so
+frameworks never share a resolution they were not locked for. There is no default environment: a
+framework without an entry is rejected, and the training worker refuses a config whose
+`framework.name` differs from the framework the engine chose its environment for.
 
-The QwenGR00T worker (`envs/qwengr00t/`) locks StarVLA to
+To add a framework that the pinned StarVLA wheel already runs, add a `PolicyEnvironment` entry with
+the shared `name`. For other dependencies, copy `envs/qwengr00t/`, change them, lock the copy with
+`library/.venv/bin/uv lock --project <dir>`, and add an entry for it. `test_duplicated_pins_agree`
+checks each entry against its project and lock.
+
+The shared worker (`envs/qwengr00t/`) locks StarVLA to
 `13d8ad43eb4128554c57227507055ecf9c3a62a2`. Upstream's wheel includes its
 benchmark dataset registries and deployment wrapper. No downstream code patches
 are applied. Transformers 4.57.1 and PyTorch 2.7.1/torchvision 0.22.1 provide the
@@ -128,6 +134,49 @@ resume. The configured 10,000 steps are additional updates. Allow roughly
 130 GiB of extra disk space for ten full checkpoints, the final model, and a
 Runtime export. Judge the resulting policy by simulation task success, not
 training loss alone.
+
+## QwenPI
+
+QwenPI predicts actions with a layer-wise flow-matching DiT: one block per VLM layer, each
+cross-attending to that layer's hidden states at the VLM's width. Its action head therefore grows
+with the backbone (counted from the pinned StarVLA code; training state is fp32 weights, gradients
+and AdamW moments, without activations):
+
+| Backbone    | VLM layers × width | Action head | Full training state |
+| ----------- | ------------------ | ----------- | ------------------- |
+| Qwen3-VL-2B | 28 × 2048          | 1.68B       | ~25 GiB             |
+| Qwen3-VL-4B | 36 × 2560          | 3.35B       | ~50 GiB             |
+| Qwen3-VL-8B | 36 × 4096          | 8.57B       | ~128 GiB            |
+
+`configs/qwenpi_libero.yaml` is a 20-step LIBERO smoke run sized for one 24 GB GPU: Qwen3-VL-2B,
+with the backbone and the DiT blocks frozen (`trainer.freeze_modules:
+qwen_vl_interface,action_model.model.transformer_blocks`), so only the head's 32M-parameter
+encoders, decoders and embeddings train. The DiT blocks start from random weights, so this run checks
+the integration and cannot produce a useful policy. To train QwenPI properly, use a GPU with room for
+the whole head and drop `action_model.model.transformer_blocks` from `freeze_modules`.
+
+Download the backbone as above, with `Qwen/Qwen3-VL-2B-Instruct` at revision
+`89644892e4d85e24eaac8bacfd4f463576704203` (ungated, 4.3 GB of safetensors), then:
+
+```bash
+WANDB_MODE=disabled library/.venv/bin/physicalai train starvla \
+  --config_yaml plugins/policies/starvla/configs/qwenpi_libero.yaml \
+  framework.qwenvl.base_vlm=/absolute/path/to/Qwen3-VL-2B-Instruct \
+  datasets.vla_data.data_root_dir=/absolute/path/to/datasets \
+  run_root_dir=/absolute/path/to/runs run_id=starvla-qwenpi
+```
+
+Runs and packages record the shared environment's pins. Export and Runtime inference work as for
+QwenGR00T, but only as native packages: `backend="openvino"` is refused, because the OpenVINO
+conversion is written for QwenGR00T's graphs.
+
+Verified on one RTX 3090 with the smoke config: 20 steps through the engine took 40 seconds with
+progress events, using at most 12.2 GB of GPU memory. The loss fell from 8,784 to 3,379; QwenGR00T's
+smoke run starts at 1.31. Training runs StarVLA's own trainer unchanged, and why QwenPI's initial loss
+is so much higher was not investigated. The native package (11.6 GB checkpoint) exported in 18
+seconds. On a real LIBERO-goal frame, Runtime's actions matched StarVLA's own `predict_action`
+exactly (maximum absolute difference `0.0`), at 0.47 seconds per chunk and 11.2 GB of GPU memory, and
+a seeded replay after `reset()` was exact. The engine listed no new environment.
 
 ## Export with explicit robot mappings
 
@@ -296,7 +345,7 @@ uv run --no-sync pytest ../plugins/policies/starvla/tests -q
 Tests exercise engine routing, package validation, I/O conversion, framing,
 worker failures, and Runtime loading with a tiny fake worker. They do not prove
 model quality, numerical parity, CUDA compatibility, or real robot safety.
-Verified with 111 CPU contract tests and a real GPU smoke run on one RTX 3090
+Verified with 117 CPU contract tests and a real GPU smoke run on one RTX 3090
 24 GB (driver 580.173.02, isolated PyTorch 2.7.1/CUDA 12.8). After the workers moved to
 Python 3.11, the 20-step training, native and OpenVINO export, native/Runtime match and seeded
 replay were rerun with the same results. The other measurements below predate that move:
