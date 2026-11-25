@@ -249,6 +249,9 @@ def flatten_actions(actions: Mapping[str, Any], io: IoSpec) -> np.ndarray:
             msg = "Worker action groups have different horizons."
             raise ValueError(msg)
         chunk[0, :, start:end] = value
+    if chunk is None:  # IoSpec requires at least one action group.
+        msg = "The package maps no action groups."
+        raise ValueError(msg)
     return chunk
 
 

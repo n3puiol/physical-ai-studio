@@ -296,7 +296,7 @@ uv run --no-sync pytest ../plugins/policies/starvla/tests -q
 Tests exercise engine routing, package validation, I/O conversion, framing,
 worker failures, and Runtime loading with a tiny fake worker. They do not prove
 model quality, numerical parity, CUDA compatibility, or real robot safety.
-Verified with 110 CPU contract tests and a real GPU smoke run on one RTX 3090
+Verified with 111 CPU contract tests and a real GPU smoke run on one RTX 3090
 24 GB (driver 580.173.02, isolated PyTorch 2.7.1/CUDA 12.8). After the workers moved to
 Python 3.11, the 20-step training, native and OpenVINO export, native/Runtime match and seeded
 replay were rerun with the same results. The other measurements below predate that move:

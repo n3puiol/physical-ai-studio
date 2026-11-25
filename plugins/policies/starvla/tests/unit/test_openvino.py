@@ -7,6 +7,7 @@ The real conversion is checked against PyTorch by the export worker itself on ev
 these tests pin the numpy ports to hand-computed values and the glue around the graphs.
 """
 
+import importlib
 import json
 import sys
 from collections.abc import Callable
@@ -95,6 +96,17 @@ def test_bfloat16_embeddings_are_exact(tmp_path: Path) -> None:
     expected = (bits.astype(np.uint32) << 16).view(np.float32)
     np.testing.assert_array_equal(table(np.array([1, 0])), expected[[1, 0]])
     np.testing.assert_array_equal(table(np.array([0]))[0, :1], [1.0])
+
+
+def test_export_image_size_is_only_read_once_resolved(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(sys, "path", list(sys.path))  # The worker puts its own folder on sys.path.
+    worker = importlib.import_module("physicalai_starvla_policy_plugin._worker.starvla_openvino_export")
+
+    export = worker.Export(tmp_path, tmp_path / "out", "fp16", image_size=None)
+    with pytest.raises(worker.ExportError, match="image size"):
+        _ = export.resolved_image_size
+    export.image_size = (224, 256)
+    assert export.resolved_image_size == (224, 256)
 
 
 # A tiny OpenVINO package: real descriptor, tokenizer and embeddings, fake compiled graphs. ------

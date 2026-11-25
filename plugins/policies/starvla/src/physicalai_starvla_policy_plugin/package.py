@@ -83,8 +83,8 @@ class IoSpec:
         return max(end for _, end in self.action.values())
 
     @classmethod
-    def from_dict(cls, value: dict[str, Any]) -> IoSpec:
-        """Validate the JSON form of an I/O mapping.
+    def from_dict(cls, value: object) -> IoSpec:
+        """Validate the JSON form of an I/O mapping, which may come from an untrusted package.
 
         Returns:
             Validated mapping.

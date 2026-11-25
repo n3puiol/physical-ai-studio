@@ -278,6 +278,18 @@ class Export:
     modules: dict[str, Any] = field(default_factory=dict)
     package: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def resolved_image_size(self) -> tuple[int, int]:
+        """Camera resolution; ``load`` fills in the training dataset's when none was requested.
+
+        Raises:
+            ExportError: If read before ``load`` has resolved it.
+        """
+        if self.image_size is None:
+            msg = "The image size is resolved when the checkpoint is loaded."
+            raise ExportError(msg)
+        return self.image_size
+
 
 def load(export: Export) -> None:
     """Check the package against the training DataConfig and load the checkpoint in float32.
@@ -344,7 +356,7 @@ def reference(export: Export) -> None:  # ruff: ignore[too-many-locals]  # One l
 
     framework, processor, io = export.framework, export.processor, export.descriptor["io"]
     rng = np.random.default_rng(0)
-    export.images = [rng.integers(0, 256, (*export.image_size, 3), dtype=np.uint8) for _ in io["cameras"]]
+    export.images = [rng.integers(0, 256, (*export.resolved_image_size, 3), dtype=np.uint8) for _ in io["cameras"]]
     raw_state = rng.normal(0, 0.2, max(end for _, end in io["state"].values())).astype(np.float32)
     export.state_groups = {key: raw_state[None, start:end] for key, (start, end) in io["state"].items()}
     normalized_state = {key: value.copy() for key, value in export.state_groups.items()}
@@ -454,7 +466,7 @@ def describe(export: Export) -> None:
     image_processor = framework.qwen_vl_interface.processor.image_processor
     merge = image_processor.merge_size
     resized = pipeline.smart_resize(
-        *export.image_size,
+        *export.resolved_image_size,
         image_processor.patch_size * merge,
         image_processor.size["shortest_edge"],
         image_processor.size["longest_edge"],
@@ -473,7 +485,7 @@ def describe(export: Export) -> None:
         "io": io,
         "image": {
             "cameras": len(io["cameras"]),
-            "size": list(export.image_size),
+            "size": list(export.resolved_image_size),
             "resized": list(resized),
             "grid": grid,
             "tokens": grid[0] * grid[1] * grid[2] // merge**2,
