@@ -411,6 +411,50 @@ The OpenVINO adapter (`starvla_openvino` backend) runs in the Runtime process. I
 gives a reproducible sequence that `reset()` restarts. Its predictions are not bit-identical to the
 native CUDA worker, which samples noise with PyTorch and runs the VLM in bf16.
 
+## StarVLA's benchmark clients
+
+StarVLA evaluates its models with benchmark clients (`examples/simBenchmarks/*/eval_files`) that talk
+to a websocket policy server. The plugin serves any of its Runtime packages, native or OpenVINO, over
+the same protocol, so StarVLA's LIBERO, SimplerEnv, RoboTwin and other clients run unchanged:
+
+```bash
+library/.venv/bin/python -m physicalai_starvla_policy_plugin.serve exports/starvla --device cuda --port 10093
+```
+
+The server needs the plugin's `serve` extra (`websockets` and `msgpack`), which the library's
+`starvla` extra includes. It prints `READY <port>` once the package is loaded. Each request's
+`image` list maps onto the package's cameras in order, `lang` is the task, and `state` is used only
+by a package that maps state. Actions come back unnormalized, in the package's action layout. The
+handshake metadata names the cameras, action keys and state keys, and reports the chunk length the
+clients use to schedule requests. A request for another normalization key, the wrong number of
+images, or missing state is answered with an error, as StarVLA's own server answers failures.
+
+The server speaks plain websockets without authentication, because StarVLA's clients expect that.
+It listens on `127.0.0.1` by default; use `--host 0.0.0.0` only on a trusted network.
+
+To run StarVLA's LIBERO evaluation, set up its client environment and LIBERO assets as StarVLA's
+LIBERO guide describes, put a checkout of StarVLA at the pinned commit on `PYTHONPATH`, and point the
+client at the server:
+
+```bash
+cd /path/to/starVLA && PYTHONPATH=$PWD python examples/simBenchmarks/LIBERO/eval_files/eval_libero.py \
+  --args.host 127.0.0.1 --args.port 10093 --args.task-suite-name libero_goal --args.num-trials-per-task 50
+```
+
+StarVLA's LIBERO client renders 256-pixel frames and resizes them to 224 pixels before sending them.
+Native packages accept that, as StarVLA's own server does. Qwen3-VL's processor enlarges images below
+256×256 before encoding them; an OpenVINO package reproduces that enlargement with OpenCV, which does
+not match it closely enough at 224 pixels, so a 224-pixel OpenVINO export fails its own validation.
+OpenVINO packages therefore need a client that sends the resolution they were exported for.
+
+Verified on one RTX 3090 with StarVLA's published `StarVLA/Qwen3-VL-OFT-LIBERO-4in1` checkpoint
+(QwenOFT on Qwen3-VL-4B, revision `39177146`), whose model card reports 98.6% on `libero_goal`.
+StarVLA publishes it as a PyTorch pickle, which the plugin refuses; for this check it was converted
+to safetensors with PyTorch's weights-only loader and then exported with `export_native`. StarVLA's
+unmodified LIBERO client ran 100 `libero_goal` episodes (10 per task, seed 7) twice: against StarVLA's
+own server and against this server with the native package, both without `--use_bf16`. Both
+succeeded in 98 of 100 episodes, with the same outcome in every episode, in about 8.5 minutes each.
+
 ## Runtime-only inference
 
 Install `physicalai` and this plugin (without its `[train]` extra) on the Runtime
