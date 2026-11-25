@@ -26,6 +26,9 @@ if TYPE_CHECKING:
     from physicalai.engine import TrainHooks
 
 
+# The framework the host chose the worker environment for; the training worker refuses any other.
+FRAMEWORK_VARIABLE = "PHYSICALAI_STARVLA_FRAMEWORK"
+
 # StarVLA has no OpenVINO path; the plugin adds one, converting in its own locked environment.
 OPENVINO_ENABLEMENTS = tuple(
     Enablement(
@@ -62,13 +65,17 @@ class StarVLAEngine(TrainingEngine):
         Returns:
             Native process exit code.
         """
-        spec = environments.for_policy(_policy_from_cli(argv))
+        policy = _policy_from_cli(argv)
+        spec = environments.for_policy(policy)
         python = environments.interpreter_path(spec, interpreter)
+        variables = {"PHYSICALAI_STARVLA_PROVENANCE": json.dumps(spec.provenance())}
+        if policy is not None:
+            variables[FRAMEWORK_VARIABLE] = spec.policy
         with resources.as_file(environments.TRAIN_WORKER) as worker:
             return subprocess.call(  # ruff: ignore[subprocess-without-shell-equals-true]  # No shell expansion.  # nosec B603
                 [str(python), str(worker), *argv],
                 shell=False,
-                env={**os.environ, "PHYSICALAI_STARVLA_PROVENANCE": json.dumps(spec.provenance())},
+                env={**os.environ, **variables},
             )
 
     @classmethod
@@ -108,7 +115,11 @@ class StarVLAEngine(TrainingEngine):
         device_variables = _device_env(device)
         config_yaml = Path(settings["config_yaml"]).expanduser().resolve(strict=True)
         spec = environments.for_policy(framework_from_config(config_yaml, overrides) or "")
-        variables = {**device_variables, "PHYSICALAI_STARVLA_PROVENANCE": json.dumps(spec.provenance())}
+        variables = {
+            **device_variables,
+            "PHYSICALAI_STARVLA_PROVENANCE": json.dumps(spec.provenance()),
+            FRAMEWORK_VARIABLE: spec.policy,
+        }
         argv = [
             "--config_yaml",
             str(config_yaml),

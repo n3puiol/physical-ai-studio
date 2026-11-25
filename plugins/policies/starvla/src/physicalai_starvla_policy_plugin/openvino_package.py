@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import environments
 from ._worker import starvla_openvino_pipeline as pipeline
-from .package import ARTIFACT, IoSpec, contained_file, write_package
+from .package import ARTIFACT, IoSpec, contained_file, framework_from_config, write_package
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -92,6 +92,10 @@ def write_openvino_package(
     if not io.state:
         msg = "The OpenVINO export requires a proprioceptive state mapping."
         raise ValueError(msg)
+    # Refuse other frameworks before staging a native package, which copies the whole backbone.
+    run_config = checkpoint.expanduser().resolve().parents[1] / "config.yaml"
+    if run_config.is_file():
+        environments.for_openvino_export(framework_from_config(run_config) or "")
     output = output.expanduser().absolute()
     if output.exists() or output.is_symlink():
         msg = "Export destination already exists."

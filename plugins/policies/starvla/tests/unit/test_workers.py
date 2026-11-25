@@ -33,6 +33,7 @@ def train_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNames
     monkeypatch.setattr(worker, "disable_remote_code", lambda: None)
     monkeypatch.setattr(worker, "start_cancel_listener", lambda: cancelled)
     monkeypatch.setenv("PHYSICALAI_STARVLA_PROVENANCE", json.dumps(environments.QWENGR00T.provenance()))
+    monkeypatch.setenv("PHYSICALAI_STARVLA_FRAMEWORK", "QwenGR00T")
     backbone = tmp_path / "Qwen3-VL"
     backbone.mkdir()
     (backbone / "config.json").write_text('{"model_type": "qwen3_vl"}')
@@ -119,10 +120,50 @@ def test_cancel_restores_native_hooks(train_worker: SimpleNamespace) -> None:
     assert train_worker.trainer._train_step is original_step
 
 
-def test_unknown_framework_rejected(train_worker: SimpleNamespace) -> None:
-    train_worker.cfg.framework.name = "unsupported"
-    with pytest.raises(ValueError, match="QwenGR00T"):
+def test_config_for_another_framework_is_rejected(
+    train_worker: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The host chose the environment for one framework; the worker refuses to train another."""
+    train_worker.cfg.framework.name = "QwenPI"
+    with pytest.raises(ValueError, match="differs from 'QwenGR00T'"):
         train_worker.worker.train(["--config_yaml", "unused.yaml"])
+    monkeypatch.delenv("PHYSICALAI_STARVLA_FRAMEWORK")
+    with pytest.raises(ValueError, match="through the StarVLA engine"):
+        train_worker.worker.train(["--config_yaml", "unused.yaml"])
+
+
+def test_qwenpi_trains_when_the_host_chose_it(train_worker: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    train_worker.cfg.framework.name = "QwenPI"
+    monkeypatch.setenv("PHYSICALAI_STARVLA_FRAMEWORK", "QwenPI")
+
+    _, checkpoint = train_worker.worker.train(["--config_yaml", "unused.yaml"])
+
+    assert checkpoint.is_file()
+    assert [event["type"] for event in train_worker.events] == ["hello", "progress"]
+
+
+def test_inference_refuses_a_checkpoint_of_another_framework(
+    train_worker: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    del train_worker
+    worker = importlib.import_module("starvla_infer_worker")
+    monkeypatch.setattr(worker, "disable_remote_code", lambda: None)
+    config = SimpleNamespace(framework=SimpleNamespace(name="QwenPI"))
+    for module, value in {
+        "omegaconf": SimpleNamespace(OmegaConf=SimpleNamespace(load=lambda _: config)),
+        "deployment": SimpleNamespace(),
+        "deployment.model_server": SimpleNamespace(),
+        "deployment.model_server.policy_wrapper": SimpleNamespace(PolicyServerWrapper=Mock()),
+    }.items():
+        monkeypatch.setitem(sys.modules, module, value)
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / "model.safetensors").write_bytes(b"fake")
+
+    with pytest.raises(ValueError, match="different StarVLA frameworks"):
+        worker.Policy(tmp_path, {"checkpoint": "model/model.safetensors", "policy": "QwenGR00T"}, "cuda")
 
 
 def test_host_acknowledgement_reads_ack_cancel_and_closed(

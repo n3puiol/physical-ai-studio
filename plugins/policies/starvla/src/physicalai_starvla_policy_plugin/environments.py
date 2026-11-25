@@ -3,9 +3,10 @@
 
 """Pinned per-policy worker declarations, importable without physicalai-train or StarVLA.
 
-Each StarVLA framework (``framework.name`` in its training YAML) trains and runs in its own
-locked worker project under ``envs/<name>/``, so frameworks with different dependencies never
-share a resolution. A framework without an entry here is not supported.
+Each StarVLA framework (``framework.name`` in its training YAML) trains and runs in a locked
+worker project under ``envs/<name>/``. Frameworks with the same dependencies share a project;
+one that needs different dependencies gets its own, so they never share a resolution. A framework
+without an entry here is not supported.
 """
 
 from __future__ import annotations
@@ -97,7 +98,15 @@ QWENGR00T = PolicyEnvironment(
     revision="13d8ad43eb4128554c57227507055ecf9c3a62a2",
     version="1.0.1",
 )
-POLICY_ENVIRONMENTS: dict[str, PolicyEnvironment] = {QWENGR00T.policy: QWENGR00T}
+# QwenPI ships in the same pinned StarVLA wheel and needs nothing more, so it shares QwenGR00T's
+# locked environment; the engine lists a shared environment once.
+QWENPI = PolicyEnvironment(
+    policy="QwenPI",
+    name=QWENGR00T.name,
+    revision=QWENGR00T.revision,
+    version=QWENGR00T.version,
+)
+POLICY_ENVIRONMENTS: dict[str, PolicyEnvironment] = {spec.policy: spec for spec in (QWENGR00T, QWENPI)}
 
 # Conversion only: the training project plus OpenVINO and NNCF, with every shared package at the
 # same locked version. Kept separate so adding the converter never changes training pins.
@@ -114,7 +123,8 @@ OPENVINO_EXPORT_ENVIRONMENTS: dict[str, PolicyEnvironment] = {QWENGR00T_OPENVINO
 def for_policy(policy: str | None) -> PolicyEnvironment:
     """Return the worker environment for a StarVLA framework.
 
-    With ``policy=None`` (e.g. ``--help`` without a config) the only declared framework is used.
+    With ``policy=None`` (e.g. ``--help`` without a config), the environment every framework
+    shares is used.
 
     Returns:
         The framework's environment declaration.
@@ -122,7 +132,7 @@ def for_policy(policy: str | None) -> PolicyEnvironment:
     Raises:
         ValueError: If the framework has no environment, or ``None`` is ambiguous.
     """
-    if policy is None and len(POLICY_ENVIRONMENTS) == 1:
+    if policy is None and len({spec.name for spec in POLICY_ENVIRONMENTS.values()}) == 1:
         return next(iter(POLICY_ENVIRONMENTS.values()))
     if policy in POLICY_ENVIRONMENTS:
         return POLICY_ENVIRONMENTS[policy]

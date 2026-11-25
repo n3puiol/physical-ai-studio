@@ -35,7 +35,7 @@ _BATCHED_IMAGE_RANK = 4
 
 @adapter_registry.register("starvla", extensions=(".starvla",))
 class StarVLARuntimeAdapter(RuntimeAdapter):
-    """Run packaged QwenGR00T checkpoints in the isolated StarVLA CUDA environment."""
+    """Run packaged StarVLA checkpoints in their framework's isolated CUDA environment."""
 
     def __init__(
         self,

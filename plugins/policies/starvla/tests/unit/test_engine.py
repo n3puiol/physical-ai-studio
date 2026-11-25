@@ -14,14 +14,14 @@ import pytest
 from physicalai import isolate
 from physicalai.engine import Engine, Run, prune, to_isolate_environment
 
-from physicalai_starvla_policy_plugin import engine, environments
+from physicalai_starvla_policy_plugin import engine, environments, openvino_package
 from physicalai_starvla_policy_plugin.package import ARTIFACT, RUN_INFO, IoSpec, load_descriptor
 
 
 def test_entry_point_and_pins() -> None:
     env = engine.StarVLAEngine.environment_for_policy("QwenGR00T")
     assert Engine.get("starvla") is engine.StarVLAEngine
-    assert engine.StarVLAEngine.policies() == ["QwenGR00T"]
+    assert engine.StarVLAEngine.policies() == ["QwenGR00T", "QwenPI"]
     assert env.pinned().base_version == "1.0.1"
     assert env.accelerators == ("cu128",)
     assert len(environments.QWENGR00T.provenance()["lock_sha256"]) == 64
@@ -65,12 +65,15 @@ def test_openvino_export_environment_only_adds_the_converter() -> None:
         assert set(locks[0]) - set(locks[1]) == {"physicalai-starvla-worker"}
 
 
-def test_each_framework_has_its_own_environment_and_no_default() -> None:
+def test_frameworks_with_the_same_dependencies_share_one_environment_and_there_is_no_default() -> None:
     assert engine.StarVLAEngine.env is None
-    assert [env.name for env in engine.StarVLAEngine.environments()] == [
-        *(spec.name for spec in environments.POLICY_ENVIRONMENTS.values()),
-        *(spec.name for spec in environments.OPENVINO_EXPORT_ENVIRONMENTS.values()),
-    ]
+    # QwenPI shares QwenGR00T's locked project, so the engine lists (and prepares) it once.
+    assert [env.name for env in engine.StarVLAEngine.environments()] == ["qwengr00t", "qwengr00t-openvino"]
+    assert engine.StarVLAEngine.environment_for_policy("QwenPI") == engine.StarVLAEngine.environment_for_policy(
+        "QwenGR00T",
+    )
+    assert environments.QWENPI.environment.key() == environments.QWENGR00T.environment.key()
+    assert environments.QWENPI.provenance() == environments.QWENGR00T.provenance()
     with pytest.raises(ValueError, match="no worker environment"):
         environments.for_policy("QwenOFT")
     assert environments.for_policy(None) is environments.QWENGR00T
@@ -151,10 +154,15 @@ def test_cuda_index_outside_the_device_mask_is_rejected(
         engine._device_env(device)
 
 
-def test_headless_settings_are_overridden_by_studio(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("framework", ["QwenGR00T", "QwenPI"])
+def test_headless_settings_are_overridden_by_studio(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    framework: str,
+) -> None:
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     config = tmp_path / "train.yaml"
-    config.write_text("framework:\n  name: QwenGR00T\n")
+    config.write_text(f"framework:\n  name: {framework}\n")
     runner = Mock(return_value=Run("starvla", tmp_path, None))
     monkeypatch.setattr(engine, "run_worker", runner)
     result = engine.StarVLAEngine.run(
@@ -169,6 +177,7 @@ def test_headless_settings_are_overridden_by_studio(tmp_path: Path, monkeypatch:
     assert args[1][-1] == "run_id=studio"
     assert "trainer.max_train_steps=20" in args[1]
     assert kwargs["extra_env"]["CUDA_VISIBLE_DEVICES"] == "2"
+    assert kwargs["extra_env"]["PHYSICALAI_STARVLA_FRAMEWORK"] == framework
     assert kwargs["accelerator"] == "cu128"
 
 
@@ -216,11 +225,65 @@ def test_export_from_run(checkpoint: Path, backbone: Path, io: IoSpec, tmp_path:
 
 def test_cli_inherits_exit_code(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(environments, "interpreter_path", lambda *_: Path("/worker/python"))
+    monkeypatch.delenv("PHYSICALAI_STARVLA_FRAMEWORK", raising=False)
     call = Mock(return_value=7)
     monkeypatch.setattr(engine.subprocess, "call", call)
     assert engine.StarVLAEngine.cli(["--help"]) == 7
     assert call.call_args.args[0][-1] == "--help"
     assert call.call_args.kwargs["shell"] is False
+    assert "PHYSICALAI_STARVLA_FRAMEWORK" not in call.call_args.kwargs["env"]
+
+
+def test_cli_tells_the_worker_which_framework_it_runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = tmp_path / "train.yaml"
+    config.write_text("framework:\n  name: QwenPI\n")
+    prepared = Mock(return_value=Path("/worker/python"))
+    monkeypatch.setattr(environments, "interpreter_path", prepared)
+    call = Mock(return_value=0)
+    monkeypatch.setattr(engine.subprocess, "call", call)
+
+    assert engine.StarVLAEngine.cli(["--config_yaml", str(config)]) == 0
+
+    assert prepared.call_args.args[0] is environments.QWENPI
+    assert call.call_args.kwargs["env"]["PHYSICALAI_STARVLA_FRAMEWORK"] == "QwenPI"
+
+
+def test_qwenpi_exports_native_packages_only(
+    checkpoint: Path,
+    backbone: Path,
+    io: IoSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capabilities = engine.StarVLAEngine.capabilities("QwenPI")
+    assert capabilities.export_formats == ("native",)
+    assert capabilities.enablements == ()
+    (checkpoint.parents[1] / "config.yaml").write_text("framework:\n  name: QwenPI\n")
+
+    native = engine.StarVLAEngine.export_native(
+        checkpoint,
+        tmp_path / "native",
+        backbone_path=backbone,
+        io=io,
+        unnorm_key="franka",
+    )
+    assert load_descriptor(native / ARTIFACT)["policy"] == "QwenPI"
+
+    # Refused before staging a native copy (the whole backbone) or preparing the conversion environment.
+    prepared, staged = Mock(), Mock()
+    monkeypatch.setattr(environments, "interpreter_path", prepared)
+    monkeypatch.setattr(openvino_package, "write_package", staged)
+    with pytest.raises(ValueError, match="'QwenPI' has no OpenVINO export"):
+        engine.StarVLAEngine.export_native(
+            checkpoint,
+            tmp_path / "openvino",
+            backbone_path=backbone,
+            io=io,
+            unnorm_key="franka",
+            backend="openvino",
+        )
+    prepared.assert_not_called()
+    staged.assert_not_called()
 
 
 def test_openvino_export_is_an_enablement_with_its_own_environment() -> None:

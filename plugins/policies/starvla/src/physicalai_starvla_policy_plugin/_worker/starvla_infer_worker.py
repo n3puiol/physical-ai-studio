@@ -41,13 +41,14 @@ class Policy:
             msg = "Invalid checkpoint path or format."
             raise ValueError(msg)
         cfg = OmegaConf.load(artifact / "model" / "config.yaml")
-        if cfg.framework.name != "QwenGR00T":
-            msg = "Only QwenGR00T is supported by this plugin."
+        # The host validated the descriptor's framework and started its environment.
+        if cfg.framework.name != descriptor["policy"]:
+            msg = "The package's checkpoint config and descriptor name different StarVLA frameworks."
             raise ValueError(msg)
         if device == "auto":
             device = "cuda"
         if not device.startswith("cuda") or not torch.cuda.is_available():
-            msg = "StarVLA QwenGR00T inference requires CUDA."
+            msg = "StarVLA inference requires CUDA."
             raise ValueError(msg)
         # Upstream dispatches its VLM by this directory-name substring.
         backbone = (artifact / "Qwen3-VL").resolve(strict=True)
@@ -153,7 +154,7 @@ def main() -> None:
                 elif operation == "predict" and policy is not None:
                     result = {"actions": policy.predict(message)}
                 elif operation == "reset" and policy is not None:
-                    # QwenGR00T is stateless; the host resets the per-call seed sequence.
+                    # predict_action is stateless; the host resets the per-call seed sequence.
                     result = {}
                 else:
                     msg = f"Unknown operation or model not loaded: {operation!r}."

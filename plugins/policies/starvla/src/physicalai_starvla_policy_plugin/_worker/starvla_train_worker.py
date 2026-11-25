@@ -44,7 +44,7 @@ def train(argv: list[str] | None = None) -> tuple[Path, Path]:  # ruff: ignore[t
         ValueError: If the framework, run name, or backbone is unsupported.
         FileNotFoundError: If training does not produce its final checkpoint.
     """
-    parser = argparse.ArgumentParser(description="StarVLA QwenGR00T training (native OmegaConf KEY=VALUE overrides)")
+    parser = argparse.ArgumentParser(description="StarVLA training (native OmegaConf KEY=VALUE overrides)")
     parser.add_argument("--config_yaml", required=True, help="Local StarVLA training YAML")
     args, overrides = parser.parse_known_args(argv)
     if any("=" not in token for token in overrides):
@@ -74,8 +74,13 @@ def train(argv: list[str] | None = None) -> tuple[Path, Path]:  # ruff: ignore[t
         OmegaConf.from_dotlist([token.removeprefix("--") for token in overrides]),
     )
     cfg = apply_config_compat(cfg)
-    if cfg.framework.name != "QwenGR00T":
-        msg = "This plugin currently supports framework.name=QwenGR00T only."
+    # The host chose this worker environment for one framework; refuse a config for another.
+    expected = os.environ.get("PHYSICALAI_STARVLA_FRAMEWORK")
+    if expected is None:
+        msg = "Start StarVLA training through the StarVLA engine, which chooses the framework's environment."
+        raise ValueError(msg)
+    if cfg.framework.name != expected:
+        msg = f"framework.name={cfg.framework.name!r} differs from {expected!r}, the framework this worker runs."
         raise ValueError(msg)
     if not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", str(cfg.run_id)):
         msg = "run_id must use 1-64 letters, digits, underscores, or hyphens."
