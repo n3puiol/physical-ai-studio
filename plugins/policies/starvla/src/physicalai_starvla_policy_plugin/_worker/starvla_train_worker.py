@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import importlib
 import json
 import os
 import re
@@ -15,6 +17,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from torch import Tensor
 
 # Isolated workers run without their folder on sys.path; the sibling modules live there.
@@ -32,7 +36,7 @@ from starvla_worker_common import (
 )
 
 
-def train(argv: list[str] | None = None) -> tuple[Path, Path]:  # ruff: ignore[too-many-statements, too-many-locals]  # Native CLI lifecycle.
+def train(argv: list[str] | None = None) -> tuple[Path, Path]:  # ruff: ignore[too-many-statements]  # Native CLI lifecycle.
     """Run the native trainer, preserving its normalization and checkpoint format.
 
     Returns:
@@ -67,13 +71,13 @@ def train(argv: list[str] | None = None) -> tuple[Path, Path]:  # ruff: ignore[t
     disable_remote_code()
     from omegaconf import OmegaConf
     from starVLA.model.framework.share_tools import apply_config_compat
-    from starVLA.training import train_starvla as native
 
     cfg = OmegaConf.merge(
         OmegaConf.load(args.config_yaml),
         OmegaConf.from_dotlist([token.removeprefix("--") for token in overrides]),
     )
     cfg = apply_config_compat(cfg)
+    cotraining = getattr(cfg.datasets, "vlm_data", None) is not None
     # The host chose this worker environment for one framework; refuse a config for another.
     expected = os.environ.get("PHYSICALAI_STARVLA_FRAMEWORK")
     if expected is None:
@@ -96,40 +100,13 @@ def train(argv: list[str] | None = None) -> tuple[Path, Path]:  # ruff: ignore[t
         msg = "Use a local Qwen3-VL backbone with Qwen3-VL in its directory name (upstream VLM dispatch)."
         raise ValueError(msg)
     cfg.framework.qwenvl.base_vlm = str(backbone)
+    if cotraining:
+        _prepare_cotraining(cfg, backbone)
     cfg.run_root_dir = str(Path(cfg.run_root_dir).expanduser().resolve())
     cfg.trainer.save_format = "safetensors"
     cfg.config_yaml = str(Path(args.config_yaml).resolve())
     output = Path(cfg.run_root_dir).expanduser().resolve() / str(cfg.run_id)
-    step_method = native.VLATrainer._train_step
-    log_method = native.VLATrainer._log_metrics
-    state_method = native._get_state_dict
-
-    def state_dict(accelerator: object, model: object) -> dict[str, Tensor]:
-        return _saveable_state_dict(state_method(accelerator, model))
-
-    def step(trainer: native.VLATrainer, batch_vla: list[dict[str, Any]], batch_vlm: object = None) -> dict[str, float]:
-        if cancelled.is_set():
-            raise CancelledError
-        return step_method(trainer, batch_vla, batch_vlm)
-
-    def log(trainer: native.VLATrainer, metrics: dict[str, Any]) -> None:
-        log_method(trainer, metrics)
-        channel.send({
-            "type": "progress",
-            "step": trainer.completed_steps,
-            "total": int(trainer.config.trainer.max_train_steps),
-            "metrics": finite_metrics(metrics),
-        })
-
-    native.VLATrainer._train_step = step
-    native.VLATrainer._log_metrics = log
-    native._get_state_dict = state_dict
-    try:
-        native.main(cfg)
-    finally:
-        native.VLATrainer._train_step = step_method
-        native.VLATrainer._log_metrics = log_method
-        native._get_state_dict = state_method
+    _train_natively(cfg, channel, cancelled, cotraining=cotraining)
     checkpoint = output / "final_model" / "model.safetensors"
     if not checkpoint.is_file():
         msg = "StarVLA finished without a final safetensors checkpoint."
@@ -145,6 +122,183 @@ def train(argv: list[str] | None = None) -> tuple[Path, Path]:  # ruff: ignore[t
     }
     (output / "physicalai_run.json").write_text(json.dumps(record, indent=2) + "\n")
     return output, checkpoint
+
+
+def _train_natively(cfg: Any, channel: EventChannel, cancelled: Any, *, cotraining: bool) -> None:  # ruff: ignore[any-type]
+    """Run upstream's SFT or co-training trainer with progress, cancellation and safetensors hooks."""
+    # A config with VLM data co-trains, with upstream's own co-training trainer.
+    if cotraining:
+        native = _import_cotrainer()
+        trainer_class = native.VLAMTrainer
+    else:
+        from starVLA.training import train_starvla
+
+        native, trainer_class = train_starvla, train_starvla.VLATrainer
+    step_method = trainer_class._train_step
+    log_method = trainer_class._log_metrics
+
+    def step(trainer: Any, batch_vla: list[dict[str, Any]], batch_vlm: object = None) -> dict[str, float]:  # ruff: ignore[any-type]
+        if cancelled.is_set():
+            raise CancelledError
+        return step_method(trainer, batch_vla, batch_vlm)
+
+    def log(trainer: Any, metrics: dict[str, Any]) -> None:  # ruff: ignore[any-type]
+        log_method(trainer, metrics)
+        channel.send({
+            "type": "progress",
+            "step": trainer.completed_steps,
+            "total": int(trainer.config.trainer.max_train_steps),
+            "metrics": finite_metrics(metrics),
+        })
+
+    trainer_class._train_step = step
+    trainer_class._log_metrics = log
+    # Both trainers save safetensors, which reject Qwen3's tied embedding and head storage.
+    if cotraining:
+        accelerator = native.accelerator
+        get_state_dict = accelerator.get_state_dict
+        accelerator.get_state_dict = lambda model, *args, **kwargs: _saveable_state_dict(
+            get_state_dict(model, *args, **kwargs),
+        )
+    else:
+        state_method = native._get_state_dict
+        native._get_state_dict = lambda accelerator, model: _saveable_state_dict(state_method(accelerator, model))
+    try:
+        with _vlm_loader_workers(cfg) if cotraining else contextlib.nullcontext():
+            native.main(cfg)
+    finally:
+        trainer_class._train_step = step_method
+        trainer_class._log_metrics = log_method
+        if cotraining:
+            del accelerator.get_state_dict
+        else:
+            native._get_state_dict = state_method
+
+
+@contextlib.contextmanager
+def _vlm_loader_workers(cfg: Any) -> Iterator[None]:  # ruff: ignore[any-type]  # OmegaConf node.
+    """Build upstream's VLM data loader with ``datasets.vlm_data.num_workers`` worker processes.
+
+    Upstream hard-codes four. Forking them after the model was on the GPU stalled training on the
+    first step, as forking video decoders does for the action data (``vla_data.num_workers``).
+    Leaving the setting unset keeps upstream's four.
+
+    Yields:
+        Nothing; upstream's loader factory is restored on exit.
+    """
+    workers = getattr(cfg.datasets.vlm_data, "num_workers", None)
+    if workers is None:
+        yield
+        return
+    from torch.utils.data import DataLoader
+
+    dataloaders: Any = importlib.import_module("starVLA.dataloader")  # nosemgrep  # Fixed module name.
+
+    make = dataloaders.make_vlm_dataloader
+
+    def make_vlm_dataloader(config: Any) -> dict[str, Any]:  # ruff: ignore[any-type]
+        module = make(config)
+        loader = module["train_dataloader"]
+        module["train_dataloader"] = DataLoader(
+            loader.dataset,
+            batch_size=loader.batch_size,
+            collate_fn=loader.collate_fn,
+            num_workers=int(workers),
+        )
+        return module
+
+    dataloaders.make_vlm_dataloader = make_vlm_dataloader
+    try:
+        yield
+    finally:
+        dataloaders.make_vlm_dataloader = make
+
+
+def _import_cotrainer() -> Any:  # ruff: ignore[any-type]  # Upstream module.
+    """Import upstream's co-training module, without DeepSpeed in the plugin's single-GPU mode.
+
+    ``train_starvla`` builds no DeepSpeed plugin when ``STARVLA_DISABLE_DEEPSPEED=1``;
+    ``train_starvla_cotrain`` builds one at import regardless, and DeepSpeed is not in the worker
+    environment. Apply the same switch while the module is imported.
+
+    Returns:
+        The ``train_starvla_cotrain`` module.
+    """
+    import accelerate
+
+    original = accelerate.DeepSpeedPlugin
+    if os.environ.get("STARVLA_DISABLE_DEEPSPEED") == "1":
+        accelerate.DeepSpeedPlugin = lambda *_args, **_kwargs: None
+    try:
+        from starVLA.training import train_starvla_cotrain
+    finally:
+        accelerate.DeepSpeedPlugin = original
+    return train_starvla_cotrain
+
+
+def _prepare_cotraining(cfg: Any, backbone: Path) -> None:  # ruff: ignore[any-type]  # OmegaConf node.
+    """Check a co-training config and register its VLM datasets with StarVLA.
+
+    Upstream names VLM datasets in a Python table with paths relative to the working directory.
+    The plugin instead reads them from ``datasets.vlm_data.sources`` (name -> absolute
+    ``annotation_path`` and ``data_path``) and registers them before training starts.
+
+    Upstream's VLM loader also overwrites the backbone's video-processor sizes, frame counts and
+    fps from ``video_*`` settings, even for image-only data, and fails when they are unset. Unset
+    ones keep the backbone's own values.
+
+    Raises:
+        ValueError: If the datasets, backbone type, VLM freezing or loss scale cannot co-train.
+    """
+    vlm_data = cfg.datasets.vlm_data
+    sources = getattr(vlm_data, "sources", None) or {}
+    names = [re.sub(r"%\d+$", "", name.strip()) for name in str(getattr(vlm_data, "dataset_use", "")).split(",")]
+    if not any(names) or not set(names) <= set(sources):
+        msg = (
+            "List every datasets.vlm_data.dataset_use name under datasets.vlm_data.sources, "
+            "each with an absolute annotation_path and data_path."
+        )
+        raise ValueError(msg)
+    registered = {}
+    for name in names:
+        annotation = Path(str(sources[name]["annotation_path"]))
+        images = Path(str(sources[name]["data_path"]))
+        if not (annotation.is_absolute() and annotation.is_file() and images.is_absolute() and images.is_dir()):
+            msg = f"VLM dataset {name!r} needs an existing absolute annotation_path file and data_path folder."
+            raise ValueError(msg)
+        registered[name] = {"annotation_path": str(annotation), "data_path": f"{images}/"}
+    if getattr(vlm_data, "model_type", None) is None:
+        vlm_data.model_type = "qwen3vl"
+    if vlm_data.model_type != "qwen3vl":
+        msg = "Co-training a Qwen3-VL backbone needs datasets.vlm_data.model_type=qwen3vl."
+        raise ValueError(msg)
+    frozen = [part.strip() for part in str(getattr(cfg.trainer, "freeze_modules", "") or "").split(",")]
+    if "qwen_vl_interface" in frozen:
+        msg = "Co-training trains the VLM on VLM data: freeze_modules must leave part of qwen_vl_interface trainable."
+        raise ValueError(msg)
+    workers = getattr(vlm_data, "num_workers", None)
+    if workers is not None and (type(workers) is not int or workers < 0):
+        msg = "datasets.vlm_data.num_workers must be a non-negative integer."
+        raise ValueError(msg)
+    if getattr(getattr(cfg.trainer, "loss_scale", None), "vlm", None) is None:
+        msg = "Co-training weighs the VLM loss by trainer.loss_scale.vlm; set it."
+        raise ValueError(msg)
+    from starVLA.dataloader.qwenvl_llavajson import qwen_data_config
+    from transformers import AutoProcessor
+
+    # The validated local backbone, with the Hub offline: nothing is downloaded.
+    video = AutoProcessor.from_pretrained(str(backbone)).video_processor  # nosec B615
+    defaults = {
+        "video_min_pixels": video.size["shortest_edge"],
+        "video_max_pixels": video.size["longest_edge"],
+        "video_min_frames": video.min_frames,
+        "video_max_frames": video.max_frames,
+        "video_fps": video.fps,
+    }
+    for key, value in defaults.items():
+        if getattr(vlm_data, key, None) is None:
+            setattr(vlm_data, key, value)
+    qwen_data_config.data_dict.update(registered)
 
 
 def _saveable_state_dict(state: dict[str, Tensor]) -> dict[str, Tensor]:

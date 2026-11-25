@@ -10,6 +10,7 @@ import os
 import subprocess  # ruff: ignore[suspicious-subprocess-import]  # Fixed interpreter and worker path.
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -18,6 +19,7 @@ import numpy as np
 import pytest
 import torch
 from safetensors.torch import load_file, save_file
+from torch.utils.data import DataLoader
 
 from physicalai_starvla_policy_plugin import environments
 
@@ -164,6 +166,156 @@ def test_inference_refuses_a_checkpoint_of_another_framework(
 
     with pytest.raises(ValueError, match="different StarVLA frameworks"):
         worker.Policy(tmp_path, {"checkpoint": "model/model.safetensors", "policy": "QwenGR00T"}, "cuda")
+
+
+@pytest.fixture
+def cotraining(train_worker: SimpleNamespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    # A co-training config, and fakes for upstream's co-training trainer, VLM data table and accelerator.
+    annotations = tmp_path / "vqa.json"
+    annotations.write_text("[]")
+    (tmp_path / "images").mkdir()
+    cfg = train_worker.cfg
+    cfg.datasets.vlm_data = SimpleNamespace(
+        dataset_use="libero_vqa%50",
+        sources={"libero_vqa": {"annotation_path": str(annotations), "data_path": str(tmp_path / "images")}},
+        model_type=None,
+        video_fps=1,
+        num_workers=0,
+    )
+    cfg.trainer.loss_scale = SimpleNamespace(vlm=0.1)
+    cfg.trainer.freeze_modules = "qwen_vl_interface.model.model.visual"
+    registry: dict[str, dict] = {"upstream": {}}
+    saved: list[dict] = []
+    tensor = torch.arange(4)
+
+    class Accelerator:
+        def get_state_dict(self, model: object) -> dict:  # ruff: ignore[no-self-use]
+            del model
+            return {"embedding": tensor, "head": tensor}
+
+    accelerator = Accelerator()
+
+    class Trainer:
+        completed_steps = 1
+        config = cfg
+        _train_step = Mock(return_value={"action_dit_loss": 0.1, "vlm_loss": 0.2})
+        _log_metrics = Mock()
+
+    def native_main(config: SimpleNamespace) -> None:
+        output = Path(config.run_root_dir) / config.run_id
+        (output / "final_model").mkdir(parents=True)
+        (output / "final_model" / "model.safetensors").write_bytes(b"fake")
+        (output / "config.full.yaml").write_text("full config")
+        (output / "dataset_statistics.json").write_text('{"franka": {}}')
+        trainer = Trainer()
+        trainer._train_step([], [{"vlm": "batch"}])
+        trainer._log_metrics({"action_dit_loss": 0.1, "vlm_loss": 0.2})
+        saved.append(accelerator.get_state_dict(object()))
+        loaders.append(sys.modules["starVLA.dataloader"].make_vlm_dataloader(config)["train_dataloader"])
+
+    cotrain = SimpleNamespace(VLAMTrainer=Trainer, main=native_main, accelerator=accelerator)
+    data_config = SimpleNamespace(data_dict=registry)
+    llavajson = SimpleNamespace(qwen_data_config=data_config)
+    plugins: list[object] = []
+    loaders: list[DataLoader] = []
+
+    def make_vlm_dataloader(config: object) -> dict[str, DataLoader]:
+        del config
+        return {"train_dataloader": DataLoader([1, 2], batch_size=1, num_workers=4)}
+
+    class DeepSpeedPlugin:
+        def __init__(self) -> None:
+            msg = "DeepSpeed is not installed"
+            raise ImportError(msg)
+
+    accelerate = SimpleNamespace(DeepSpeedPlugin=DeepSpeedPlugin)
+
+    class Training:
+        # Stands in for starVLA.training: importing the co-trainer builds its DeepSpeed plugin, as upstream's does.
+        train_starvla = sys.modules["starVLA.training"].train_starvla
+
+        def __getattr__(self, name: str) -> object:
+            if name != "train_starvla_cotrain":
+                raise AttributeError(name)
+            plugins.append(accelerate.DeepSpeedPlugin())
+            return cotrain
+
+    video = SimpleNamespace(size={"shortest_edge": 4096, "longest_edge": 25165824}, min_frames=4, max_frames=768, fps=2)
+    processor = SimpleNamespace(video_processor=video)
+    transformers = SimpleNamespace(AutoProcessor=SimpleNamespace(from_pretrained=lambda _path: processor))
+    for module, value in {
+        "accelerate": accelerate,
+        "transformers": transformers,
+        "starVLA.training": Training(),
+        "starVLA.dataloader": SimpleNamespace(qwenvl_llavajson=llavajson, make_vlm_dataloader=make_vlm_dataloader),
+        "starVLA.dataloader.qwenvl_llavajson": llavajson,
+        "starVLA.dataloader.qwenvl_llavajson.qwen_data_config": data_config,
+    }.items():
+        monkeypatch.setitem(sys.modules, module, value)
+    return SimpleNamespace(
+        **vars(train_worker),
+        registry=registry,
+        saved=saved,
+        accelerator=accelerator,
+        images=tmp_path / "images",
+        plugins=plugins,
+        loaders=loaders,
+        make_vlm_dataloader=make_vlm_dataloader,
+        deepspeed=accelerate,
+        deepspeed_plugin=DeepSpeedPlugin,
+    )
+
+
+def test_cotraining_runs_upstreams_cotrainer_with_registered_vlm_data(cotraining: SimpleNamespace) -> None:
+    sft_step = cotraining.trainer._train_step
+
+    _, checkpoint = cotraining.worker.train(["--config_yaml", "unused.yaml"])
+
+    assert checkpoint.is_file()
+    sft_step.assert_not_called()  # The SFT trainer was not used.
+    assert cotraining.events[1]["metrics"] == {"action_dit_loss": 0.1, "vlm_loss": 0.2}
+    assert cotraining.registry["libero_vqa"]["data_path"] == f"{cotraining.images}/"
+    assert "upstream" in cotraining.registry
+    vlm_data = cotraining.cfg.datasets.vlm_data
+    assert vlm_data.model_type == "qwen3vl"
+    # Unset video settings keep the backbone's own; set ones are kept.
+    assert (vlm_data.video_min_pixels, vlm_data.video_max_pixels) == (4096, 25165824)
+    assert (vlm_data.video_min_frames, vlm_data.video_max_frames, vlm_data.video_fps) == (4, 768, 1)
+    # Tied tensors are saved as separate storage, and the accelerator is restored afterwards.
+    (state,) = cotraining.saved
+    assert state["embedding"].untyped_storage().data_ptr() != state["head"].untyped_storage().data_ptr()
+    assert "get_state_dict" not in vars(cotraining.accelerator)
+    # Upstream's co-trainer builds a DeepSpeed plugin at import; single-GPU mode gets none, as for SFT.
+    assert cotraining.plugins == [None]
+    # Upstream's VLM loader is rebuilt with the configured workers, and the factory restored.
+    ((loader,),) = [cotraining.loaders]
+    assert loader.num_workers == 0
+    assert list(loader) == [1, 2] or [int(batch) for batch in loader] == [1, 2]
+    assert sys.modules["starVLA.dataloader"].make_vlm_dataloader is cotraining.make_vlm_dataloader
+    assert cotraining.deepspeed.DeepSpeedPlugin is cotraining.deepspeed_plugin
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (lambda cfg: setattr(cfg.datasets.vlm_data, "dataset_use", "unknown_vqa"), "dataset_use name"),
+        (lambda cfg: cfg.datasets.vlm_data.sources["libero_vqa"].update(data_path="images"), "absolute"),
+        (lambda cfg: setattr(cfg.datasets.vlm_data, "model_type", "qwen2.5vl"), "model_type=qwen3vl"),
+        (lambda cfg: setattr(cfg.trainer, "freeze_modules", "qwen_vl_interface"), "leave part of qwen_vl_interface"),
+        (lambda cfg: delattr(cfg.trainer, "loss_scale"), "loss_scale.vlm"),
+        (lambda cfg: setattr(cfg.datasets.vlm_data, "num_workers", -1), "num_workers"),
+    ],
+)
+def test_cotraining_config_is_checked_before_training(
+    cotraining: SimpleNamespace,
+    change: Callable[[SimpleNamespace], object],
+    message: str,
+) -> None:
+    change(cotraining.cfg)
+
+    with pytest.raises(ValueError, match=message):
+        cotraining.worker.train(["--config_yaml", "unused.yaml"])
+    assert cotraining.saved == []
 
 
 def test_host_acknowledgement_reads_ack_cancel_and_closed(
