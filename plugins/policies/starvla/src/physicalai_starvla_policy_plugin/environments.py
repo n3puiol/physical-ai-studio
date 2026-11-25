@@ -98,15 +98,21 @@ QWENGR00T = PolicyEnvironment(
     revision="13d8ad43eb4128554c57227507055ecf9c3a62a2",
     version="1.0.1",
 )
-# QwenPI ships in the same pinned StarVLA wheel and needs nothing more, so it shares QwenGR00T's
-# locked environment; the engine lists a shared environment once.
+# QwenPI and QwenOFT ship in the same pinned StarVLA wheel and need nothing more, so they share
+# QwenGR00T's locked environment; the engine lists a shared environment once.
 QWENPI = PolicyEnvironment(
     policy="QwenPI",
     name=QWENGR00T.name,
     revision=QWENGR00T.revision,
     version=QWENGR00T.version,
 )
-POLICY_ENVIRONMENTS: dict[str, PolicyEnvironment] = {spec.policy: spec for spec in (QWENGR00T, QWENPI)}
+QWENOFT = PolicyEnvironment(
+    policy="QwenOFT",
+    name=QWENGR00T.name,
+    revision=QWENGR00T.revision,
+    version=QWENGR00T.version,
+)
+POLICY_ENVIRONMENTS: dict[str, PolicyEnvironment] = {spec.policy: spec for spec in (QWENGR00T, QWENPI, QWENOFT)}
 
 # Conversion only: the training project plus OpenVINO and NNCF, with every shared package at the
 # same locked version. Kept separate so adding the converter never changes training pins.

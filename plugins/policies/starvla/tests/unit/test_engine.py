@@ -21,7 +21,7 @@ from physicalai_starvla_policy_plugin.package import ARTIFACT, RUN_INFO, IoSpec,
 def test_entry_point_and_pins() -> None:
     env = engine.StarVLAEngine.environment_for_policy("QwenGR00T")
     assert Engine.get("starvla") is engine.StarVLAEngine
-    assert engine.StarVLAEngine.policies() == ["QwenGR00T", "QwenPI"]
+    assert engine.StarVLAEngine.policies() == ["QwenGR00T", "QwenOFT", "QwenPI"]
     assert env.pinned().base_version == "1.0.1"
     assert env.accelerators == ("cu128",)
     assert len(environments.QWENGR00T.provenance()["lock_sha256"]) == 64
@@ -74,8 +74,9 @@ def test_frameworks_with_the_same_dependencies_share_one_environment_and_there_i
     )
     assert environments.QWENPI.environment.key() == environments.QWENGR00T.environment.key()
     assert environments.QWENPI.provenance() == environments.QWENGR00T.provenance()
+    assert environments.QWENOFT.environment.key() == environments.QWENGR00T.environment.key()
     with pytest.raises(ValueError, match="no worker environment"):
-        environments.for_policy("QwenOFT")
+        environments.for_policy("QwenFast")
     assert environments.for_policy(None) is environments.QWENGR00T
 
 
@@ -97,20 +98,20 @@ def test_framework_is_read_from_the_config_and_overrides(tmp_path: Path, argv: l
 
 def test_unsupported_framework_is_rejected_before_training(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config = tmp_path / "train.yaml"
-    config.write_text("framework:\n  name: QwenOFT\n")
+    config.write_text("framework:\n  name: QwenFast\n")
     runner = Mock()
     monkeypatch.setattr(engine, "run_worker", runner)
     call = Mock(return_value=0)
     monkeypatch.setattr(engine.subprocess, "call", call)
 
-    with pytest.raises(ValueError, match="'QwenOFT' has no worker environment"):
+    with pytest.raises(ValueError, match="'QwenFast' has no worker environment"):
         engine.StarVLAEngine.run(
             {"config_yaml": str(config)},
             dataset=tmp_path,
             output_dir=tmp_path / "out",
             device="cuda",
         )
-    with pytest.raises(ValueError, match="'QwenOFT' has no worker environment"):
+    with pytest.raises(ValueError, match="'QwenFast' has no worker environment"):
         engine.StarVLAEngine.cli(["--config_yaml", str(config)])
     runner.assert_not_called()
     call.assert_not_called()
@@ -154,7 +155,7 @@ def test_cuda_index_outside_the_device_mask_is_rejected(
         engine._device_env(device)
 
 
-@pytest.mark.parametrize("framework", ["QwenGR00T", "QwenPI"])
+@pytest.mark.parametrize("framework", ["QwenGR00T", "QwenPI", "QwenOFT"])
 def test_headless_settings_are_overridden_by_studio(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -248,17 +249,19 @@ def test_cli_tells_the_worker_which_framework_it_runs(tmp_path: Path, monkeypatc
     assert call.call_args.kwargs["env"]["PHYSICALAI_STARVLA_FRAMEWORK"] == "QwenPI"
 
 
-def test_qwenpi_exports_native_packages_only(
+@pytest.mark.parametrize("framework", ["QwenPI", "QwenOFT"])
+def test_frameworks_without_a_conversion_export_native_packages_only(
     checkpoint: Path,
     backbone: Path,
     io: IoSpec,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    framework: str,
 ) -> None:
-    capabilities = engine.StarVLAEngine.capabilities("QwenPI")
+    capabilities = engine.StarVLAEngine.capabilities(framework)
     assert capabilities.export_formats == ("native",)
     assert capabilities.enablements == ()
-    (checkpoint.parents[1] / "config.yaml").write_text("framework:\n  name: QwenPI\n")
+    (checkpoint.parents[1] / "config.yaml").write_text(f"framework:\n  name: {framework}\n")
 
     native = engine.StarVLAEngine.export_native(
         checkpoint,
@@ -267,13 +270,13 @@ def test_qwenpi_exports_native_packages_only(
         io=io,
         unnorm_key="franka",
     )
-    assert load_descriptor(native / ARTIFACT)["policy"] == "QwenPI"
+    assert load_descriptor(native / ARTIFACT)["policy"] == framework
 
     # Refused before staging a native copy (the whole backbone) or preparing the conversion environment.
     prepared, staged = Mock(), Mock()
     monkeypatch.setattr(environments, "interpreter_path", prepared)
     monkeypatch.setattr(openvino_package, "write_package", staged)
-    with pytest.raises(ValueError, match="'QwenPI' has no OpenVINO export"):
+    with pytest.raises(ValueError, match=f"'{framework}' has no OpenVINO export"):
         engine.StarVLAEngine.export_native(
             checkpoint,
             tmp_path / "openvino",
