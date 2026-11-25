@@ -95,6 +95,24 @@ Model overrides use `KEY=VALUE` or `--KEY=VALUE`; `--KEY VALUE` is not supported
 The smoke config uses `num_workers: 0` to avoid a video-decoder fork stall observed
 after model initialization. Increase it only after checking your loader setup.
 
+StarVLA feeds proprioceptive state to the model only when `datasets.vla_data.include_state=true`.
+It is off by default, in StarVLA's own LIBERO recipe and in the bundled configs, and packages follow
+the checkpoint: one trained without state maps none, so Runtime neither needs nor sends it, and one
+trained with state needs it in every observation. LIBERO's `libero_franka` DataConfig normalizes
+only actions, so with `include_state=true` the eight state values reach the model in raw units.
+
+Verified on one RTX 3090. For the 20-step smoke checkpoint, trained without state:
+
+- The native package maps no state, and Runtime matches StarVLA's own `predict_action` without
+  state exactly.
+- A package exported earlier, which still maps state, now gives the same actions.
+- The OpenVINO export validates with a head that has no state input.
+
+For a 20-step Qwen3-VL-2B run with `include_state=true`:
+
+- The package keeps the state mapping, and Runtime matches StarVLA with state exactly.
+- Runtime refuses an observation without state, and the OpenVINO head has a state input.
+
 The plugin forces safetensors output. It preserves the native trainer, emits
 step metrics/cancellation events for the headless engine API, and writes
 `final_model/model.safetensors`, full `config.yaml`, `dataset_statistics.json`,
@@ -196,8 +214,10 @@ seven action coordinates. State inputs use **raw training units**; the worker
 applies the training state transforms and unnormalizes actions with StarVLA's
 `PolicyNormProcessor`. No client-side action normalization is needed. The worker
 rejects camera order or state/action widths that differ from the checkpoint.
-An empty state mapping is accepted only when the training DataConfig has no state
-keys. State transforms other than upstream's `StateActionToTensor` and
+The state mapping is used only if the checkpoint was trained with state (`include_state`);
+otherwise the export drops it. Packages exported before the plugin followed `include_state` still
+map state, and the worker ignores it for such checkpoints. State transforms other than upstream's
+`StateActionToTensor` and
 `StateActionTransform` are rejected rather than silently bypassed.
 
 ```python
@@ -292,7 +312,9 @@ statistically indistinguishable. The run took 23 minutes on the CPU, against 6 m
 an RTX 3090. INT8 and fp32 packages have not been benchmarked closed-loop. Current limitations:
 
 - Fixed camera resolution per export; images of another size are rejected.
-- Proprioceptive state is required.
+- The head takes proprioceptive state only if the checkpoint was trained with it. OpenVINO packages
+  exported earlier from checkpoints trained without state still feed an untrained state token;
+  re-export them.
 - Checkpoints trained with `obs_image_size`, rotation state transforms, or batch size above one
   are not supported.
 
@@ -330,7 +352,7 @@ try:
             "front": np.zeros((224, 224, 3), dtype=np.uint8),
             "wrist": np.zeros((224, 224, 3), dtype=np.uint8),
         },
-        "state": np.zeros(8, dtype=np.float32),
+        "state": np.zeros(8, dtype=np.float32),  # used only if trained with include_state
         "task": "pick up the object",
     })
     model.reset()  # restarts the seeded prediction sequence
