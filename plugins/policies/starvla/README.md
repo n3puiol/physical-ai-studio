@@ -172,11 +172,21 @@ conversion is written for QwenGR00T's graphs.
 
 Verified on one RTX 3090 with the smoke config: 20 steps through the engine took 40 seconds with
 progress events, using at most 12.2 GB of GPU memory. The loss fell from 8,784 to 3,379; QwenGR00T's
-smoke run starts at 1.31. Training runs StarVLA's own trainer unchanged, and why QwenPI's initial loss
-is so much higher was not investigated. The native package (11.6 GB checkpoint) exported in 18
+smoke run starts at 1.31. The native package (11.6 GB checkpoint) exported in 18
 seconds. On a real LIBERO-goal frame, Runtime's actions matched StarVLA's own `predict_action`
 exactly (maximum absolute difference `0.0`), at 0.47 seconds per chunk and 11.2 GB of GPU memory, and
 a seeded replay after `reset()` was exact. The engine listed no new environment.
+
+QwenPI's initial loss is high because of upstream's head, not this plugin. The DiT cross-attends to
+raw Qwen3-VL hidden states, which from the third layer on carry a massive activation of about 14,800
+(RMS about 32). The head also calls the DiT with `return_pre_output=True`, which skips the DiT's
+final LayerNorm, so nothing bounds the residual stream: its RMS grows from 0.5 to 320 over the 28
+blocks, and the decoder predicts velocities with RMS 74 against a target of 1.1. On real LIBERO-goal
+batches at initialisation, QwenPI's loss is about 5,200 and QwenGR00T's about 1.35. QwenGR00T reads
+the same raw states but normalises the DiT output. Normalising either the DiT output or the VLM
+states brings QwenPI's initial loss to 1.2–1.4. The plugin runs upstream unchanged, so trained
+packages stay faithful to StarVLA; whether the scale slows or harms full QwenPI training was not
+measured.
 
 ## Export with explicit robot mappings
 
