@@ -175,7 +175,11 @@ Materialize Hugging Face cache symlinks before export.
 `export_native(..., backend="openvino")` (or `export(run, out, backend="openvino")`) converts the
 checkpoint on CPU in a second locked environment, `envs/qwengr00t-openvino/`: the training
 project plus OpenVINO 2026.4.1 and NNCF, with every shared package at the same locked version.
-Training pins are unchanged, so existing runs and native packages stay valid.
+Adding the converter never changes the training pins.
+
+Runs and native packages record the hash of the training lock. Those made before the workers moved
+to Python 3.11 are refused by `export(run)` and by Runtime; re-export their checkpoint with
+`export_native(...)`. OpenVINO packages run without a worker and are not affected.
 
 ```python
 package = Engine.get("starvla").export_native(
@@ -237,6 +241,12 @@ an RTX 3090. INT8 and fp32 packages have not been benchmarked closed-loop. Curre
 model = InferenceModel("exports/starvla-openvino", device="CPU", seed=42)  # or GPU / NPU
 ```
 
+On an Intel GPU (PCI device `0xe223`), the fp16 package of the 10,000-step checkpoint took 0.043 s
+per chunk, against 1.7 s on the same machine's CPU. On three LIBERO-goal frames, GPU and CPU actions
+differed by 7.9e-4 on average (0.4% of the mean action) and by at most 7.4e-3; both were 0.083 from
+the recorded actions on average. GPU inference is not bit-reproducible: a seeded replay after
+`reset()` differed by up to 1e-3.
+
 The OpenVINO adapter (`starvla_openvino` backend) runs in the Runtime process. It needs only
 `physicalai` and this plugin, imports no PyTorch or StarVLA, and samples noise with numpy: a seed
 gives a reproducible sequence that `reset()` restarts. Its predictions are not bit-identical to the
@@ -286,8 +296,10 @@ uv run --no-sync pytest ../plugins/policies/starvla/tests -q
 Tests exercise engine routing, package validation, I/O conversion, framing,
 worker failures, and Runtime loading with a tiny fake worker. They do not prove
 model quality, numerical parity, CUDA compatibility, or real robot safety.
-Verified with 55 CPU contract tests and a real GPU smoke run on one RTX 3090
-24 GB (driver 580.173.02, isolated PyTorch 2.7.1/CUDA 12.8):
+Verified with 110 CPU contract tests and a real GPU smoke run on one RTX 3090
+24 GB (driver 580.173.02, isolated PyTorch 2.7.1/CUDA 12.8). After the workers moved to
+Python 3.11, the 20-step training, native and OpenVINO export, native/Runtime match and seeded
+replay were rerun with the same results. The other measurements below predate that move:
 
 - Qwen3-VL-4B backbone frozen; 161.5M action-head parameters trained for 20 steps
   on LIBERO goal, batch size one, with progress events and safetensors checkpoints.
