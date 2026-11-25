@@ -32,7 +32,7 @@ packages = ["src/physicalai_starvla_policy_plugin"]
 include = ["/README.md", "/pyproject.toml", "/configs/**", "/src/physicalai_starvla_policy_plugin/**", "/tests/**"]
 
 [tool.uv.sources]
-physicalai = { git = "https://github.com/n3puiol/physicalai.git", rev = "066d037a7253f604e45338e9357b811f7c8c5180" }
+physicalai = { git = "https://github.com/n3puiol/physicalai.git", rev = "51c3062820b8a23452e0073f7c7b3fb9fadcba61" }
 # Keep the optional train extra on this checkout's Runtime source.
 physicalai-train = { path = "../../../library", editable = true }
 

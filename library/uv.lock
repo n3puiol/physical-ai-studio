@@ -3782,7 +3782,7 @@ train = [
 [package.metadata]
 requires-dist = [
     { name = "numpy", specifier = ">=1.26" },
-    { name = "physicalai", git = "https://github.com/n3puiol/physicalai.git?rev=066d037a7253f604e45338e9357b811f7c8c5180" },
+    { name = "physicalai", git = "https://github.com/n3puiol/physicalai.git?rev=51c3062820b8a23452e0073f7c7b3fb9fadcba61" },
     { name = "physicalai-train", marker = "extra == 'train'", editable = "." },
     { name = "pytest", marker = "extra == 'tests'", specifier = ">=9.0.3" },
     { name = "uv", specifier = ">=0.13.4,<0.14" },
