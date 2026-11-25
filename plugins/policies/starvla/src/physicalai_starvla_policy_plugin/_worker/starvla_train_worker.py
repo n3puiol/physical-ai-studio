@@ -32,13 +32,15 @@ from starvla_worker_common import (
 )
 
 
-def train(argv: list[str] | None = None) -> tuple[Path, Path]:  # ruff: ignore[too-many-statements]  # Native CLI lifecycle.
+def train(argv: list[str] | None = None) -> tuple[Path, Path]:  # ruff: ignore[too-many-statements, too-many-locals]  # Native CLI lifecycle.
     """Run the native trainer, preserving its normalization and checkpoint format.
 
     Returns:
         Run directory and final checkpoint.
 
     Raises:
+        CancelledError: If the host cancels before accepting the handshake.
+        WorkerHandshakeError: If the host does not accept the handshake.
         ValueError: If the framework, run name, or backbone is unsupported.
         FileNotFoundError: If training does not produce its final checkpoint.
     """

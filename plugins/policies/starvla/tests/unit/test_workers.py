@@ -125,7 +125,6 @@ def test_unknown_framework_rejected(train_worker: SimpleNamespace) -> None:
         train_worker.worker.train(["--config_yaml", "unused.yaml"])
 
 
-
 def test_host_acknowledgement_reads_ack_cancel_and_closed(
     train_worker: SimpleNamespace,
     monkeypatch: pytest.MonkeyPatch,
@@ -166,6 +165,7 @@ def test_training_waits_for_the_host_to_accept_the_handshake(
         worker.train(["--config_yaml", "unused.yaml"])
 
     assert [event["type"] for event in train_worker.events] == ["hello"]
+
 
 def test_tied_weights_keep_both_keys_in_safetensors(tmp_path: Path, train_worker: SimpleNamespace) -> None:
     tensor = torch.arange(6).reshape(2, 3)

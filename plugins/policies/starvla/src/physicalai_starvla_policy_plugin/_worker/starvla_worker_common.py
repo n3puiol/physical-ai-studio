@@ -16,7 +16,6 @@ import time
 from importlib.metadata import version
 from typing import Any
 
-
 _ACK_TIMEOUT_SECONDS = 60.0
 
 
@@ -117,7 +116,7 @@ def finite_metrics(metrics: dict[str, Any]) -> dict[str, float]:
 
 def disable_remote_code() -> None:
     """Refuse Transformers dynamic modules, including upstream's trust_remote_code defaults."""
-    dynamic = importlib.import_module("transformers.dynamic_module_utils")  # nosemgrep  # Fixed Transformers module name.
+    dynamic = importlib.import_module("transformers.dynamic_module_utils")  # nosemgrep  # Fixed module name.
     original = dynamic.get_class_from_dynamic_module
     for name in (
         "configuration_auto",
