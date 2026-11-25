@@ -3065,7 +3065,7 @@ requires-dist = [
     { name = "peft", marker = "extra == 'rldx1'", specifier = ">=0.13.0,<1.0.0" },
     { name = "physicalai", git = "https://github.com/n3puiol/physicalai.git?rev=51c3062820b8a23452e0073f7c7b3fb9fadcba61" },
     { name = "physicalai-lerobot-policy-plugin", extras = ["train"], marker = "extra == 'lerobot'", editable = "../../plugins/policies/lerobot" },
-    { name = "physicalai-starvla-policy-plugin", extras = ["train"], marker = "extra == 'starvla'", editable = "../../plugins/policies/starvla" },
+    { name = "physicalai-starvla-policy-plugin", extras = ["train", "serve"], marker = "extra == 'starvla'", editable = "../../plugins/policies/starvla" },
     { name = "physicalai-train", extras = ["cosmos3"], marker = "extra == 'policies'" },
     { name = "physicalai-train", extras = ["diffusion"], marker = "extra == 'policies'" },
     { name = "physicalai-train", extras = ["executorch"], marker = "extra == 'executorch-openvino'" },

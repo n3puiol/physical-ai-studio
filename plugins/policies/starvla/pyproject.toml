@@ -17,6 +17,8 @@ dependencies = [
 
 [project.optional-dependencies]
 train = ["physicalai-train>=0.3.0"]
+# Serve packages to StarVLA's own benchmark clients (python -m physicalai_starvla_policy_plugin.serve).
+serve = ["websockets>=13", "msgpack>=1.0"]
 tests = ["pytest>=9.0.3"]
 
 [project.entry-points."physicalai.engines"]
