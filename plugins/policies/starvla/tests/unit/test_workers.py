@@ -250,6 +250,7 @@ def test_inference_applies_state_transforms_once(
         ),
     )
     policy = worker.Policy.__new__(worker.Policy)
+    policy.uses_state = True
     policy.io = {"cameras": {"video.main": "front"}, "state": {"state.a": [0, 1], "state.b": [1, 2]}}
     policy.processor = SimpleNamespace(
         transform=SimpleNamespace(transforms=[ToTensor(), Normalize()]),
@@ -266,6 +267,52 @@ def test_inference_applies_state_transforms_once(
     })
     np.testing.assert_array_equal(predict.call_args.kwargs["examples"][0]["state"], [[4, 2]])
     assert result["action.arm"].shape == (3, 2)
+
+
+def test_inference_leaves_out_state_a_checkpoint_was_not_trained_on(
+    train_worker: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Older packages still map state; a checkpoint trained without include_state never receives it."""
+    del train_worker
+    worker = importlib.import_module("starvla_infer_worker")
+    monkeypatch.setitem(
+        sys.modules,
+        "starVLA.dataloader.gr00t_lerobot.transform.state_action",
+        SimpleNamespace(StateActionToTensor=object, StateActionTransform=object),
+    )
+    policy = worker.Policy.__new__(worker.Policy)
+    policy.uses_state = False
+    policy.io = {"cameras": {"video.main": "front"}, "state": {"state.a": [0, 1]}}
+    policy.processor = SimpleNamespace(action_keys=["action.arm"], action_key_dims={"action.arm": 2})
+    predict = Mock(return_value={"actions": np.ones((1, 3, 2), np.float32)})
+    policy.wrapper = SimpleNamespace(predict_action=predict)
+
+    policy.predict({
+        "video": {"video.main": np.zeros((8, 9, 3), np.uint8)},
+        "state": {"state.a": np.array([[1]], np.float32)},
+        "task": "pick",
+    })
+
+    assert "state" not in predict.call_args.kwargs["examples"][0]
+
+
+def test_mapping_check_follows_the_state_the_checkpoint_was_trained_on(train_worker: SimpleNamespace) -> None:
+    del train_worker
+    worker = importlib.import_module("starvla_infer_worker")
+    processor = SimpleNamespace(action_key_dims={"action.arm": 2}, state_key_dims={"state.a": 1})
+    io = {"action": {"action.arm": [0, 2]}, "state": {"state.a": [0, 1]}}
+
+    worker.check_mapping(io, processor, uses_state=True)
+    # Without state in training, a stale or empty state mapping is ignored.
+    worker.check_mapping({**io, "state": {"state.other": [0, 5]}}, processor, uses_state=False)
+    worker.check_mapping({**io, "state": {}}, processor, uses_state=False)
+    with pytest.raises(ValueError, match="trained with proprioceptive state"):
+        worker.check_mapping({**io, "state": {}}, processor, uses_state=True)
+    with pytest.raises(ValueError, match="state keys or widths"):
+        worker.check_mapping({**io, "state": {"state.a": [0, 2]}}, processor, uses_state=True)
+    with pytest.raises(ValueError, match="action keys or widths"):
+        worker.check_mapping({**io, "action": {"action.arm": [0, 3]}}, processor, uses_state=False)
 
 
 @pytest.mark.parametrize(

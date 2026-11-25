@@ -8,11 +8,12 @@ from __future__ import annotations
 import json
 import shutil
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import environments
+from ._worker.starvla_worker_common import trained_with_state
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -118,6 +119,20 @@ def framework_from_config(config_yaml: str | Path | None, overrides: Sequence[st
     return name if isinstance(name, str) and name else None
 
 
+def checkpoint_uses_state(config_yaml: Path) -> bool:
+    """Whether a run's checkpoint was trained with proprioceptive state (``include_state``).
+
+    Returns:
+        True when StarVLA's loader packed state into the run's training samples.
+    """
+    import yaml  # ruff: ignore[import-outside-top-level]  # Only needed when reading training configs.
+
+    data = yaml.safe_load(Path(config_yaml).read_text(encoding="utf-8"))
+    datasets = data.get("datasets") if isinstance(data, dict) else None
+    vla_data = datasets.get("vla_data") if isinstance(datasets, dict) else None
+    return trained_with_state(vla_data if isinstance(vla_data, dict) else {})
+
+
 def contained_file(root: Path, relative: object) -> Path:
     """Resolve a package file, rejecting absolute paths and symlink escapes.
 
@@ -183,7 +198,9 @@ def write_package(
     """Atomically package a local safetensors checkpoint and local backbone for Runtime.
 
     Existing exports are never overwritten. Only model data is copied; package
-    configuration cannot introduce Python files into the worker environment.
+    configuration cannot introduce Python files into the worker environment. A checkpoint
+    trained without proprioceptive state (StarVLA's ``include_state``, off by default) gets a
+    package that maps none, so Runtime neither requires nor sends it.
 
     Returns:
         Completed Runtime package directory.
@@ -200,6 +217,8 @@ def write_package(
     for name in ("config.yaml", "dataset_statistics.json"):
         contained_file(run_dir, name)
     spec = environments.for_policy(framework_from_config(run_dir / "config.yaml") or "")
+    if not checkpoint_uses_state(run_dir / "config.yaml"):
+        io = replace(io, state={})
     stats = json.loads((run_dir / "dataset_statistics.json").read_text())
     if not isinstance(stats, dict) or unnorm_key not in stats:
         msg = "unnorm_key is not present in the checkpoint's dataset statistics."

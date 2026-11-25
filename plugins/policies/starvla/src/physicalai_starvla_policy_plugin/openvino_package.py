@@ -89,9 +89,6 @@ def write_openvino_package(
     if image_size is not None and (len(image_size) != 2 or any(type(v) is not int or v <= 0 for v in image_size)):  # ruff: ignore[magic-value-comparison]
         msg = "image_size must be (height, width) in pixels."
         raise ValueError(msg)
-    if not io.state:
-        msg = "The OpenVINO export requires a proprioceptive state mapping."
-        raise ValueError(msg)
     # Refuse other frameworks before staging a native package, which copies the whole backbone.
     run_config = checkpoint.expanduser().resolve().parents[1] / "config.yaml"
     if run_config.is_file():

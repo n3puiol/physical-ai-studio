@@ -34,6 +34,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import starvla_openvino_pipeline as pipeline
+from starvla_worker_common import trained_with_state
 
 # Largest acceptable |OpenVINO - PyTorch| on normalized actions, and smallest cosine, per weight format.
 TOLERANCE = {"fp32": (1e-3, 0.99999), "fp16": (5e-2, 0.9999), "int8": (1e-1, 0.999)}
@@ -68,11 +69,14 @@ def stats(actual: Any, expected: Any) -> dict[str, float]:
 
 
 # PyTorch modules traced into the three graphs ------------------------------------------------
-def build_modules(torch: Any, framework: Any, grid: Any) -> dict[str, Any]:
+def build_modules(torch: Any, framework: Any, grid: Any, *, with_state: bool) -> dict[str, Any]:
     """Wrap StarVLA's vision tower, text model and action head as traceable modules.
 
     Patches the text model in place (identity final norm, dense DeepStack), so StarVLA's own
     ``predict_action`` must not be called afterwards.
+
+    ``with_state`` adds the proprioceptive state token and input; a checkpoint trained without
+    state (StarVLA's ``include_state``) gets a head without either, as in training.
 
     Returns:
         ``vision``, ``llm`` and ``head`` modules, and ``head_fn`` for the PyTorch reference.
@@ -90,7 +94,7 @@ def build_modules(torch: Any, framework: Any, grid: Any) -> dict[str, Any]:
         batch = vl_embs.shape[0]
         actions = noise
         steps = head.num_inference_timesteps
-        state_features = head.state_encoder(state)
+        state_features = head.state_encoder(state) if state is not None else None
         future = head.future_tokens.weight.unsqueeze(0).expand(batch, -1, -1)
         for step in range(steps):
             bucket = int(step / float(steps) * head.num_timestep_buckets)
@@ -98,7 +102,8 @@ def build_modules(torch: Any, framework: Any, grid: Any) -> dict[str, Any]:
             features = head.action_encoder(actions, timesteps)
             if head.config.add_pos_embed:
                 features += head.position_embedding(torch.arange(features.shape[1])).unsqueeze(0)
-            hidden = torch.cat((state_features, future, features), dim=1)
+            parts = (state_features, future, features) if state_features is not None else (future, features)
+            hidden = torch.cat(parts, dim=1)
             out = head.model(
                 hidden_states=hidden,
                 encoder_hidden_states=vl_embs,
@@ -118,6 +123,16 @@ def build_modules(torch: Any, framework: Any, grid: Any) -> dict[str, Any]:
 
         def forward(self, vl_embs: Any, attention_mask: Any, state: Any, noise: Any) -> Any:  # ruff: ignore[no-self-use]
             return head_with_noise(vl_embs, attention_mask, state, noise)
+
+    class StatelessHead(torch.nn.Module):
+        """The head of a checkpoint trained without proprioceptive state: no state input."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.head = head
+
+        def forward(self, vl_embs: Any, attention_mask: Any, noise: Any) -> Any:  # ruff: ignore[no-self-use]
+            return head_with_noise(vl_embs, attention_mask, None, noise)
 
     class Vision(torch.nn.Module):
         """Vision tower with the exported camera grid baked in."""
@@ -162,7 +177,8 @@ def build_modules(torch: Any, framework: Any, grid: Any) -> dict[str, Any]:
             )
             return out.last_hidden_state
 
-    return {"head": Head().eval(), "vision": Vision().eval(), "llm": Text().eval(), "head_fn": head_with_noise}
+    exported_head = Head() if with_state else StatelessHead()
+    return {"head": exported_head.eval(), "vision": Vision().eval(), "llm": Text().eval(), "head_fn": head_with_noise}
 
 
 # Package metadata ------------------------------------------------------------------------------
@@ -268,6 +284,7 @@ class Export:
     output: Path
     weights: str
     image_size: tuple[int, int] | None
+    uses_state: bool = True
     descriptor: dict[str, Any] = field(default_factory=dict)
     framework: Any = None
     processor: Any = None
@@ -315,7 +332,6 @@ def load(export: Export) -> None:
             getattr(cfg.datasets.vla_data, "obs_image_size", None),
         ),
         "Package camera order differs from the training DataConfig.": cameras != list(data_config.video_keys),
-        "The OpenVINO action head is exported with proprioceptive state; this package has none.": not io["state"],
     }
     for message, failed in problems.items():
         if failed:
@@ -337,11 +353,22 @@ def load(export: Export) -> None:
     # which does nothing on CPU. Export (and the reference) run in float32.
     export.framework.float().eval()
     export.processor = wrapper.get_norm_processor()
-    for label, dims in (("action", export.processor.action_key_dims), ("state", export.processor.state_key_dims)):
+    # Follow training: StarVLA packs state only with include_state.
+    export.uses_state = trained_with_state(cfg.datasets.vla_data) and bool(export.processor.state_keys)
+    labels = [("action", export.processor.action_key_dims)]
+    if export.uses_state:
+        if not io["state"]:
+            msg = "The checkpoint was trained with proprioceptive state (include_state); the package maps none."
+            raise ExportError(msg)
+        labels.append(("state", export.processor.state_key_dims))
+    else:
+        io["state"] = {}
+    for label, dims in labels:
         mapping = io[label]
         if set(mapping) != set(dims) or any(end - start != dims[key] for key, (start, end) in mapping.items()):
             msg = f"Package {label} keys or widths differ from the checkpoint DataConfig."
             raise ExportError(msg)
+    log(f"proprioceptive state: {'yes' if export.uses_state else 'no (include_state is off)'}")
     log(f"loaded checkpoint in {time.time() - started:.0f}s")
 
 
@@ -357,18 +384,17 @@ def reference(export: Export) -> None:  # ruff: ignore[too-many-locals]  # One l
     framework, processor, io = export.framework, export.processor, export.descriptor["io"]
     rng = np.random.default_rng(0)
     export.images = [rng.integers(0, 256, (*export.resolved_image_size, 3), dtype=np.uint8) for _ in io["cameras"]]
-    raw_state = rng.normal(0, 0.2, max(end for _, end in io["state"].values())).astype(np.float32)
-    export.state_groups = {key: raw_state[None, start:end] for key, (start, end) in io["state"].items()}
-    normalized_state = {key: value.copy() for key, value in export.state_groups.items()}
-    for transform in processor.transform.transforms:
-        if any(key.startswith("state.") for key in transform.apply_to):
-            normalized_state = transform(normalized_state)
-    example_state = np.concatenate([np.asarray(normalized_state[key]) for key in processor.state_keys], axis=-1)
-    example = {
-        "image": [Image.fromarray(image) for image in export.images],
-        "lang": VALIDATION_TASK,
-        "state": example_state,
-    }
+    example: dict[str, Any] = {"image": [Image.fromarray(image) for image in export.images], "lang": VALIDATION_TASK}
+    example_state = None
+    if export.uses_state:
+        raw_state = rng.normal(0, 0.2, max(end for _, end in io["state"].values())).astype(np.float32)
+        export.state_groups = {key: raw_state[None, start:end] for key, (start, end) in io["state"].items()}
+        normalized_state = {key: value.copy() for key, value in export.state_groups.items()}
+        for transform in processor.transform.transforms:
+            if any(key.startswith("state.") for key in transform.apply_to):
+                normalized_state = transform(normalized_state)
+        example_state = np.concatenate([np.asarray(normalized_state[key]) for key in processor.state_keys], axis=-1)
+        example["state"] = example_state
 
     with torch.inference_mode():
         interface = framework.qwen_vl_interface
@@ -395,9 +421,9 @@ def reference(export: Export) -> None:  # ruff: ignore[too-many-locals]  # One l
         noise = torch.randn((1, head.action_horizon, head.action_dim))
 
         # Patches the text model in place, so the native path above must already have run.
-        export.modules = build_modules(torch, framework, grid.clone())
+        export.modules = build_modules(torch, framework, grid.clone(), with_state=export.uses_state)
         hidden = export.modules["llm"](embeds, inputs["attention_mask"], position_ids, dense)
-        state = torch.from_numpy(np.array([example_state])).float()
+        state = torch.from_numpy(np.array([example_state])).float() if example_state is not None else None
         mask = inputs["attention_mask"].bool()
         actions = export.modules["head_fn"](hidden, mask, state, noise)
     split = stats(actions, native_actions)
@@ -431,7 +457,11 @@ def convert(export: Export) -> None:
             (t["embeds"], t["attention_mask"], t["position_ids"], t["dense"]),
             ["inputs_embeds", "attention_mask", "position_ids", "deepstack"],
         ),
-        "head": ((t["hidden"], t["mask"], t["state"], t["noise"]), ["vl_embs", "attention_mask", "state", "noise"]),
+        "head": (
+            ((t["hidden"], t["mask"], t["state"], t["noise"]), ["vl_embs", "attention_mask", "state", "noise"])
+            if export.uses_state
+            else ((t["hidden"], t["mask"], t["noise"]), ["vl_embs", "attention_mask", "noise"])
+        ),
     }
     for name in pipeline.MODELS:
         started = time.time()
@@ -501,7 +531,9 @@ def describe(export: Export) -> None:
             "vision_start_token_id": int(vlm_config.vision_start_token_id),
         },
         "embedding": {"dtype": "bfloat16" if bfloat16 else "float32", "shape": list(export.embedding.shape)},
-        "state": {"keys": [[key, processor.state_key_dims[key]] for key in processor.state_keys]},
+        "state": {
+            "keys": [[key, processor.state_key_dims[key]] for key in processor.state_keys] if export.uses_state else [],
+        },
         "action": {
             "keys": [[key, processor.action_key_dims[key]] for key in processor.action_keys],
             "horizon": int(head.action_horizon),
@@ -529,13 +561,20 @@ def validate(export: Export) -> dict[str, Any]:
         "input_ids_equal": bool(np.array_equal(prepared["input_ids"], t["input_ids"].numpy())),
         "position_ids_equal": bool(np.array_equal(prepared["position_ids"], t["position_ids"].numpy())),
         "pixel_values": stats(prepared["pixel_values"], t["pixel_values"]),
-        "state": stats(ov_pipeline.normalize_state(export.state_groups), t["state"].numpy()),
+        "state": (
+            stats(ov_pipeline.normalize_state(export.state_groups), t["state"].numpy()) if export.uses_state else None
+        ),
         "unnormalize": stats(
             np.concatenate([unnormalized[key] for key, _ in export.package["action"]["keys"]], axis=-1),
             export.processor.unapply_actions(t["native_actions"][0]),
         ),
         "actions": stats(
-            ov_pipeline.predict_normalized(export.images, VALIDATION_TASK, t["state"].numpy(), t["noise"].numpy()),
+            ov_pipeline.predict_normalized(
+                export.images,
+                VALIDATION_TASK,
+                ov_pipeline.normalize_state(export.state_groups),
+                t["noise"].numpy(),
+            ),
             t["actions"],
         ),
     }
@@ -545,7 +584,9 @@ def validate(export: Export) -> dict[str, Any]:
         "Torch-free prompt or position ids differ from transformers.": not (
             checks["input_ids_equal"] and checks["position_ids_equal"]
         ),
-        "Numpy normalization differs from StarVLA's transforms.": checks["state"]["max_abs"] > STATE_TOLERANCE
+        "Numpy normalization differs from StarVLA's transforms.": (
+            checks["state"] is not None and checks["state"]["max_abs"] > STATE_TOLERANCE
+        )
         or checks["unnormalize"]["max_abs"] > UNNORMALIZE_TOLERANCE,
         f"OpenVINO actions differ from PyTorch beyond the {export.weights} tolerance.": checks["actions"]["max_abs"]
         > max_abs

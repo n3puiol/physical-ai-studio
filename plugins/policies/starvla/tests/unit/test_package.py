@@ -4,18 +4,20 @@
 """Package structure, allowlists, and untrusted descriptor validation."""
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
 from physicalai.inference.manifest import Manifest
 
+from physicalai_starvla_policy_plugin._worker.starvla_worker_common import trained_with_state
 from physicalai_starvla_policy_plugin.package import ARTIFACT, BACKBONE_DIR, IoSpec, load_descriptor, write_package
 
 
 def test_package_roundtrip(package: Path, io: IoSpec) -> None:
     descriptor = load_descriptor(package / ARTIFACT)
-    assert asdict(IoSpec.from_dict(descriptor["io"])) == json.loads(json.dumps(asdict(io)))
+    # The fixture run was trained without proprioceptive state (StarVLA's default), so the package maps none.
+    assert asdict(IoSpec.from_dict(descriptor["io"])) == json.loads(json.dumps(asdict(replace(io, state={}))))
     assert Manifest.load(package / "manifest.json").model.artifacts == {"starvla": ARTIFACT}
     assert (package / ARTIFACT / BACKBONE_DIR / "tokenizer.json").is_file()
     assert not list(package.rglob("*.py"))
@@ -89,3 +91,43 @@ def test_pickle_checkpoint_is_rejected(tmp_path: Path, backbone: Path, io: IoSpe
 def test_invalid_action_mapping(action: dict) -> None:
     with pytest.raises(ValueError, match=r"mapping|slices|slice"):
         IoSpec(cameras={"video.main": "front"}, state={}, action=action)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("missing", False),
+        (False, False),
+        ("False", False),
+        (0, False),
+        (True, True),
+        ("true", True),
+        ("false", True),  # Upstream only treats False and "False" as off.
+        (None, True),
+    ],
+)
+def test_state_rule_mirrors_starvla(value: object, *, expected: bool) -> None:
+    assert trained_with_state({} if value == "missing" else {"include_state": value}) is expected
+
+
+@pytest.mark.parametrize(
+    ("vla_data", "keeps_state"),
+    [
+        ("", False),
+        ("datasets:\n  vla_data:\n    include_state: false\n", False),
+        ("datasets:\n  vla_data:\n    include_state: true\n", True),
+    ],
+)
+def test_package_maps_state_only_if_training_used_it(
+    tmp_path: Path,
+    checkpoint: Path,
+    backbone: Path,
+    io: IoSpec,
+    vla_data: str,
+    *,
+    keeps_state: bool,
+) -> None:
+    (checkpoint.parents[1] / "config.yaml").write_text("framework:\n  name: QwenGR00T\n" + vla_data)
+    exported = write_package(checkpoint, tmp_path / "state-export", backbone=backbone, io=io, unnorm_key="franka")
+    state = load_descriptor(exported / ARTIFACT)["io"]["state"]
+    assert state == ({"state.arm": [0, 2]} if keeps_state else {})

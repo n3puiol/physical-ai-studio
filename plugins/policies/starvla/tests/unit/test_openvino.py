@@ -190,9 +190,11 @@ class FakePipeline(pipeline.QwenGR00TPipeline):
             return [embeds + deepstack.sum(0)]
 
         def head(inputs: list[np.ndarray]) -> list[np.ndarray]:
-            hidden, mask, state, noise = inputs
+            # A head exported without proprioceptive state has no state input.
+            hidden, mask, *rest = inputs
+            state, noise = rest if len(rest) == 2 else (None, rest[0])
             self.calls.append({"hidden": hidden, "state": state, "noise": noise, "head_mask": mask})
-            return [noise * 0 + state.sum()]
+            return [noise * 0 + (state.sum() if state is not None else 0)]
 
         self.models = {"vision": vision, "llm": llm, "head": head}
 
@@ -381,13 +383,23 @@ def test_openvino_export_options_are_validated(
         )
 
 
-def test_openvino_export_requires_state(tmp_path: Path, checkpoint: Path, backbone: Path) -> None:
-    io = IoSpec(cameras={"video.primary": "front"}, state={}, action={"action.arm": (0, 1)})
-    with pytest.raises(ValueError, match="state"):
-        openvino_package.write_openvino_package(
-            checkpoint,
-            tmp_path / "ov",
-            backbone=backbone,
-            io=io,
-            unnorm_key="franka",
-        )
+def test_package_without_state_runs_without_it(
+    tmp_path: Path,
+    descriptor: dict[str, Any],
+    observation: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A checkpoint trained without include_state exports a head with no state input; Runtime needs none."""
+    package = tmp_path / "ov-stateless"
+    descriptor = {**descriptor, "io": {**descriptor["io"], "state": {}}, "state": {"keys": []}}
+    _write_artifact(package / openvino_package.OPENVINO_ARTIFACT, descriptor)
+    openvino_package._write_manifest(package, "QwenGR00T")
+    monkeypatch.setattr(openvino_runtime.pipeline, "QwenGR00TPipeline", FakePipeline)
+
+    with InferenceModel(package, seed=3) as model:
+        action = model({key: value for key, value in observation.items() if key != "state"})["action"]
+
+    head = FakePipeline.last.calls[1]
+    assert head["state"] is None
+    assert head["noise"].shape == (1, 2, 3)
+    np.testing.assert_allclose(action, [[[0, 10, 20], [0, 10, 20]]])

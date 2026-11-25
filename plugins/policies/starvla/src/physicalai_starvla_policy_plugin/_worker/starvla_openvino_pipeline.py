@@ -13,7 +13,8 @@ The pipeline reproduces ``QwenGR00T.predict_action`` for one observation:
 2. ``vision.xml``: the vision tower with the exported camera grid baked in.
 3. Host glue: token embedding lookup, image-token scatter, dense DeepStack features, mRoPE ids.
 4. ``llm.xml``: the text model, returning the *pre-norm* last hidden state StarVLA conditions on.
-5. ``head.xml``: the flow-matching action head with the sampled noise as an input.
+5. ``head.xml``: the flow-matching action head with the sampled noise as an input, and the
+   normalized state when the checkpoint was trained with it (StarVLA's ``include_state``).
 6. StarVLA's state normalization and action unnormalization.
 """
 
@@ -357,11 +358,16 @@ class QwenGR00TPipeline:
     def head(self, hidden: np.ndarray, state: np.ndarray, noise: np.ndarray) -> np.ndarray:
         """Run the unrolled flow-matching action head on normalized state and explicit noise.
 
+        A package exported from a checkpoint trained without proprioceptive state declares no
+        state keys, and its head has no state input; ``state`` is then ignored.
+
         Returns:
             Normalized actions of shape (1, horizon, action_dim).
         """
         mask = np.ones(hidden.shape[:2], dtype=bool)
-        return self.models["head"]([hidden, mask, state, noise.astype(np.float32)])[0]
+        noise = noise.astype(np.float32)
+        inputs = [hidden, mask, state, noise] if self.descriptor["state"]["keys"] else [hidden, mask, noise]
+        return self.models["head"](inputs)[0]
 
     def predict_normalized(
         self,

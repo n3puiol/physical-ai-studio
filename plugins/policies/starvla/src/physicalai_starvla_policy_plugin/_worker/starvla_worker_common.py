@@ -14,7 +14,10 @@ import sys
 import threading
 import time
 from importlib.metadata import version
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 _ACK_TIMEOUT_SECONDS = 60.0
 
@@ -47,6 +50,19 @@ class EventChannel:
         payload = b"\x1ephysicalai-worker " + (json.dumps(message, allow_nan=False) + "\n").encode()
         while payload:
             payload = payload[os.write(self._fd, payload) :]
+
+
+def trained_with_state(vla_data: Mapping[str, object]) -> bool:
+    """Whether StarVLA's data loader packs proprioceptive state into training samples.
+
+    Mirrors ``starVLA.dataloader.gr00t_lerobot.datasets``: state is packed unless
+    ``include_state`` is ``False`` or ``"False"``, and the setting defaults to ``False``.
+    ``vla_data`` is the training config's ``datasets.vla_data`` (a dict or an OmegaConf node).
+
+    Returns:
+        True when the checkpoint was trained with proprioceptive state.
+    """
+    return vla_data.get("include_state", False) not in ("False", False)  # ruff: ignore[literal-membership]  # Same test as upstream, any value.
 
 
 def identity() -> dict[str, str]:

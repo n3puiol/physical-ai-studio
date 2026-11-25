@@ -17,7 +17,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import starvla_worker_protocol as protocol
-from starvla_worker_common import disable_remote_code, identity
+from starvla_worker_common import disable_remote_code, identity, trained_with_state
 
 _ACTION_RANK = 3
 
@@ -60,13 +60,9 @@ class Policy:
         )
         self.processor = self.wrapper.get_norm_processor()
         self.io = descriptor["io"]
-        for label, dimensions in (("action", self.processor.action_key_dims), ("state", self.processor.state_key_dims)):
-            mapping = self.io[label]
-            if set(mapping) != set(dimensions) or any(
-                end - start != dimensions[key] for key, (start, end) in mapping.items()
-            ):
-                msg = f"Package {label} keys or widths differ from the checkpoint DataConfig."
-                raise ValueError(msg)
+        # Feed state only if training did: StarVLA packs it only with include_state.
+        self.uses_state = trained_with_state(cfg.datasets.vla_data) and bool(self.processor.state_keys)
+        check_mapping(self.io, self.processor, uses_state=self.uses_state)
         # The wrapper deliberately does not infer image order. Check it against training.
         from deployment.model_server.policy_norm_processor import (
             _resolve_robot_type,  # ruff: ignore[import-private-name]  # Pinned wrapper resolution.
@@ -107,7 +103,7 @@ class Policy:
             "image": [Image.fromarray(message["video"][key]) for key in self.io["cameras"]],
             "lang": message["task"],
         }
-        if self.io["state"]:
+        if self.uses_state:
             state = {key: np.asarray(value, dtype=np.float32) for key, value in message["state"].items()}
             for transform in self.processor.transform.transforms:
                 if not any(key.startswith("state.") for key in transform.apply_to):
@@ -130,6 +126,28 @@ class Policy:
             result[key] = actions[0, :, cursor : cursor + width]
             cursor += width
         return result
+
+
+def check_mapping(io: dict[str, Any], processor: Any, *, uses_state: bool) -> None:  # ruff: ignore[any-type]
+    """Check the package's robot mapping against the checkpoint's training DataConfig.
+
+    A checkpoint trained without proprioceptive state ignores any state mapping; packages
+    exported before the plugin followed ``include_state`` still carry one.
+
+    Raises:
+        ValueError: If action keys or widths, or the state the checkpoint was trained on, differ.
+    """
+    labels = [("action", processor.action_key_dims)]
+    if uses_state:
+        if not io["state"]:
+            msg = "The checkpoint was trained with proprioceptive state (include_state); the package maps none."
+            raise ValueError(msg)
+        labels.append(("state", processor.state_key_dims))
+    for label, dimensions in labels:
+        widths = {key: end - start for key, (start, end) in io[label].items()}
+        if widths != dict(dimensions):
+            msg = f"Package {label} keys or widths differ from the checkpoint DataConfig."
+            raise ValueError(msg)
 
 
 def main() -> None:
