@@ -1,12 +1,12 @@
 # StarVLA engine
 
-Train StarVLA **QwenGR00T** and **QwenPI** with the upstream trainer and run exported
-checkpoints through Physical AI Runtime. StarVLA, PyTorch, Transformers, and its dataset code
+Train StarVLA **QwenGR00T**, **QwenPI** and **QwenOFT** with the upstream trainers, including
+co-training with VLM data, and run exported checkpoints through Physical AI Runtime. StarVLA, PyTorch, Transformers, and its dataset code
 live in a separate locked Python 3.11/CUDA 12.8 environment. Neither the host nor
 a Runtime-only install imports `physicalai-train` to perform inference.
 
-This integration supports single-GPU QwenGR00T and QwenPI on Qwen3-VL, upstream
-registered LeRobot dataset mixtures, one observation per camera, native safetensors
+This integration supports single-GPU QwenGR00T, QwenPI and QwenOFT on Qwen3-VL, supervised
+training and co-training with VLM data, upstream registered LeRobot dataset mixtures, one observation per camera, native safetensors
 packages (CUDA inference in the isolated worker), and, for QwenGR00T, OpenVINO packages
 (in-process inference on CPU or another OpenVINO device, without StarVLA or PyTorch). Other
 StarVLA frameworks, custom executable dataset registrations, DeepSpeed/multi-GPU
@@ -18,7 +18,7 @@ From `library/`:
 
 ```bash
 uv sync --extra starvla
-uv run physicalai engine prepare starvla --policy QwenGR00T --accelerator cu128  # QwenPI shares it
+uv run physicalai engine prepare starvla --policy QwenGR00T --accelerator cu128  # QwenPI and QwenOFT share it
 uv run physicalai engine prepare starvla --enablement qwengr00t-openvino  # OpenVINO conversion
 uv run physicalai train starvla --help
 ```
@@ -27,7 +27,7 @@ Each StarVLA framework maps to a locked worker project under
 `src/physicalai_starvla_policy_plugin/envs/<name>/`, declared in `environments.POLICY_ENVIRONMENTS`
 and mapped through `StarVLAEngine.policy_envs`. Training, export and Runtime pick the environment
 from `framework.name` in the training YAML (a `framework.name=...` override wins). Frameworks with
-the same dependencies share a project: QwenPI uses QwenGR00T's `envs/qwengr00t/`, so the engine
+the same dependencies share a project: QwenPI and QwenOFT use QwenGR00T's `envs/qwengr00t/`, so the engine
 lists and prepares it once. A framework that needs other dependencies gets its own project, so
 frameworks never share a resolution they were not locked for. There is no default environment: a
 framework without an entry is rejected, and the training worker refuses a config whose
@@ -206,6 +206,84 @@ states brings QwenPI's initial loss to 1.2–1.4. The plugin runs upstream uncha
 packages stay faithful to StarVLA; whether the scale slows or harms full QwenPI training was not
 measured.
 
+## QwenOFT
+
+QwenOFT appends eight copies of a query token to the prompt and regresses the action chunk from
+their last hidden states with a small MLP and an L1 loss. Its predictions involve no noise, so they
+are deterministic. When a checkpoint was trained with state, QwenOFT writes the state into the
+prompt as discretized text.
+
+`configs/qwenoft_libero.yaml` is a 20-step LIBERO smoke run on Qwen3-VL-4B with the VLM frozen, so
+only the MLP trains. Upstream's OFT recipes also train the VLM, which needs more than 24 GB, so this
+run checks the integration rather than producing a useful policy. QwenOFT exports native packages
+only.
+
+Verified on one RTX 3090: 20 steps through the engine took 23 seconds at 11.0 GB of GPU memory, and
+the loss fell from 0.87 to 0.47. On a real LIBERO-goal frame, Runtime matched StarVLA's own
+`predict_action` exactly (maximum absolute difference `0.0`) and repeated it exactly, and an
+OpenVINO export was refused.
+
+## Co-training with VLM data
+
+A training config with `datasets.vlm_data` runs StarVLA's co-training trainer instead of the
+supervised one. Each step adds a language-modelling loss on VLM question-answering data, weighted by
+`trainer.loss_scale.vlm`, to the action loss. That loss trains the VLM, so `freeze_modules` must
+leave part of `qwen_vl_interface` trainable.
+
+StarVLA names VLM datasets in a Python table with paths relative to its working directory. The
+plugin reads them from the config instead. Every name in `dataset_use` (optionally with a `%NN`
+sampling suffix) must be listed under `sources`, with an absolute path to a LLaVA-format JSON file
+and to its image folder:
+
+```yaml
+datasets:
+  vlm_data:
+    dataset_py: vlm_datasets
+    dataset_use: libero_goal_vqa
+    sources:
+      libero_goal_vqa:
+        annotation_path: /absolute/path/to/vqa.json
+        data_path: /absolute/path/to/images
+    model_type: qwen3vl
+```
+
+Each JSON record has an `image` (relative to `data_path`) and `conversations` of `human` and `gpt`
+turns, with `<image>` marking where the image goes. Training refuses unknown names, missing or
+relative paths, a `model_type` other than `qwen3vl`, a fully frozen VLM and a missing
+`trainer.loss_scale.vlm`.
+
+`configs/qwengroot_libero_cotrain.yaml` co-trains QwenGR00T on Qwen3-VL-2B for 20 steps with
+upstream's loss weights (VLA 1.0, VLM 0.1). To fit a 24 GB GPU it freezes the vision tower, the
+embeddings and the first 26 of 28 LLM layers; upstream's recipes train the whole VLM.
+
+```bash
+WANDB_MODE=disabled library/.venv/bin/physicalai train starvla \
+  --config_yaml plugins/policies/starvla/configs/qwengroot_libero_cotrain.yaml \
+  framework.qwenvl.base_vlm=/absolute/path/to/Qwen3-VL-2B-Instruct \
+  datasets.vla_data.data_root_dir=/absolute/path/to/datasets \
+  datasets.vlm_data.sources.libero_goal_vqa.annotation_path=/absolute/path/to/vqa.json \
+  datasets.vlm_data.sources.libero_goal_vqa.data_path=/absolute/path/to/images \
+  run_root_dir=/absolute/path/to/runs run_id=starvla-cotrain
+```
+
+Co-trained checkpoints export and run like any other run of their framework.
+
+Three upstream gaps for single-GPU co-training are bridged in the worker:
+
+- StarVLA's co-training trainer builds a DeepSpeed plugin unconditionally. DeepSpeed is not in the
+  worker environment, so the worker builds none, as the supervised trainer does in single-GPU mode.
+- The VLM loader overwrites the backbone's video-processor sizes, frame counts and fps from
+  `video_*` settings, even for image data, and fails when they are unset. Unset ones keep the
+  backbone's own values.
+- The VLM loader hard-codes four worker processes, which stalled training after model
+  initialization. `datasets.vlm_data.num_workers` sets the count; the bundled config uses 0.
+
+Verified on one RTX 3090 with a 40-example question-answering set built from LIBERO-goal frames
+("What task is the robot performing?", answered with the episode's instruction). 20 steps took 20
+seconds at 8.9 GB of GPU memory and reported the action loss (1.28) and the weighted VLM loss
+(0.46) every step. Runtime matched StarVLA's own `predict_action` exactly, and the co-trained
+QwenGR00T also exported to OpenVINO (actions within 3.1e-3 of PyTorch).
+
 ## Export with explicit robot mappings
 
 Review `configs/libero_io.json` against your actual observations. It specifies
@@ -377,7 +455,7 @@ uv run --no-sync pytest ../plugins/policies/starvla/tests -q
 Tests exercise engine routing, package validation, I/O conversion, framing,
 worker failures, and Runtime loading with a tiny fake worker. They do not prove
 model quality, numerical parity, CUDA compatibility, or real robot safety.
-Verified with 117 CPU contract tests and a real GPU smoke run on one RTX 3090
+Verified with 140 CPU contract tests and a real GPU smoke run on one RTX 3090
 24 GB (driver 580.173.02, isolated PyTorch 2.7.1/CUDA 12.8). After the workers moved to
 Python 3.11, the 20-step training, native and OpenVINO export, native/Runtime match and seeded
 replay were rerun with the same results. The other measurements below predate that move:
