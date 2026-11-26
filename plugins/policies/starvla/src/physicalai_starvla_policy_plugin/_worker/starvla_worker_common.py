@@ -150,14 +150,23 @@ BACKBONE_VARIABLE = "PHYSICALAI_STARVLA_BACKBONE"
 
 # World-model backbones (StarVLA's WM4A frameworks), by backbone type: the package folder name, which
 # carries the substring StarVLA's get_world_model dispatches on (case-insensitively), and the
-# diffusers pipeline class the folder's model_index.json names. Wan2.2 is not wired: its weights
-# alone fill a 24 GB GPU.
-WORLD_MODELS = {"cosmos_predict2": ("Cosmos-Predict2", "Cosmos2VideoToWorldPipeline")}
+# diffusers pipeline class the folder's model_index.json names.
+WORLD_MODELS = {
+    "cosmos_predict2": ("Cosmos-Predict2", "Cosmos2VideoToWorldPipeline"),
+    "wan2_2": ("Wan2.2-TI2V", "WanPipeline"),
+}
+# Wan2.1 folders also name WanPipeline and match StarVLA's "wan2" dispatch, but its Wan wrapper is
+# built for Wan2.2-TI2V: it encodes 480x832 frames, which Wan2.1's 8x VAE (z_dim 16) turns into 1,560
+# DiT tokens per frame, beyond the wrapper's 1,024-token limit. Wan2.2-TI2V's 16x VAE has z_dim 48.
+_WORLD_MODEL_CONFIG = {"wan2_2": ("vae/config.json", "z_dim", 48)}
 # The world-model frameworks the plugin trains, and the backbone type each is built for.
 WORLD_MODEL_FRAMEWORKS = {
     "CosmoPredict2GR00T": "cosmos_predict2",
     "CosmoPredict2OFT": "cosmos_predict2",
     "CosmoPredict2PI": "cosmos_predict2",
+    "WanGR00T": "wan2_2",
+    "WanOFT": "wan2_2",
+    "WanPI": "wan2_2",
 }
 
 
@@ -172,6 +181,30 @@ def dispatched_world_model(path: str) -> str | None:
         return None
     if "cosmos-predict2" in name:
         return "cosmos_predict2"
+    if "wan2" in name or "ti2v" in name:
+        return "wan2_2"
+    return None
+
+
+def world_model_problem(folder: Path, kind: str) -> str | None:
+    """Say why a local folder is not a world model of ``kind`` StarVLA can load, if it is not one.
+
+    Returns:
+        The reason, or ``None`` for a usable folder.
+    """
+    name, pipeline = WORLD_MODELS[kind]
+    index = folder / "model_index.json"
+    found = json.loads(index.read_text()).get("_class_name") if index.is_file() else None
+    if found != pipeline:
+        return f"Use a local, materialized {name} diffusers folder ({pipeline})."
+    if kind in _WORLD_MODEL_CONFIG:
+        relative, key, value = _WORLD_MODEL_CONFIG[kind]
+        config = folder / relative
+        if not config.is_file() or json.loads(config.read_text()).get(key) != value:
+            return (
+                f"StarVLA's Wan wrapper takes Wan2.2-TI2V ({relative} {key}={value}); Wan2.1's 8x VAE gives 1,560 "
+                "DiT tokens per 480x832 frame, beyond its 1,024-token limit."
+            )
     return None
 
 

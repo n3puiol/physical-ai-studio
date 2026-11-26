@@ -537,10 +537,12 @@ def test_a_world_model_framework_trains_on_its_cosmos_predict2_folder(
     with pytest.raises(ValueError, match=r"reads its backbone from framework\.world_model\.base_wm"):
         train_worker.worker.train(["--config_yaml", "unused.yaml"])
     # StarVLA would load another model, or the folder is not a Cosmos-Predict2 pipeline.
-    for folder in (_cosmos(tmp_path / "a", name="world-model"), _cosmos(tmp_path / "b", pipeline="WanPipeline")):
-        framework.world_model.base_wm = str(folder)
-        with pytest.raises(ValueError, match="materialized Cosmos-Predict2 diffusers folder"):
-            train_worker.worker.train(["--config_yaml", "unused.yaml"])
+    framework.world_model.base_wm = str(_cosmos(tmp_path / "a", name="world-model"))
+    with pytest.raises(ValueError, match="StarVLA picks the world model by its path"):
+        train_worker.worker.train(["--config_yaml", "unused.yaml"])
+    framework.world_model.base_wm = str(_cosmos(tmp_path / "b", pipeline="WanPipeline"))
+    with pytest.raises(ValueError, match="materialized Cosmos-Predict2 diffusers folder"):
+        train_worker.worker.train(["--config_yaml", "unused.yaml"])
     cosmos = _cosmos(tmp_path)
     framework.world_model.base_wm = str(cosmos)
 
@@ -548,6 +550,34 @@ def test_a_world_model_framework_trains_on_its_cosmos_predict2_folder(
 
     assert framework.world_model.base_wm == str(cosmos.resolve())
     assert json.loads((output / "physicalai_run.json").read_text())["backbone_path"] == str(cosmos.resolve())
+
+
+def _wan(root: Path, name: str, z_dim: int) -> Path:
+    folder = root / name
+    (folder / "vae").mkdir(parents=True)
+    (folder / "model_index.json").write_text('{"_class_name": "WanPipeline"}')
+    (folder / "vae" / "config.json").write_text(json.dumps({"z_dim": z_dim}))
+    return folder
+
+
+def test_wan_frameworks_train_on_wan22_ti2v_and_refuse_wan21(
+    train_worker: SimpleNamespace,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PHYSICALAI_STARVLA_FRAMEWORK", "WanGR00T")
+    monkeypatch.setenv("PHYSICALAI_STARVLA_BACKBONE", "wan2_2")
+    framework = train_worker.cfg.framework
+    framework.name = "WanGR00T"
+    framework.world_model = SimpleNamespace(base_wm=str(_wan(tmp_path / "a", "Wan2.1-T2V-1.3B-Diffusers", 16)))
+    with pytest.raises(ValueError, match=r"Wan2\.1's 8x VAE gives 1,560 DiT tokens"):
+        train_worker.worker.train(["--config_yaml", "unused.yaml"])
+    wan = _wan(tmp_path, "Wan2.2-TI2V-5B-Diffusers", 48)
+    framework.world_model.base_wm = str(wan)
+
+    output, _ = train_worker.worker.train(["--config_yaml", "unused.yaml"])
+
+    assert json.loads((output / "physicalai_run.json").read_text())["backbone_path"] == str(wan.resolve())
 
 
 def test_world_model_frameworks_do_not_cotrain(

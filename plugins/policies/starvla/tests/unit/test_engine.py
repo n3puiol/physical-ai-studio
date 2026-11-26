@@ -29,6 +29,9 @@ def test_entry_point_and_pins() -> None:
         "QwenGR00T",
         "QwenOFT",
         "QwenPI",
+        "WanGR00T",
+        "WanOFT",
+        "WanPI",
     ]
     assert env.pinned().base_version == "1.0.1"
     assert env.accelerators == ("cu128",)
@@ -585,7 +588,10 @@ def test_world_model_frameworks_train_in_the_shared_environment(
     [
         ("CosmoPredict2GR00T", "/models/Cosmos-Predict2-2B-Video2World", "cosmos_predict2"),
         ("CosmoPredict2OFT", "/models/nvidia/cosmos-predict2-2b", "cosmos_predict2"),  # Case-insensitive upstream.
-        ("CosmoPredict2GR00T", "/models/Wan2.2-TI2V-5B", "cosmos_predict2"),  # Not wired: the worker refuses it.
+        ("CosmoPredict2GR00T", "/models/Wan2.2-TI2V-5B", "wan2_2"),  # No Cosmos framework runs it: refused.
+        ("WanGR00T", "/models/Wan2.2-TI2V-5B-Diffusers", "wan2_2"),
+        ("WanOFT", "/models/wan2.1-t2v-1.3b", "wan2_2"),  # StarVLA dispatches it; its VAE check refuses it.
+        ("WanPI", "/models/Qwen3-VL-4B", "wan2_2"),  # Another model: the framework's own type, refused later.
         ("QwenGR00T", "/models/Cosmos-Predict2-2B-Video2World", "qwen3_vl"),
     ],
 )
@@ -617,3 +623,10 @@ def test_export_from_a_world_model_run(checkpoint: Path, io: IoSpec, tmp_path: P
     )
     with pytest.raises(ValueError, match="has no OpenVINO export"):
         engine.StarVLAEngine.export(Run("starvla", root, checkpoint), tmp_path / "ov", backend="openvino")
+
+
+def test_a_cosmos_framework_on_a_wan_path_is_refused_before_training() -> None:
+    with pytest.raises(ValueError, match=r"no Wan2\.2-TI2V environment"):
+        environments.for_policy("CosmoPredict2GR00T", environments.backbone_for("CosmoPredict2GR00T", "/m/Wan2.2-TI2V"))
+    assert environments.for_policy("WanPI").name == "qwengr00t"
+    assert environments.for_policy("WanPI").backbone == "wan2_2"

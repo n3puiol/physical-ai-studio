@@ -238,3 +238,27 @@ def test_world_model_frameworks_need_their_world_model(
     (backbone / "model_index.json").write_text('{"_class_name": "WanPipeline"}')
     with pytest.raises(ValueError, match="Cosmos2VideoToWorldPipeline"):
         write_package(checkpoint, tmp_path / "wan", backbone=backbone, io=io, unnorm_key="franka")
+
+
+def test_wan_runs_are_packaged_with_their_wan22_folder(
+    tmp_path: Path,
+    checkpoint: Path,
+    io: IoSpec,
+) -> None:
+    (checkpoint.parents[1] / "config.yaml").write_text("framework:\n  name: WanOFT\n")
+    wan = tmp_path / "Wan2.2-TI2V-5B-Diffusers"
+    for part in ("vae", "transformer", "text_encoder"):
+        (wan / part).mkdir(parents=True)
+        (wan / part / "diffusion_pytorch_model.safetensors").write_bytes(b"weights")
+    (wan / "model_index.json").write_text('{"_class_name": "WanPipeline"}')
+    (wan / "vae" / "config.json").write_text('{"z_dim": 16}')
+    with pytest.raises(ValueError, match=r"needs a Wan2\.2-TI2V world model"):
+        write_package(checkpoint, tmp_path / "wan21", backbone=wan, io=io, unnorm_key="franka")
+    (wan / "vae" / "config.json").write_text('{"z_dim": 48}')
+
+    package = write_package(checkpoint, tmp_path / "wan22", backbone=wan, io=io, unnorm_key="franka")
+
+    descriptor = load_descriptor(package / ARTIFACT)
+    assert descriptor["backbone"] == "Wan2.2-TI2V"
+    assert package_environment(descriptor) is environments.POLICY_ENVIRONMENTS["WanOFT"]
+    assert (package / ARTIFACT / "Wan2.2-TI2V" / "vae" / "config.json").is_file()

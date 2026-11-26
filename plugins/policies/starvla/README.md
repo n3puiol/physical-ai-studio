@@ -7,7 +7,7 @@ a Runtime-only install imports `physicalai-train` to perform inference.
 
 This integration supports QwenGR00T, QwenPI, QwenOFT and QwenFast on Qwen3-VL (QwenGR00T, QwenPI and
 QwenOFT also on Qwen3.5), StarVLA's world-model frameworks on Cosmos-Predict2 (CosmoPredict2GR00T,
-CosmoPredict2OFT and CosmoPredict2PI), on one GPU or data-parallel on all visible GPUs of one machine, supervised
+CosmoPredict2OFT and CosmoPredict2PI) and Wan2.2 (WanGR00T, WanOFT and WanPI), on one GPU or data-parallel on all visible GPUs of one machine, supervised
 training and co-training with VLM data, upstream registered LeRobot dataset mixtures, one observation per camera, native safetensors
 packages (CUDA inference in the isolated worker), and, for QwenGR00T, OpenVINO packages
 (in-process inference on CPU or another OpenVINO device, without StarVLA or PyTorch). Other
@@ -32,7 +32,7 @@ and mapped through `StarVLAEngine.policy_envs`. Training, export and Runtime pic
 from `framework.name` in the training YAML and the backbone StarVLA loads for
 `framework.qwenvl.base_vlm` (overrides win); Qwen3.5 backbones use their own environment (see
 [Qwen3.5 backbones](#qwen35-backbones)). Frameworks with
-the same dependencies share a project: QwenPI, QwenOFT, QwenFast and the Cosmos-Predict2 frameworks use QwenGR00T's `envs/qwengr00t/`, so the engine
+the same dependencies share a project: QwenPI, QwenOFT, QwenFast and the world-model frameworks use QwenGR00T's `envs/qwengr00t/`, so the engine
 lists and prepares it once. A framework that needs other dependencies gets its own project, so
 frameworks never share a resolution they were not locked for. There is no default environment: a
 framework without an entry is rejected, and the training worker refuses a config whose
@@ -418,9 +418,8 @@ StarVLA's world-model wrapper resizes every camera image to 320×576 and feeds t
 of one short video, and it samples the VAE's latent distribution, so a prediction depends on the
 seed; Runtime seeds it the same way as StarVLA's own server. Packages keep the world model in a
 `Cosmos-Predict2` folder (`model_index.json` and its parts) and, as for every framework, a checkpoint
-that holds the whole model again. Co-training and the OpenVINO export are refused. Wan2.2, StarVLA's
-other world model, is not wired: its weights alone take about 23 GB in bf16, more than a 24 GB GPU
-holds with anything else.
+that holds the whole model again. Co-training and the OpenVINO export are refused. StarVLA's other
+world model is in [Wan2.2 world models](#wan22-world-models).
 
 Verified on one RTX 3090 with Cosmos-Predict2-2B (revision `f50c09f5`), 20 LIBERO-goal steps each
 through the engine:
@@ -436,6 +435,76 @@ checkpoints or download metadata) and the checkpoint (14.3 to 20.8 GB), and no P
 matched StarVLA's own `predict_action` exactly on a real frame and repeated it exactly after a reset,
 and the OpenVINO export was refused. CosmoPredict2PI's loss starts near 25, far above the other two
 heads, much as QwenPI's does on Qwen3-VL (see [QwenPI](#qwenpi)); its cause was not investigated.
+
+## Wan2.2 world models
+
+WanGR00T, WanOFT and WanPI put the same three heads on Wan2.2-TI2V-5B, Wan-AI's text-and-image-to-video
+model (a UMT5 text encoder, Wan2.2's 16× VAE and a 30-block video DiT of width 3072). They also use
+QwenGR00T's environment. The world model is `framework.world_model.base_wm`: a local copy of the
+diffusers folder of `Wan-AI/Wan2.2-TI2V-5B-Diffusers` (Apache-2.0, not gated). StarVLA picks the model by
+`Wan2` or `TI2V` in that path (any case), and the training worker checks that its `model_index.json`
+names a `WanPipeline` with Wan2.2-TI2V's VAE (`z_dim` 48 in `vae/config.json`). Wan2.1 folders are
+refused before training: StarVLA's wrapper encodes 480×832 frames and its DiT takes at most 1,024
+tokens, which Wan2.2's VAE fits (390 per frame) and Wan2.1's 8× VAE does not (1,560). Download the
+diffusers parts (about 34 GB; the repository also holds a few images):
+
+```python
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+    revision="b8fff7315c768468a5333511427288870b2e9635",
+    allow_patterns=["model_index.json", "scheduler/*", "text_encoder/*", "tokenizer/*", "transformer/*", "vae/*"],
+    local_dir="/absolute/path/to/Wan2.2-TI2V-5B-Diffusers",
+)
+```
+
+```bash
+WANDB_MODE=disabled library/.venv/bin/physicalai train starvla \
+  --config_yaml plugins/policies/starvla/configs/wangroot_libero.yaml \
+  framework.world_model.base_wm=/absolute/path/to/Wan2.2-TI2V-5B-Diffusers \
+  datasets.vla_data.data_root_dir=/absolute/path/to/datasets \
+  run_root_dir=/absolute/path/to/runs run_id=starvla-wan
+```
+
+The world model has 11.4B parameters (about 23 GB in bf16), so these frameworks need a GPU larger than
+24 GB even with it frozen. `configs/wangroot_libero.yaml` is a 20-step LIBERO smoke run with the world
+model frozen, so only the action head trains; WanOFT takes it with `framework.name=WanOFT`.
+`configs/wanpi_libero.yaml` also freezes the PI head's DiT blocks (30 blocks of width 3072, 4.0B
+parameters) and sets the head's DiT shape: WanPI, like CosmoPredict2PI, does not fill
+`action_model.diffusion_model_cfg`, so the head would otherwise build 36 blocks for Wan2.2's 30.
+
+Inference, seeding and refusals work as for Cosmos-Predict2. Packages keep the world model in a
+`Wan2.2-TI2V` folder and the checkpoint holds the whole model again, so a package takes about 60 GB
+(75 GB for WanPI).
+
+Verified on one A100 80 GB with Wan2.2-TI2V-5B (revision `b8fff731`), 20 LIBERO-goal steps each through
+the engine:
+
+| Framework | What trains                | Time | GPU memory | Loss        | Runtime vs StarVLA      |
+| --------- | -------------------------- | ---- | ---------- | ----------- | ----------------------- |
+| WanGR00T  | action head                | 56 s | 27.5 GB    | 1.36 → 1.22 | exact, 0.57 s per chunk |
+| WanOFT    | action MLP                 | 44 s | 27.8 GB    | 0.76 → 0.39 | exact, 0.47 s per chunk |
+| WanPI     | head encoders and decoders | 97 s | 41.7 GB    | 1.49 → 0.99 | exact, 1.14 s per chunk |
+
+Each package held the world model's diffusers folder (34.2 GB) and the checkpoint (25.4 to 41.2 GB),
+and no Python. Runtime matched StarVLA's own `predict_action` exactly on a real frame and repeated it
+exactly after a reset, and the OpenVINO export was refused.
+
+StarVLA's published `StarVLA/WM4A-Wan2d2-OFT-LIBERO-4in1` checkpoint (WanOFT, revision `4bdf523c`;
+its model card reports 95.4% on `libero_goal`) does not work on the pinned StarVLA, through StarVLA's
+own server or this plugin. It was trained in April 2026. In August, StarVLA's `f8e365e` began
+zero-padding the UMT5 text embeddings after the instruction, where the encoder's outputs used to be.
+The pinned commit, and `starVLA_dev` as of 2026-11-26, pad every checkpoint that way, so this one
+receives different text conditioning than it was trained with. Plugin runs train and infer on the
+same commit, so they are not affected. Converted to safetensors with PyTorch's weights-only loader
+(bit-identical) and exported with `export_native`, the checkpoint's package matched StarVLA's own
+`predict_action` exactly on a real frame. On `libero_goal` with StarVLA's unmodified client (seed 7):
+
+- StarVLA's own server at the pinned commit: 5 of 30 episodes (3 per task; only two tasks ever succeeded).
+- This plugin's server with the package: 0 of 6 episodes on the first task, the same as StarVLA's
+  server there.
+- StarVLA's own server with only `f8e365e` reverted: 89 of 100 episodes (10 per task).
 
 ## Co-training with VLM data
 

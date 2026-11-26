@@ -20,6 +20,7 @@ from ._worker.starvla_worker_common import (
     WORLD_MODEL_FRAMEWORKS,
     WORLD_MODELS,
     trained_with_state,
+    world_model_problem,
 )
 
 if TYPE_CHECKING:
@@ -354,13 +355,11 @@ def _backbone_folder(backbone: Path, policy: str) -> tuple[str, str]:
     """
     if policy in WORLD_MODEL_FRAMEWORKS:
         kind = WORLD_MODEL_FRAMEWORKS[policy]
-        folder, pipeline = WORLD_MODELS[kind]
-        index_file = backbone / "model_index.json"
-        index = json.loads(index_file.read_text()) if index_file.is_file() else None
-        if not isinstance(index, dict) or index.get("_class_name") != pipeline:
-            msg = f"{policy} needs a {folder} world model: a diffusers {pipeline} folder."
+        problem = world_model_problem(backbone, kind)
+        if problem is not None:
+            msg = f"{policy} needs a {WORLD_MODELS[kind][0]} world model. {problem}"
             raise ValueError(msg)
-        return kind, folder
+        return kind, WORLD_MODELS[kind][0]
     config = json.loads(contained_file(backbone, "config.json").read_text())
     model_type = config.get("model_type") if isinstance(config, dict) else None
     if model_type not in BACKBONES:

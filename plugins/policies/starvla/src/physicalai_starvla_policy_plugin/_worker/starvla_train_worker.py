@@ -50,6 +50,7 @@ from starvla_worker_common import (
     start_cancel_listener,
     use_fast_tokenizer,
     wait_for_host_acknowledgement,
+    world_model_problem,
 )
 
 _MIN_DATA_PARALLEL_GPUS = 2
@@ -370,15 +371,13 @@ def _check_world_model(cfg: Any, *, cotraining: bool) -> Path:  # ruff: ignore[a
         msg = f"{cfg.framework.name} reads its backbone from framework.world_model.base_wm; set a local {folder_name}."
         raise ValueError(msg)
     backbone = Path(str(base_wm)).expanduser().resolve(strict=True)
-    index = backbone / "model_index.json"
-    found = json.loads(index.read_text()).get("_class_name") if index.is_file() else None
-    # StarVLA picks the world model by a substring of the path; model_index.json says what it holds.
-    if found != pipeline or dispatched_world_model(str(backbone)) != kind:
-        msg = (
-            f"Use a local, materialized {folder_name} diffusers folder ({pipeline}) with {folder_name} in its "
-            "directory name (upstream world-model dispatch)."
-        )
+    # StarVLA picks the world model by a substring of the path; the folder's configs say what it holds.
+    if dispatched_world_model(str(backbone)) != kind:
+        msg = f"Put {folder_name!r} in the {pipeline} folder's name: StarVLA picks the world model by its path."
         raise ValueError(msg)
+    problem = world_model_problem(backbone, kind)
+    if problem is not None:
+        raise ValueError(problem)
     if cotraining:
         msg = "Co-training with VLM data supports Qwen3-VL backbones; StarVLA's VLM data loader needs one."
         raise ValueError(msg)
