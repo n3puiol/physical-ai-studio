@@ -556,6 +556,68 @@ run took 14.7 GB on one GPU. Rank 0 reported every step in order, and Runtime ma
 and both GPUs free. Killing the host process at step 3, as a crash would, also left no worker,
 `torchrun` or rank behind. A co-training config was refused before any rank started.
 
+## RL post-training with RLinf
+
+[RLinf](https://github.com/RLinf/RLinf) post-trains StarVLA policies with reinforcement learning in
+simulation (GRPO or PPO, with LIBERO in the loop) on Ray. It runs from its own installer and
+environment, so the plugin does not run it; it hands a run to RLinf and imports the result back as
+a normal run that exports to a Runtime package. RLinf's StarVLA wrapper runs QwenGR00T, QwenOFT and
+QwenPI on Qwen3-VL, so those are the runs the plugin hands over. RLinf installs StarVLA at its
+`starVLA-v1.6` tag, an ancestor of this plugin's pin with the same checkpoint layout.
+
+Install RLinf at a fixed commit. Its installer runs `requirements/sys_deps.sh` with `sudo apt-get`
+unless you pass `--no-root`: on the verification machine that installed 164 system packages (a build
+toolchain and OpenGL, OSMesa, ffmpeg and ImageMagick development libraries) and upgraded 77, then
+restarted services. With `--no-root` those must already be present.
+
+```bash
+git clone https://github.com/RLinf/RLinf.git && cd RLinf && git checkout ed0e1b836d11ec50eef4e5133e6b42ebd370cab9
+bash requirements/install.sh embodied --model starvla --env libero --no-root
+```
+
+Then hand a run over, train, and import the result. The plugin reads and writes safetensors only
+and never unpickles a file; the two conversions to and from RLinf's `.pt` files run in RLinf's own
+environment, which loads its checkpoints with PyTorch anyway:
+
+```bash
+# 1. Plugin: the run in StarVLA's layout (checkpoints/steps_0_model.safetensors, config.yaml, dataset_statistics.json).
+library/.venv/bin/python -m physicalai_starvla_policy_plugin.rlinf export /path/to/runs/starvla /path/to/rlinf-start
+
+# 2. RLinf's environment: the .pt RLinf loads, beside it.
+python -c "import sys, torch; from safetensors.torch import load_file; torch.save(load_file(sys.argv[1]), sys.argv[2])" \
+  /path/to/rlinf-start/checkpoints/steps_0_model.safetensors /path/to/rlinf-start/checkpoints/steps_0_pytorch_model.pt
+
+# 3. RLinf: set actor.model.model_path and rollout.model.model_path to that .pt, and
+#    actor.model.starvla.framework_name, action_dim, num_action_chunks (the run's action_horizon) and unnorm_key.
+bash examples/embodiment/run_embodiment.sh <your_config> LIBERO
+
+# 4. RLinf's environment: the trained policy as safetensors. RLinf writes it as
+#    checkpoints/global_step_<N>/actor/model_state_dict/full_weights.pt (or convert its dcp_checkpoint
+#    with rlinf/utils/ckpt_convertor/fsdp_convertor/convert_dcp_to_pt.py).
+python -c "import sys, torch; from safetensors.torch import save_file; s = torch.load(sys.argv[1], map_location='cpu', weights_only=True); save_file({k: v.clone().contiguous() for k, v in s.items()}, sys.argv[2])" \
+  logs/<run>/<experiment>/checkpoints/global_step_<N>/actor/model_state_dict/full_weights.pt rl.safetensors
+
+# 5. Plugin: a run that exports like any other.
+library/.venv/bin/python -m physicalai_starvla_policy_plugin.rlinf import rl.safetensors /path/to/runs/starvla /path/to/runs/starvla-rl
+```
+
+The import takes the StarVLA weights from under RLinf's `starvla_model.` prefix and leaves out
+RLinf's own parameters (`actor_logstd`, a value head). Every weight must match the starting run in
+name and shape, and keeps the starting run's dtype; the run record notes the source file and its
+SHA-256 under `post_training`. RLinf holds the policy in bf16 (`actor.model.precision`), so fp32
+weights, such as QwenOFT's action head, come back rounded to bf16 even where RL did not change them.
+
+Verified on two RTX 3090s with a 20-step QwenOFT run on Qwen3-VL-2B and RLinf's test-sized GRPO
+config on LIBERO-goal (8 simulators, 8-step episodes, one epoch). RLinf loaded the handed-over run,
+trained the epoch and saved a checkpoint in about 1.5 minutes at 13.4 GB per GPU. Eight steps are
+too short to finish a LIBERO task, so every reward and the gradient were zero; the imported weights
+equalled RLinf's, differing from the starting run only by that bf16 rounding of the 16 fp32
+tensors. The `.pt` from step 2 was identical to the one RLinf trained from, RLinf's
+`full_weights.pt` matched its distributed checkpoint converted with its own tool, and the imported
+run exported, with Runtime matching StarVLA's own `predict_action` exactly and repeating it
+exactly after a reset. An RL run that improves a policy (longer episodes; RLinf's recipe
+uses 8 GPUs) was not tried.
+
 ## Export with explicit robot mappings
 
 Review `configs/libero_io.json` against your actual observations. It specifies
