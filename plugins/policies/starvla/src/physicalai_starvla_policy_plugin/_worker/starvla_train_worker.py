@@ -24,6 +24,15 @@ if TYPE_CHECKING:
 # Isolated workers run without their folder on sys.path; the sibling modules live there.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from starvla_distributed import (
+    DISTRIBUTED_DIR_VARIABLE,
+    die_with_parent,
+    leave_process_group,
+    rank_hooks,
+    supervise,
+    torchrun_command,
+    visible_gpus,
+)
 from starvla_worker_common import (
     BACKBONE_VARIABLE,
     BACKBONES,
@@ -40,24 +49,100 @@ from starvla_worker_common import (
     wait_for_host_acknowledgement,
 )
 
+_MIN_DATA_PARALLEL_GPUS = 2
 
-def train(argv: list[str] | None = None) -> tuple[Path, Path]:  # ruff: ignore[too-many-statements]  # Native CLI lifecycle.
+
+def train(argv: list[str] | None = None) -> tuple[Path, Path]:
     """Run the native trainer, preserving its normalization and checkpoint format.
+
+    With ``--all_devices`` this worker supervises one data-parallel ``torchrun`` rank per visible
+    GPU; each rank runs this function again, as rank, without the engine protocol.
 
     Returns:
         Run directory and final checkpoint.
 
     Raises:
-        CancelledError: If the host cancels before accepting the handshake.
-        WorkerHandshakeError: If the host does not accept the handshake.
-        ValueError: If the framework, run name, or backbone is unsupported.
+        ValueError: If ``--all_devices`` is given for a co-training config.
         FileNotFoundError: If training does not produce its final checkpoint.
     """
     parser = argparse.ArgumentParser(description="StarVLA training (native OmegaConf KEY=VALUE overrides)")
     parser.add_argument("--config_yaml", required=True, help="Local StarVLA training YAML")
+    parser.add_argument(
+        "--all_devices",
+        action="store_true",
+        help="Train on every visible GPU, one data-parallel process per GPU",
+    )
     args, overrides = parser.parse_known_args(argv)
     if any("=" not in token for token in overrides):
         parser.error("Overrides must use KEY=VALUE or --KEY=VALUE tokens.")
+    rank_directory = os.environ.get(DISTRIBUTED_DIR_VARIABLE)
+    if rank_directory is not None:
+        die_with_parent()
+    channel, cancelled = _start(rank_directory)
+    cfg, backbone, cotraining = _load_config(args.config_yaml, overrides)
+    output = Path(cfg.run_root_dir) / str(cfg.run_id)
+    checkpoint = output / "final_model" / "model.safetensors"
+    if rank_directory is not None:  # A torchrun rank: the supervisor reports the run.
+        _train_natively(cfg, channel, cancelled, cotraining=cotraining, data_parallel=True)
+        return output, checkpoint
+    if args.all_devices:
+        if cotraining:
+            msg = (
+                "Co-training runs on one GPU: StarVLA's co-training step runs two backward passes per step, which "
+                "DistributedDataParallel does not support; upstream co-trains on several GPUs with DeepSpeed."
+            )
+            raise ValueError(msg)
+        _train_on_all_gpus(sys.argv[1:] if argv is None else argv, channel, cancelled)
+    else:
+        _train_natively(cfg, channel, cancelled, cotraining=cotraining)
+    if not checkpoint.is_file():
+        msg = "StarVLA finished without a final safetensors checkpoint."
+        raise FileNotFoundError(msg)
+    shutil.copy2(output / "config.full.yaml", output / "config.yaml")
+    stats = json.loads((output / "dataset_statistics.json").read_text())
+    record = {
+        "environment": json.loads(os.environ["PHYSICALAI_STARVLA_PROVENANCE"]),
+        "backbone_path": str(backbone),
+        "unnorm_key": next(iter(stats)) if len(stats) == 1 else None,
+        "dataset_root": str(cfg.datasets.vla_data.data_root_dir),
+        "data_mix": str(cfg.datasets.vla_data.data_mix),
+    }
+    (output / "physicalai_run.json").write_text(json.dumps(record, indent=2) + "\n")
+    return output, checkpoint
+
+
+def _train_on_all_gpus(arguments: list[str], channel: EventChannel, cancelled: Any) -> None:  # ruff: ignore[any-type]
+    """Supervise one torchrun rank per visible GPU, each running this worker as a rank.
+
+    Raises:
+        ValueError: If fewer than two GPUs are visible.
+        CancelledError: If the host cancels training.
+    """
+    processes = visible_gpus()
+    if processes < _MIN_DATA_PARALLEL_GPUS:
+        msg = f"--all_devices trains on every visible GPU and needs at least two; this worker sees {processes}."
+        raise ValueError(msg)
+    command = torchrun_command(
+        Path(__file__).resolve(),
+        [item for item in arguments if item != "--all_devices"],
+        processes,
+    )
+    if supervise(command, send=channel.send, cancelled=cancelled):
+        raise CancelledError
+
+
+def _start(rank_directory: str | None) -> tuple[Any, Any]:
+    """Open the engine protocol, or a rank's channel and cancellation under a supervising worker.
+
+    Returns:
+        The event channel and the cancellation to poll.
+
+    Raises:
+        CancelledError: If the host cancels before accepting the handshake.
+        WorkerHandshakeError: If the host does not accept the handshake.
+    """
+    if rank_directory is not None:
+        return rank_hooks(Path(rank_directory))
     channel = EventChannel()
     channel.send({"type": "hello", "protocol": 1, **identity()})
     if channel.enabled:
@@ -68,7 +153,18 @@ def train(argv: list[str] | None = None) -> tuple[Path, Path]:  # ruff: ignore[t
         if answer != "ack":
             msg = "The host did not accept the handshake."
             raise WorkerHandshakeError(msg)
-    cancelled = start_cancel_listener()
+    return channel, start_cancel_listener()
+
+
+def _load_config(config_yaml: str, overrides: list[str]) -> tuple[Any, Path, bool]:
+    """Load and check the training config, and prepare upstream for it in this process.
+
+    Returns:
+        The config, the resolved backbone folder, and whether it co-trains with VLM data.
+
+    Raises:
+        ValueError: If the framework, run name, or backbone is unsupported.
+    """
     os.environ.setdefault("STARVLA_DISABLE_DEEPSPEED", "1")
     # Model code and weights must already be local; no mutable remote revisions.
     os.environ["HF_HUB_OFFLINE"] = "1"
@@ -78,7 +174,7 @@ def train(argv: list[str] | None = None) -> tuple[Path, Path]:  # ruff: ignore[t
     from starVLA.model.framework.share_tools import apply_config_compat
 
     cfg = OmegaConf.merge(
-        OmegaConf.load(args.config_yaml),
+        OmegaConf.load(config_yaml),
         OmegaConf.from_dotlist([token.removeprefix("--") for token in overrides]),
     )
     cfg = apply_config_compat(cfg)
@@ -96,34 +192,31 @@ def train(argv: list[str] | None = None) -> tuple[Path, Path]:  # ruff: ignore[t
         raise ValueError(msg)
     backbone = _check_backbone(Path(cfg.framework.qwenvl.base_vlm), cotraining=cotraining)
     cfg.framework.qwenvl.base_vlm = str(backbone)
+    # These register upstream state in this process, so every torchrun rank repeats them.
     if cfg.framework.name == "QwenFast":
         _prepare_qwenfast(cfg, backbone)
     if cotraining:
         _prepare_cotraining(cfg, backbone)
     cfg.run_root_dir = str(Path(cfg.run_root_dir).expanduser().resolve())
     cfg.trainer.save_format = "safetensors"
-    cfg.config_yaml = str(Path(args.config_yaml).resolve())
-    output = Path(cfg.run_root_dir).expanduser().resolve() / str(cfg.run_id)
-    _train_natively(cfg, channel, cancelled, cotraining=cotraining)
-    checkpoint = output / "final_model" / "model.safetensors"
-    if not checkpoint.is_file():
-        msg = "StarVLA finished without a final safetensors checkpoint."
-        raise FileNotFoundError(msg)
-    shutil.copy2(output / "config.full.yaml", output / "config.yaml")
-    stats = json.loads((output / "dataset_statistics.json").read_text())
-    record = {
-        "environment": json.loads(os.environ["PHYSICALAI_STARVLA_PROVENANCE"]),
-        "backbone_path": str(backbone),
-        "unnorm_key": next(iter(stats)) if len(stats) == 1 else None,
-        "dataset_root": str(cfg.datasets.vla_data.data_root_dir),
-        "data_mix": str(cfg.datasets.vla_data.data_mix),
-    }
-    (output / "physicalai_run.json").write_text(json.dumps(record, indent=2) + "\n")
-    return output, checkpoint
+    cfg.config_yaml = str(Path(config_yaml).resolve())
+    return cfg, backbone, cotraining
 
 
-def _train_natively(cfg: Any, channel: EventChannel, cancelled: Any, *, cotraining: bool) -> None:  # ruff: ignore[any-type]
-    """Run upstream's SFT or co-training trainer with progress, cancellation and safetensors hooks."""
+def _train_natively(
+    cfg: Any,  # ruff: ignore[any-type]  # OmegaConf node.
+    channel: Any,  # ruff: ignore[any-type]  # EventChannel, or a rank's FileChannel.
+    cancelled: Any,  # ruff: ignore[any-type]  # threading.Event, or a rank's SharedCancellation.
+    *,
+    cotraining: bool,
+    data_parallel: bool = False,
+) -> None:
+    """Run upstream's SFT or co-training trainer with progress, cancellation and safetensors hooks.
+
+    ``data_parallel`` marks a torchrun rank. Upstream's multi-GPU recipes use DeepSpeed, which
+    tolerates trainable parameters that a step leaves unused (an unused state encoder, for one);
+    DistributedDataParallel stops at the second step unless it looks for them.
+    """
     # A config with VLM data co-trains, with upstream's own co-training trainer.
     if cotraining:
         native = _import_cotrainer()
@@ -162,7 +255,10 @@ def _train_natively(cfg: Any, channel: EventChannel, cancelled: Any, *, cotraini
         state_method = native._get_state_dict
         native._get_state_dict = lambda accelerator, model: _saveable_state_dict(state_method(accelerator, model))
     try:
-        with _vlm_loader_workers(cfg) if cotraining else contextlib.nullcontext():
+        with (
+            _vlm_loader_workers(cfg) if cotraining else contextlib.nullcontext(),
+            _find_unused_parameters(native.accelerator) if data_parallel else contextlib.nullcontext(),
+        ):
             native.main(cfg)
     finally:
         trainer_class._train_step = step_method
@@ -171,6 +267,23 @@ def _train_natively(cfg: Any, channel: EventChannel, cancelled: Any, *, cotraini
             del accelerator.get_state_dict
         else:
             native._get_state_dict = state_method
+
+
+@contextlib.contextmanager
+def _find_unused_parameters(accelerator: Any) -> Iterator[None]:  # ruff: ignore[any-type]  # accelerate.Accelerator.
+    """Make the accelerator's DistributedDataParallel look for trainable parameters a step left unused.
+
+    Yields:
+        Nothing; the accelerator's previous setting is restored on exit.
+    """
+    from accelerate.utils import DistributedDataParallelKwargs
+
+    previous = accelerator.ddp_handler
+    accelerator.ddp_handler = DistributedDataParallelKwargs(find_unused_parameters=True)
+    try:
+        yield
+    finally:
+        accelerator.ddp_handler = previous
 
 
 @contextlib.contextmanager
@@ -358,12 +471,16 @@ def main() -> int:
     """Emit one terminal event and retain a nonzero status on failures.
 
     Returns:
-        Zero on success, one on cancellation.
+        Zero on success, one on cancellation; zero for a torchrun rank that stopped with the others
+        for a cancellation, so torchrun does not report it as a failed rank.
     """
     channel = EventChannel()
     try:
         output, checkpoint = train()
     except CancelledError:
+        if os.environ.get(DISTRIBUTED_DIR_VARIABLE) is not None:
+            leave_process_group()
+            return 0
         channel.send({"type": "cancelled", "step": None})
         return 1
     except Exception as exc:

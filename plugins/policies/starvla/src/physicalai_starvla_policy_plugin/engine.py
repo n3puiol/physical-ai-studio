@@ -29,6 +29,8 @@ if TYPE_CHECKING:
 
 # The framework the host chose the worker environment for; the training worker refuses any other.
 FRAMEWORK_VARIABLE = "PHYSICALAI_STARVLA_FRAMEWORK"
+# Devices that leave the worker every GPU the caller exposes.
+_ALL_VISIBLE_DEVICES = frozenset({"auto", "cuda", "gpu"})
 
 # StarVLA has no OpenVINO path; the plugin adds one, converting in its own locked environment.
 OPENVINO_ENABLEMENTS = tuple(
@@ -102,7 +104,10 @@ class StarVLAEngine(TrainingEngine):
     ) -> Run:
         """Train with Studio-owned dataset root, output directory, and CUDA device.
 
-        Settings contain config_yaml and optional native KEY=VALUE overrides.
+        Settings contain config_yaml, optional native KEY=VALUE overrides, and optional
+        ``all_devices``: train on every GPU the caller exposes (``CUDA_VISIBLE_DEVICES``), one
+        data-parallel process per GPU, with ``device="cuda"``. The per-device batch size stays as
+        configured, so each step uses that many samples per GPU.
         The dataset root contains the datasets named by the config's data_mix.
 
         Returns:
@@ -110,10 +115,20 @@ class StarVLAEngine(TrainingEngine):
 
         Raises:
             ValueError: If settings, device, or output name are invalid.
+            TypeError: If ``all_devices`` is not a boolean.
         """
-        unknown = set(settings) - {"config_yaml", "overrides"}
+        unknown = set(settings) - {"config_yaml", "overrides", "all_devices"}
         if unknown or not isinstance(settings.get("config_yaml"), (str, Path)):
-            msg = "StarVLA settings require config_yaml and optional overrides only."
+            msg = "StarVLA settings require config_yaml, and allow overrides and all_devices only."
+            raise ValueError(msg)
+        all_devices = settings.get("all_devices", False)
+        if not isinstance(all_devices, bool):
+            msg = "all_devices must be true or false."
+            raise TypeError(msg)
+        if all_devices and device not in _ALL_VISIBLE_DEVICES:
+            msg = (
+                "all_devices trains on every visible GPU: use device='cuda' and choose GPUs with CUDA_VISIBLE_DEVICES."
+            )
             raise ValueError(msg)
         overrides = settings.get("overrides", [])
         if not isinstance(overrides, (list, tuple)) or any(not isinstance(v, str) or "=" not in v for v in overrides):
@@ -142,6 +157,7 @@ class StarVLAEngine(TrainingEngine):
             f"datasets.vla_data.data_root_dir={json.dumps(str(dataset.expanduser().resolve(strict=True)))}",
             f"run_root_dir={json.dumps(str(output.parent))}",
             f"run_id={output.name}",
+            *(["--all_devices"] if all_devices else []),
         ]
         return run_worker(
             spec.worker_env(),
@@ -262,6 +278,7 @@ class StarVLAEngine(TrainingEngine):
             "properties": {
                 "config_yaml": {"type": "string"},
                 "overrides": {"type": "array", "items": {"type": "string"}},
+                "all_devices": {"type": "boolean"},
             },
         }
 
@@ -317,7 +334,7 @@ def _device_env(device: str) -> dict[str, str]:
     Raises:
         ValueError: If the device is not CUDA or the index is outside the caller's visible devices.
     """
-    if device in {"auto", "cuda", "gpu"}:
+    if device in _ALL_VISIBLE_DEVICES:
         return {}
     index = device.removeprefix("cuda:")
     if not device.startswith("cuda:") or not index.isdigit():

@@ -491,3 +491,30 @@ def test_export_from_a_qwen35_run(checkpoint: Path, io: IoSpec, tmp_path: Path) 
     assert descriptor["backbone"] == "Qwen3.5"
     assert descriptor["environment"] == environments.QWENGR00T_QWEN35.provenance()
     assert (exported / ARTIFACT / "Qwen3.5" / "model.safetensors-00001-of-00001.safetensors").is_file()
+
+
+def test_all_devices_trains_on_every_gpu_the_caller_exposes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    config = tmp_path / "train.yaml"
+    config.write_text("framework:\n  name: QwenGR00T\n")
+    runner = Mock(return_value=Run("starvla", tmp_path, None))
+    monkeypatch.setattr(engine, "run_worker", runner)
+    settings = {"config_yaml": str(config), "all_devices": True}
+
+    engine.StarVLAEngine.run(settings, dataset=tmp_path, output_dir=tmp_path / "ddp", device="cuda")
+
+    args, kwargs = runner.call_args
+    assert args[1][-1] == "--all_devices"
+    assert "CUDA_VISIBLE_DEVICES" not in kwargs["extra_env"]
+    assert engine.StarVLAEngine.config_schema("QwenGR00T")["properties"]["all_devices"] == {"type": "boolean"}
+    with pytest.raises(ValueError, match="all_devices trains on every visible GPU"):
+        engine.StarVLAEngine.run(settings, dataset=tmp_path, output_dir=tmp_path / "one", device="cuda:1")
+    with pytest.raises(TypeError, match="true or false"):
+        engine.StarVLAEngine.run(
+            {**settings, "all_devices": "yes"},
+            dataset=tmp_path,
+            output_dir=tmp_path / "bad",
+            device="cuda",
+        )
+    engine.StarVLAEngine.run({"config_yaml": str(config)}, dataset=tmp_path, output_dir=tmp_path / "one", device="cuda")
+    assert "--all_devices" not in runner.call_args.args[1]

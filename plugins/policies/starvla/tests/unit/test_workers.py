@@ -382,6 +382,137 @@ def test_cotraining_needs_a_qwen3_vl_backbone(
     assert cotraining.saved == []
 
 
+def test_all_devices_needs_two_visible_gpus(train_worker: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    supervise = Mock()
+    monkeypatch.setattr(train_worker.worker, "supervise", supervise)
+    monkeypatch.setattr(train_worker.worker, "visible_gpus", lambda: 1)
+
+    with pytest.raises(ValueError, match="needs at least two; this worker sees 1"):
+        train_worker.worker.train(["--config_yaml", "unused.yaml", "--all_devices"])
+    supervise.assert_not_called()
+
+
+def _fake_ranks(train_worker: SimpleNamespace, commands: list, *, cancelled: bool = False) -> object:
+    """Stand in for the torchrun ranks: record the command, report one step and write the run's outputs.
+
+    Returns:
+        A replacement for the worker's ``supervise``.
+    """
+
+    def supervise(command: list[str], *, send: object, cancelled: object) -> bool:
+        del cancelled
+        commands.append(command)
+        send({"type": "progress", "step": 2, "total": 2, "metrics": {"loss": 0.1}})
+        output = Path(train_worker.cfg.run_root_dir) / train_worker.cfg.run_id
+        (output / "final_model").mkdir(parents=True)
+        (output / "final_model" / "model.safetensors").write_bytes(b"fake")
+        (output / "config.full.yaml").write_text("full config")
+        (output / "dataset_statistics.json").write_text('{"franka": {}}')
+        return was_cancelled
+
+    was_cancelled = cancelled
+    return supervise
+
+
+def test_all_devices_supervises_one_rank_per_gpu_and_records_the_run(
+    train_worker: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+    monkeypatch.setattr(train_worker.worker, "supervise", _fake_ranks(train_worker, commands))
+    monkeypatch.setattr(train_worker.worker, "visible_gpus", lambda: 2)
+    train_worker.trainer._train_step.reset_mock()
+
+    output, checkpoint = train_worker.worker.train(
+        ["--config_yaml", "unused.yaml", "--all_devices", "trainer.max_train_steps=2"],
+    )
+
+    (command,) = commands
+    assert "--nproc_per_node=2" in command
+    assert command[-3:] == ["--config_yaml", "unused.yaml", "trainer.max_train_steps=2"]
+    assert "--all_devices" not in command
+    assert Path(command[command.index("--nproc_per_node=2") + 1]).name == "starvla_train_worker.py"
+    # The supervisor relays rank 0's events and records the run; it trains nothing itself.
+    assert {"type": "progress", "step": 2, "total": 2, "metrics": {"loss": 0.1}} in train_worker.events
+    train_worker.trainer._train_step.assert_not_called()
+    assert checkpoint.is_file()
+    assert json.loads((output / "physicalai_run.json").read_text())["unnorm_key"] == "franka"
+
+
+def test_a_cancelled_multi_gpu_run_is_reported_as_cancelled(
+    train_worker: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(train_worker.worker, "supervise", _fake_ranks(train_worker, [], cancelled=True))
+    monkeypatch.setattr(train_worker.worker, "visible_gpus", lambda: 2)
+
+    with pytest.raises(train_worker.worker.CancelledError):
+        train_worker.worker.train(["--config_yaml", "unused.yaml", "--all_devices"])
+
+
+def test_cotraining_is_refused_on_several_gpus(cotraining: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    supervise = Mock()
+    monkeypatch.setattr(cotraining.worker, "supervise", supervise)
+    monkeypatch.setattr(cotraining.worker, "visible_gpus", lambda: 2)
+
+    with pytest.raises(ValueError, match="Co-training runs on one GPU"):
+        cotraining.worker.train(["--config_yaml", "unused.yaml", "--all_devices"])
+    supervise.assert_not_called()
+    assert cotraining.saved == []
+
+
+def test_a_rank_trains_with_ddp_looking_for_unused_parameters(
+    train_worker: SimpleNamespace,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("accelerate")
+    directory = tmp_path / "ranks"
+    directory.mkdir()
+    monkeypatch.setenv("PHYSICALAI_STARVLA_DISTRIBUTED_DIR", str(directory))
+    monkeypatch.setenv("RANK", "0")
+    native = sys.modules["starVLA.training"].train_starvla
+    native.accelerator = SimpleNamespace(ddp_handler=None)
+    handlers = []
+    main = native.main
+
+    def rank_main(config: SimpleNamespace) -> None:
+        handlers.append(native.accelerator.ddp_handler)
+        main(config)
+
+    monkeypatch.setattr(native, "main", rank_main)
+
+    output, checkpoint = train_worker.worker.train(["--config_yaml", "unused.yaml"])
+
+    assert handlers[0].find_unused_parameters is True
+    assert native.accelerator.ddp_handler is None  # Restored.
+    # A rank never speaks the engine protocol: rank 0's progress goes to the supervisor's file.
+    assert train_worker.events == []
+    events = [json.loads(line) for line in (directory / "events.jsonl").read_text().splitlines()]
+    assert [event["type"] for event in events] == ["progress"]
+    assert checkpoint.is_file()
+    assert not (output / "physicalai_run.json").exists()
+
+
+def test_a_rank_stopped_by_a_cancellation_exits_cleanly(
+    train_worker: SimpleNamespace,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Torchrun treats a nonzero rank as failed and kills the others; a cancelled rank exits with zero."""
+    pytest.importorskip("accelerate")
+    directory = tmp_path / "ranks"
+    directory.mkdir()
+    (directory / "cancel").touch()
+    monkeypatch.setenv("PHYSICALAI_STARVLA_DISTRIBUTED_DIR", str(directory))
+    monkeypatch.setenv("RANK", "1")
+    sys.modules["starVLA.training"].train_starvla.accelerator = SimpleNamespace(ddp_handler=None)
+    monkeypatch.setattr(sys, "argv", ["starvla_train_worker.py", "--config_yaml", "unused.yaml"])
+
+    assert train_worker.worker.main() == 0
+    assert train_worker.events == []
+
+
 def test_host_acknowledgement_reads_ack_cancel_and_closed(
     train_worker: SimpleNamespace,
     monkeypatch: pytest.MonkeyPatch,

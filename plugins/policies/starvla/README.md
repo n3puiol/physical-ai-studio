@@ -5,13 +5,13 @@ co-training with VLM data, and run exported checkpoints through Physical AI Runt
 live in a separate locked Python 3.11/CUDA 12.8 environment. Neither the host nor
 a Runtime-only install imports `physicalai-train` to perform inference.
 
-This integration supports single-GPU QwenGR00T, QwenPI, QwenOFT and QwenFast on Qwen3-VL (QwenGR00T,
-QwenPI and QwenOFT also on Qwen3.5), supervised
+This integration supports QwenGR00T, QwenPI, QwenOFT and QwenFast on Qwen3-VL (QwenGR00T, QwenPI and
+QwenOFT also on Qwen3.5), on one GPU or data-parallel on all visible GPUs of one machine, supervised
 training and co-training with VLM data, upstream registered LeRobot dataset mixtures, one observation per camera, native safetensors
 packages (CUDA inference in the isolated worker), and, for QwenGR00T, OpenVINO packages
 (in-process inference on CPU or another OpenVINO device, without StarVLA or PyTorch). Other
-StarVLA frameworks, custom executable dataset registrations, DeepSpeed/multi-GPU
-launching, and ONNX conversion are not enabled. Training requires CUDA.
+StarVLA frameworks, custom executable dataset registrations, DeepSpeed, multi-machine training
+and ONNX conversion are not enabled. Training requires CUDA.
 
 ## Install and prepare
 
@@ -418,6 +418,64 @@ Verified on one RTX 3090 with a 40-example question-answering set built from LIB
 seconds at 8.9 GB of GPU memory and reported the action loss (1.28) and the weighted VLM loss
 (0.46) every step. Runtime matched StarVLA's own `predict_action` exactly, and the co-trained
 QwenGR00T also exported to OpenVINO (actions within 3.1e-3 of PyTorch).
+
+## Multi-GPU training
+
+`all_devices` trains on every GPU the caller exposes, with one data-parallel process per GPU, like
+Studio's "All GPUs" choice for remote trainers. Pass it with `device="cuda"` (not `cuda:N`), and choose
+the GPUs with `CUDA_VISIBLE_DEVICES`; it needs at least two. On the command line, add `--all_devices`.
+
+```python
+run = Engine.get("starvla").run(
+    {
+        "config_yaml": "plugins/policies/starvla/configs/qwengroot_libero.yaml",
+        "overrides": ["framework.qwenvl.base_vlm=/absolute/path/to/Qwen3-VL-4B-Instruct"],
+        "all_devices": True,
+    },
+    dataset=Path("/absolute/path/to/datasets"),
+    output_dir=Path("/absolute/path/to/runs/starvla-2gpu"),
+    device="cuda",
+)
+```
+
+`datasets.vla_data.per_device_batch_size` stays per GPU, so each step uses that many samples on every
+GPU: with two GPUs, twice the single-GPU batch at the same learning rate and step count.
+
+The worker the engine starts keeps the engine's protocol and launches `torchrun` with one rank per
+GPU. Each rank runs StarVLA's own trainer, which uses `accelerate`'s DistributedDataParallel under
+`torchrun`. Progress comes from rank 0 (its loss, not an average over the ranks), and rank 0 writes
+the checkpoint, which exports and runs like any other. A cancellation reaches every rank at the same
+step; ranks that have not stopped after 3 seconds are terminated. `torchrun` starts each rank in a
+session of its own, so each rank also asks Linux to kill it when `torchrun` dies: stopping the
+worker, or a crashed host, frees every GPU.
+
+Co-training stays on one GPU: without DeepSpeed, StarVLA's co-training step runs a second backward
+pass for the VLM loss, through the VLM outside the parallel wrapper, and DistributedDataParallel
+supports one backward pass per step. The worker refuses `all_devices` for a co-training config.
+
+DistributedDataParallel is told to look for trainable parameters that a step leaves unused (an
+untrained state encoder, for one); otherwise it stops at the second step. Upstream's multi-GPU
+recipes use DeepSpeed ZeRO-2 instead, which also shards the optimizer state across the GPUs.
+DeepSpeed is published only as source code and is not in the worker environments, so here every GPU
+still holds the whole model and optimizer state: more GPUs train on more samples per step, but do
+not let a larger model fit.
+
+Verified on two RTX 3090s, 20 LIBERO-goal steps each through the engine:
+
+| Run                                            | GPUs | Time | GPU memory       | Runtime vs StarVLA |
+| ---------------------------------------------- | ---- | ---- | ---------------- | ------------------ |
+| QwenGR00T on Qwen3-VL-2B, VLM frozen           | 2    | 28 s | 10.9 GB on each  | exact              |
+| the same run                                   | 1    | 18 s | 8.1 GB           | exact              |
+| QwenPI on Qwen3.5-0.8B, whole model (`qwen35`) | 2    | 43 s | 17.9 and 17.4 GB | exact              |
+
+Twenty steps are mostly start-up (one model load per GPU and the process group), so these runs check
+correctness, not speed; on two GPUs each step trains on twice the samples. Each GPU also needs more
+memory than a single-GPU run (DistributedDataParallel keeps gradient buckets): QwenPI's whole-model
+run took 14.7 GB on one GPU. Rank 0 reported every step in order, and Runtime matched StarVLA's own
+`predict_action` exactly on a real frame and repeated it exactly after a reset. Cancelling after step
+5 stopped both ranks together after step 6, returning 3.2 seconds after the request with no rank left
+and both GPUs free. Killing the host process at step 3, as a crash would, also left no worker,
+`torchrun` or rank behind. A co-training config was refused before any rank started.
 
 ## Export with explicit robot mappings
 
