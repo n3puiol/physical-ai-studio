@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from physicalai.inference.manifest import Manifest
 
-from physicalai_starvla_policy_plugin._worker.starvla_worker_common import trained_with_state
+from physicalai_starvla_policy_plugin._worker.starvla_worker_common import FAST_TOKENIZER_FILES, trained_with_state
 from physicalai_starvla_policy_plugin.package import ARTIFACT, BACKBONE_DIR, IoSpec, load_descriptor, write_package
 
 
@@ -131,3 +131,60 @@ def test_package_maps_state_only_if_training_used_it(
     exported = write_package(checkpoint, tmp_path / "state-export", backbone=backbone, io=io, unnorm_key="franka")
     state = load_descriptor(exported / ARTIFACT)["io"]["state"]
     assert state == ({"state.arm": [0, 2]} if keeps_state else {})
+
+
+def test_unsupported_backbones_and_package_folders_are_refused(
+    tmp_path: Path,
+    checkpoint: Path,
+    backbone: Path,
+    io: IoSpec,
+    package: Path,
+) -> None:
+    (backbone / "config.json").write_text('{"model_type": "florence2"}')
+    with pytest.raises(ValueError, match="requires a Qwen3-VL backbone"):
+        write_package(checkpoint, tmp_path / "florence-export", backbone=backbone, io=io, unnorm_key="franka")
+    path = package / ARTIFACT / "package.json"
+    data = json.loads(path.read_text())
+    data["backbone"] = "../escape"
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="backbone"):
+        load_descriptor(path.parent)
+
+
+@pytest.fixture
+def fast(tmp_path: Path) -> Path:
+    # A FAST tokenizer folder as downloaded from physical-intelligence/fast, code included.
+    root = tmp_path / "fast"
+    root.mkdir()
+    for name in FAST_TOKENIZER_FILES:
+        (root / name).write_text("{}")
+    (root / "processing_action_tokenizer.py").write_text("raise RuntimeError('must not ship')")
+    return root
+
+
+def test_a_qwenfast_package_carries_its_fast_tokenizer_data(
+    tmp_path: Path,
+    checkpoint: Path,
+    backbone: Path,
+    io: IoSpec,
+    fast: Path,
+) -> None:
+    config = checkpoint.parents[1] / "config.yaml"
+    config.write_text("framework:\n  name: QwenFast\n")
+    with pytest.raises(ValueError, match="fast_tokenizer_path"):
+        write_package(checkpoint, tmp_path / "no-fast", backbone=backbone, io=io, unnorm_key="franka")
+
+    config.write_text(f"framework:\n  name: QwenFast\n  action_model:\n    fast_tokenizer_path: {fast}\n")
+    action = backbone.rename(backbone.with_name("Qwen3-VL-4B-Instruct-Action"))
+    package = write_package(checkpoint, tmp_path / "fast-export", backbone=action, io=io, unnorm_key="franka")
+    artifact = package / ARTIFACT
+
+    descriptor = load_descriptor(artifact)
+    assert descriptor["fast_tokenizer"] == "FAST"
+    # StarVLA enables the action tokens only when the backbone path says -Action.
+    assert descriptor["backbone"] == "Qwen3-VL-Action"
+    assert (artifact / "Qwen3-VL-Action" / "config.json").is_file()
+    assert sorted(path.name for path in (artifact / "FAST").iterdir()) == sorted(FAST_TOKENIZER_FILES)
+    (artifact / "FAST" / "tokenizer.json").unlink()
+    with pytest.raises(ValueError, match="missing"):
+        load_descriptor(artifact)

@@ -17,7 +17,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import starvla_worker_protocol as protocol
-from starvla_worker_common import disable_remote_code, identity, trained_with_state
+from starvla_worker_common import identity, restrict_remote_code, trained_with_state, use_fast_tokenizer
 
 _ACTION_RANK = 3
 
@@ -31,7 +31,7 @@ class Policy:
         Raises:
             ValueError: If model metadata, device, or robot mapping is unsupported.
         """
-        disable_remote_code()
+        restrict_remote_code()
         import torch
         from deployment.model_server.policy_wrapper import PolicyServerWrapper
         from omegaconf import OmegaConf
@@ -50,8 +50,10 @@ class Policy:
         if not device.startswith("cuda") or not torch.cuda.is_available():
             msg = "StarVLA inference requires CUDA."
             raise ValueError(msg)
-        # Upstream dispatches its VLM by this directory-name substring.
-        backbone = (artifact / "Qwen3-VL").resolve(strict=True)
+        # Upstream picks its VLM, and enables action tokens, by substrings of this folder name.
+        backbone = (artifact / descriptor.get("backbone", "Qwen3-VL")).resolve(strict=True)
+        if descriptor.get("fast_tokenizer"):
+            use_fast_tokenizer((artifact / descriptor["fast_tokenizer"]).resolve(strict=True))
         self.wrapper = PolicyServerWrapper(
             str(checkpoint),
             device=device,
@@ -73,11 +75,7 @@ class Policy:
         if list(self.io["cameras"]) != list(data_config.video_keys):
             msg = "Package camera count/order differs from the training DataConfig."
             raise ValueError(msg)
-        for label in ("observation_indices", "state_indices"):
-            indices = getattr(data_config, label, [0])
-            if list(indices) != [0]:
-                msg = "Observation-history checkpoints are not supported."
-                raise ValueError(msg)
+        check_single_step(data_config)
 
     def predict(self, message: dict[str, Any]) -> dict[str, np.ndarray]:
         """Normalize raw states with training transforms and unnormalize native actions.
@@ -126,6 +124,19 @@ class Policy:
             result[key] = actions[0, :, cursor : cursor + width]
             cursor += width
         return result
+
+
+def check_single_step(data_config: Any) -> None:  # ruff: ignore[any-type]  # Upstream DataConfig.
+    """Refuse a training DataConfig that feeds the model more than the current observation and state.
+
+    Raises:
+        ValueError: If the DataConfig uses an observation or state history.
+    """
+    for label in ("observation_indices", "state_indices"):
+        indices = getattr(data_config, label, None) or [0]  # Some DataConfigs (oxe_bridge) set None.
+        if list(indices) != [0]:
+            msg = "Observation-history checkpoints are not supported."
+            raise ValueError(msg)
 
 
 def check_mapping(io: dict[str, Any], processor: Any, *, uses_state: bool) -> None:  # ruff: ignore[any-type]

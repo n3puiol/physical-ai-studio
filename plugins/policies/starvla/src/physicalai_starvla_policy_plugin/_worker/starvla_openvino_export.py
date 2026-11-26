@@ -345,7 +345,9 @@ def load(export: Export) -> None:
         str(export.artifact / export.descriptor["checkpoint"]),
         device="cpu",
         unnorm_key=export.descriptor["unnorm_key"],
-        config_overrides=[f"framework.qwenvl.base_vlm={export.artifact / 'Qwen3-VL'}"],
+        config_overrides=[
+            f"framework.qwenvl.base_vlm={export.artifact / export.descriptor.get('backbone', 'Qwen3-VL')}",
+        ],
     )
     export.framework = wrapper._framework
     export.embedding = export.framework.qwen_vl_interface.model.model.get_input_embeddings().weight.detach()
@@ -491,7 +493,8 @@ def describe(export: Export) -> None:
     bfloat16 = export.embedding.dtype == torch.bfloat16
     table = export.embedding.view(torch.int16).numpy().view(np.uint16) if bfloat16 else export.embedding.float().numpy()
     np.save(export.output / pipeline.EMBEDDINGS, table)
-    shutil.copy2(export.artifact / "Qwen3-VL" / pipeline.TOKENIZER, export.output / pipeline.TOKENIZER)
+    backbone = export.artifact / export.descriptor.get("backbone", "Qwen3-VL")
+    shutil.copy2(backbone / pipeline.TOKENIZER, export.output / pipeline.TOKENIZER)
 
     image_processor = framework.qwen_vl_interface.processor.image_processor
     merge = image_processor.merge_size

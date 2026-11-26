@@ -21,7 +21,7 @@ from physicalai_starvla_policy_plugin.package import ARTIFACT, RUN_INFO, IoSpec,
 def test_entry_point_and_pins() -> None:
     env = engine.StarVLAEngine.environment_for_policy("QwenGR00T")
     assert Engine.get("starvla") is engine.StarVLAEngine
-    assert engine.StarVLAEngine.policies() == ["QwenGR00T", "QwenOFT", "QwenPI"]
+    assert engine.StarVLAEngine.policies() == ["QwenFast", "QwenGR00T", "QwenOFT", "QwenPI"]
     assert env.pinned().base_version == "1.0.1"
     assert env.accelerators == ("cu128",)
     assert len(environments.QWENGR00T.provenance()["lock_sha256"]) == 64
@@ -76,7 +76,7 @@ def test_frameworks_with_the_same_dependencies_share_one_environment_and_there_i
     assert environments.QWENPI.provenance() == environments.QWENGR00T.provenance()
     assert environments.QWENOFT.environment.key() == environments.QWENGR00T.environment.key()
     with pytest.raises(ValueError, match="no worker environment"):
-        environments.for_policy("QwenFast")
+        environments.for_policy("QwenAdapter")
     assert environments.for_policy(None) is environments.QWENGR00T
 
 
@@ -98,20 +98,20 @@ def test_framework_is_read_from_the_config_and_overrides(tmp_path: Path, argv: l
 
 def test_unsupported_framework_is_rejected_before_training(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config = tmp_path / "train.yaml"
-    config.write_text("framework:\n  name: QwenFast\n")
+    config.write_text("framework:\n  name: QwenAdapter\n")
     runner = Mock()
     monkeypatch.setattr(engine, "run_worker", runner)
     call = Mock(return_value=0)
     monkeypatch.setattr(engine.subprocess, "call", call)
 
-    with pytest.raises(ValueError, match="'QwenFast' has no worker environment"):
+    with pytest.raises(ValueError, match="'QwenAdapter' has no worker environment"):
         engine.StarVLAEngine.run(
             {"config_yaml": str(config)},
             dataset=tmp_path,
             output_dir=tmp_path / "out",
             device="cuda",
         )
-    with pytest.raises(ValueError, match="'QwenFast' has no worker environment"):
+    with pytest.raises(ValueError, match="'QwenAdapter' has no worker environment"):
         engine.StarVLAEngine.cli(["--config_yaml", str(config)])
     runner.assert_not_called()
     call.assert_not_called()
@@ -155,7 +155,7 @@ def test_cuda_index_outside_the_device_mask_is_rejected(
         engine._device_env(device)
 
 
-@pytest.mark.parametrize("framework", ["QwenGR00T", "QwenPI", "QwenOFT"])
+@pytest.mark.parametrize("framework", ["QwenGR00T", "QwenPI", "QwenOFT", "QwenFast"])
 def test_headless_settings_are_overridden_by_studio(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

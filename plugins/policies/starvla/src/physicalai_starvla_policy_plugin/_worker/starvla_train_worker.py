@@ -28,10 +28,11 @@ from starvla_worker_common import (
     CancelledError,
     EventChannel,
     WorkerHandshakeError,
-    disable_remote_code,
     finite_metrics,
     identity,
+    restrict_remote_code,
     start_cancel_listener,
+    use_fast_tokenizer,
     wait_for_host_acknowledgement,
 )
 
@@ -68,7 +69,7 @@ def train(argv: list[str] | None = None) -> tuple[Path, Path]:  # ruff: ignore[t
     # Model code and weights must already be local; no mutable remote revisions.
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    disable_remote_code()
+    restrict_remote_code()
     from omegaconf import OmegaConf
     from starVLA.model.framework.share_tools import apply_config_compat
 
@@ -100,6 +101,8 @@ def train(argv: list[str] | None = None) -> tuple[Path, Path]:  # ruff: ignore[t
         msg = "Use a local Qwen3-VL backbone with Qwen3-VL in its directory name (upstream VLM dispatch)."
         raise ValueError(msg)
     cfg.framework.qwenvl.base_vlm = str(backbone)
+    if cfg.framework.name == "QwenFast":
+        _prepare_qwenfast(cfg, backbone)
     if cotraining:
         _prepare_cotraining(cfg, backbone)
     cfg.run_root_dir = str(Path(cfg.run_root_dir).expanduser().resolve())
@@ -234,6 +237,22 @@ def _import_cotrainer() -> Any:  # ruff: ignore[any-type]  # Upstream module.
     finally:
         accelerate.DeepSpeedPlugin = original
     return train_starvla_cotrain
+
+
+def _prepare_qwenfast(cfg: Any, backbone: Path) -> None:  # ruff: ignore[any-type]  # OmegaConf node.
+    """Check QwenFast's backbone and point its FAST tokenizer at the configured folder.
+
+    Raises:
+        ValueError: If the backbone lacks StarVLA's action tokens or the tokenizer folder is invalid.
+    """
+    # StarVLA enables the action-token range only for backbones whose path says "-Action".
+    if "-Action" not in str(backbone):
+        msg = "QwenFast needs StarVLA's Qwen3-VL-4B-Instruct-Action backbone, in a folder named with -Action."
+        raise ValueError(msg)
+    # A plugin key: StarVLA hard-codes the FAST tokenizer's location (see use_fast_tokenizer).
+    fast = Path(str(getattr(cfg.framework.action_model, "fast_tokenizer_path", "") or "")).expanduser()
+    use_fast_tokenizer(fast)
+    cfg.framework.action_model.fast_tokenizer_path = str(fast)
 
 
 def _prepare_cotraining(cfg: Any, backbone: Path) -> None:  # ruff: ignore[any-type]  # OmegaConf node.

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import math
@@ -14,6 +15,7 @@ import sys
 import threading
 import time
 from importlib.metadata import version
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -130,8 +132,75 @@ def finite_metrics(metrics: dict[str, Any]) -> dict[str, float]:
     }
 
 
-def disable_remote_code() -> None:
-    """Refuse Transformers dynamic modules, including upstream's trust_remote_code defaults."""
+# Hugging Face "remote code" the plugin has reviewed and ships in remote_code/, by module file: the
+# vendored package and the SHA-256 of the upstream file at its pinned revision (remote_code/README.md).
+REVIEWED_REMOTE_CODE = {
+    "processing_action_tokenizer": ("fast", "6f021ca1f4c1b194ab6fa399d80baf3d642eadb17efb8f73301e4ac401522c20"),
+}
+# Files of a FAST action tokenizer folder (physical-intelligence/fast) that QwenFast needs at run time.
+FAST_TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "processor_config.json")
+
+
+def use_fast_tokenizer(folder: Path) -> None:
+    """Point QwenFast's FAST action tokenizer at ``folder``.
+
+    StarVLA builds it from ``playground/Pretrained_models/fast``, relative to the working directory,
+    with no config key; the plugin replaces that default.
+
+    Raises:
+        ValueError: If the folder lacks the FAST tokenizer files.
+    """
+    missing = [name for name in FAST_TOKENIZER_FILES if not (folder / name).is_file()]
+    if not folder.is_absolute() or missing:
+        msg = f"QwenFast needs an absolute FAST tokenizer folder (physical-intelligence/fast); missing {missing}."
+        raise ValueError(msg)
+    fast = importlib.import_module(
+        "starVLA.model.modules.action_model.fast_ActionHeader",
+    )  # nosemgrep  # Fixed module name.
+    fast.Fast_Action_Tokenizer.__init__.__defaults__ = (str(folder),)
+
+
+def load_reviewed_class(
+    class_reference: str,
+    pretrained_model_name_or_path: object = None,
+    *_args: object,
+    **_kwargs: object,
+) -> type:
+    """Answer a Transformers request for a model's own Python class from the plugin's reviewed copy.
+
+    Returns:
+        The requested class from the vendored module.
+
+    Raises:
+        RuntimeError: If the code is not among the reviewed files, or the model folder's own copy
+            differs from the reviewed revision.
+    """
+    module_name, _, class_name = class_reference.rpartition(".")
+    module_name = module_name.rpartition("--")[2]
+    if module_name not in REVIEWED_REMOTE_CODE:
+        msg = (
+            f"Model repository Python code ({module_name}.py) has not been reviewed for the Physical AI StarVLA plugin."
+        )
+        raise RuntimeError(msg)
+    package, digest = REVIEWED_REMOTE_CODE[module_name]
+    if pretrained_model_name_or_path is not None:
+        local = Path(str(pretrained_model_name_or_path)) / f"{module_name}.py"
+        if local.is_file() and hashlib.sha256(local.read_bytes()).hexdigest() != digest:
+            msg = (
+                f"{local} differs from the reviewed {module_name}.py; use the pinned revision (remote_code/README.md)."
+            )
+            raise RuntimeError(msg)
+    module = importlib.import_module(f"remote_code.{package}.{module_name}")  # nosemgrep  # Names from the table above.
+    return getattr(module, class_name)
+
+
+def restrict_remote_code() -> None:
+    """Serve a model's own Python code only from the plugin's reviewed copies; refuse everything else.
+
+    Transformers loads ``trust_remote_code`` classes through ``get_class_from_dynamic_module``. Every
+    reference to it is replaced with ``load_reviewed_class``, including upstream's
+    ``trust_remote_code=True`` defaults, so no Python file from a model folder or the Hub runs.
+    """
     dynamic = importlib.import_module("transformers.dynamic_module_utils")  # nosemgrep  # Fixed module name.
     original = dynamic.get_class_from_dynamic_module
     for name in (
@@ -144,18 +213,10 @@ def disable_remote_code() -> None:
         "video_processing_auto",
     ):
         importlib.import_module(f"transformers.models.auto.{name}")  # nosemgrep  # Fixed Transformers module names.
-
-    def refuse(*_args: object, **_kwargs: object) -> None:
-        msg = "Model repository Python code is disabled by the Physical AI StarVLA plugin."
-        raise RuntimeError(msg)
-
     for module in list(sys.modules.values()):
         namespace = getattr(module, "__dict__", {})
         if (
             str(namespace.get("__name__", "")).startswith("transformers")
-            and namespace.get(
-                "get_class_from_dynamic_module",
-            )
-            is original
+            and namespace.get("get_class_from_dynamic_module") is original
         ):
-            namespace["get_class_from_dynamic_module"] = refuse
+            namespace["get_class_from_dynamic_module"] = load_reviewed_class

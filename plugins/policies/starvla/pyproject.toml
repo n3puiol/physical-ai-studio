@@ -41,6 +41,8 @@ physicalai-train = { path = "../../../library", editable = true }
 [tool.ruff]
 extend = "../../../pyproject.toml"
 src = ["src", "tests"]
+# Unmodified upstream remote code; its SHA-256 must keep matching upstream (remote_code/README.md).
+extend-exclude = ["src/physicalai_starvla_policy_plugin/_worker/remote_code/fast/processing_action_tokenizer.py"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["undocumented-public-function", "assert", "magic-value-comparison", "import-private-name", "private-member-access"]

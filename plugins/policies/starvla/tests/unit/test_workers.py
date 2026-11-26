@@ -32,7 +32,7 @@ def train_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNames
     cancelled = threading.Event()
     monkeypatch.setattr(worker, "EventChannel", lambda: SimpleNamespace(send=events.append, enabled=False))
     monkeypatch.setattr(worker, "identity", lambda: {"framework": "starvla", "package": "starvla", "version": "1.0.1"})
-    monkeypatch.setattr(worker, "disable_remote_code", lambda: None)
+    monkeypatch.setattr(worker, "restrict_remote_code", lambda: None)
     monkeypatch.setattr(worker, "start_cancel_listener", lambda: cancelled)
     monkeypatch.setenv("PHYSICALAI_STARVLA_PROVENANCE", json.dumps(environments.QWENGR00T.provenance()))
     monkeypatch.setenv("PHYSICALAI_STARVLA_FRAMEWORK", "QwenGR00T")
@@ -152,7 +152,7 @@ def test_inference_refuses_a_checkpoint_of_another_framework(
 ) -> None:
     del train_worker
     worker = importlib.import_module("starvla_infer_worker")
-    monkeypatch.setattr(worker, "disable_remote_code", lambda: None)
+    monkeypatch.setattr(worker, "restrict_remote_code", lambda: None)
     config = SimpleNamespace(framework=SimpleNamespace(name="QwenPI"))
     for module, value in {
         "omegaconf": SimpleNamespace(OmegaConf=SimpleNamespace(load=lambda _: config)),
@@ -318,6 +318,29 @@ def test_cotraining_config_is_checked_before_training(
     assert cotraining.saved == []
 
 
+def test_qwenfast_trains_with_the_configured_fast_tokenizer(
+    train_worker: SimpleNamespace,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    folders: list[Path] = []
+    monkeypatch.setattr(train_worker.worker, "use_fast_tokenizer", folders.append)
+    monkeypatch.setenv("PHYSICALAI_STARVLA_FRAMEWORK", "QwenFast")
+    train_worker.cfg.framework.name = "QwenFast"
+    train_worker.cfg.framework.action_model = SimpleNamespace(fast_tokenizer_path=str(tmp_path / "fast"))
+    with pytest.raises(ValueError, match="-Action"):
+        train_worker.worker.train(["--config_yaml", "unused.yaml"])
+    action = tmp_path / "Qwen3-VL-4B-Instruct-Action"
+    action.mkdir()
+    (action / "config.json").write_text('{"model_type": "qwen3_vl"}')
+    train_worker.cfg.framework.qwenvl.base_vlm = str(action)
+
+    train_worker.worker.train(["--config_yaml", "unused.yaml"])
+
+    assert folders == [tmp_path / "fast"]
+    assert train_worker.cfg.framework.action_model.fast_tokenizer_path == str(tmp_path / "fast")
+
+
 def test_host_acknowledgement_reads_ack_cancel_and_closed(
     train_worker: SimpleNamespace,
     monkeypatch: pytest.MonkeyPatch,
@@ -447,6 +470,17 @@ def test_inference_leaves_out_state_a_checkpoint_was_not_trained_on(
     })
 
     assert "state" not in predict.call_args.kwargs["examples"][0]
+
+
+def test_inference_accepts_only_the_current_step(train_worker: SimpleNamespace) -> None:
+    del train_worker
+    worker = importlib.import_module("starvla_infer_worker")
+
+    worker.check_single_step(SimpleNamespace(observation_indices=[0], state_indices=[0]))
+    # Some upstream DataConfigs (oxe_bridge) set the indices to None, meaning the current step.
+    worker.check_single_step(SimpleNamespace(observation_indices=None, state_indices=None))
+    with pytest.raises(ValueError, match="Observation-history"):
+        worker.check_single_step(SimpleNamespace(observation_indices=[-1, 0], state_indices=[0]))
 
 
 def test_mapping_check_follows_the_state_the_checkpoint_was_trained_on(train_worker: SimpleNamespace) -> None:

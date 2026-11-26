@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import environments
-from ._worker.starvla_worker_common import trained_with_state
+from ._worker.starvla_worker_common import FAST_TOKENIZER_FILES, trained_with_state
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -21,7 +21,14 @@ if TYPE_CHECKING:
 BACKEND = "starvla"
 ARTIFACT = "policy.starvla"
 RUN_INFO = "physicalai_run.json"
+# StarVLA picks its VLM implementation by this substring of the backbone path.
 BACKBONE_DIR = "Qwen3-VL"
+# StarVLA also reads this marker in the backbone path: it enables the action tokens of StarVLA's
+# "-Action" backbones, which QwenFast predicts. Packages keep it in the backbone folder's name and
+# record that name as "backbone" in package.json (packages without the field hold Qwen3-VL).
+ACTION_MARKER = "-Action"
+# QwenFast packages carry their FAST action tokenizer's data files (never its code) in this folder.
+FAST_DIR = "FAST"
 _SLICE_BOUNDS = 2
 
 
@@ -183,7 +190,17 @@ def load_descriptor(artifact: Path) -> dict[str, Any]:
         raise ValueError(msg)
     contained_file(artifact, "model/config.yaml")
     contained_file(artifact, "model/dataset_statistics.json")
-    contained_file(artifact, f"{BACKBONE_DIR}/config.json")
+    backbone = descriptor.get("backbone", BACKBONE_DIR)
+    if backbone not in {BACKBONE_DIR, BACKBONE_DIR + ACTION_MARKER}:
+        msg = "Unsupported StarVLA package backbone."
+        raise ValueError(msg)
+    contained_file(artifact, f"{backbone}/config.json")
+    if descriptor["policy"] == "QwenFast":
+        if descriptor.get("fast_tokenizer") != FAST_DIR:
+            msg = "QwenFast packages carry their FAST tokenizer."
+            raise ValueError(msg)
+        for name in FAST_TOKENIZER_FILES:
+            contained_file(artifact, f"{FAST_DIR}/{name}")
     return descriptor
 
 
@@ -224,10 +241,8 @@ def write_package(
         msg = "unnorm_key is not present in the checkpoint's dataset statistics."
         raise ValueError(msg)
     backbone = backbone.expanduser().resolve(strict=True)
-    config = json.loads(contained_file(backbone, "config.json").read_text())
-    if not isinstance(config, dict) or config.get("model_type") != "qwen3_vl":
-        msg = "This plugin requires a Qwen3-VL backbone."
-        raise ValueError(msg)
+    folder = _backbone_folder(backbone)
+    fast = _fast_tokenizer(run_dir / "config.yaml") if spec.policy == "QwenFast" else None
     if not any(backbone.glob("*.safetensors")):
         msg = "The local backbone must contain safetensors weights."
         raise ValueError(msg)
@@ -244,8 +259,7 @@ def write_package(
         shutil.copy2(checkpoint, model / "checkpoints" / "model.safetensors")
         for name in ("config.yaml", "dataset_statistics.json"):
             shutil.copy2(run_dir / name, model / name)
-        # Upstream selects the VLM implementation by a substring of its local path.
-        _copy_backbone(backbone, artifact / BACKBONE_DIR)
+        _copy_backbone(backbone, artifact / folder)
         descriptor = {
             "format_version": 1,
             "policy": spec.policy,
@@ -253,12 +267,59 @@ def write_package(
             "checkpoint": "model/checkpoints/model.safetensors",
             "unnorm_key": unnorm_key,
             "io": asdict(io),
+            "backbone": folder,
         }
+        if fast is not None:
+            (artifact / FAST_DIR).mkdir()
+            for name in FAST_TOKENIZER_FILES:
+                shutil.copy2(fast / name, artifact / FAST_DIR / name)
+            descriptor["fast_tokenizer"] = FAST_DIR
         (artifact / "package.json").write_text(json.dumps(descriptor, indent=2) + "\n")
         load_descriptor(artifact)
         _write_manifest(staged, spec.policy)
         staged.rename(output)
     return output
+
+
+def _backbone_folder(backbone: Path) -> str:
+    """Name the package folder for a backbone.
+
+    StarVLA selects the VLM implementation, and enables action tokens, by substrings of its path.
+
+    Returns:
+        The folder name, keeping StarVLA's "-Action" marker.
+
+    Raises:
+        ValueError: If the backbone is not Qwen3-VL.
+    """
+    config = json.loads(contained_file(backbone, "config.json").read_text())
+    if not isinstance(config, dict) or config.get("model_type") != "qwen3_vl":
+        msg = "This plugin requires a Qwen3-VL backbone."
+        raise ValueError(msg)
+    return BACKBONE_DIR + (ACTION_MARKER if ACTION_MARKER in backbone.name else "")
+
+
+def _fast_tokenizer(config_yaml: Path) -> Path:
+    """Return the FAST tokenizer folder a QwenFast run was trained with.
+
+    Raises:
+        ValueError: If the run's config does not name an absolute folder with the tokenizer files.
+    """
+    import yaml  # ruff: ignore[import-outside-top-level]  # Only needed when reading training configs.
+
+    data = yaml.safe_load(config_yaml.read_text(encoding="utf-8"))
+    framework = data.get("framework") if isinstance(data, dict) else None
+    action_model = framework.get("action_model") if isinstance(framework, dict) else None
+    path = action_model.get("fast_tokenizer_path") if isinstance(action_model, dict) else None
+    folder = Path(str(path)) if path else None
+    if (
+        folder is None
+        or not folder.is_absolute()
+        or not all((folder / name).is_file() for name in FAST_TOKENIZER_FILES)
+    ):
+        msg = "QwenFast packages carry the FAST tokenizer: set the run's framework.action_model.fast_tokenizer_path."
+        raise ValueError(msg)
+    return folder
 
 
 def _copy_backbone(source: Path, destination: Path) -> None:

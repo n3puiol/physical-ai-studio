@@ -1,11 +1,11 @@
 # StarVLA engine
 
-Train StarVLA **QwenGR00T**, **QwenPI** and **QwenOFT** with the upstream trainers, including
+Train StarVLA **QwenGR00T**, **QwenPI**, **QwenOFT** and **QwenFast** with the upstream trainers, including
 co-training with VLM data, and run exported checkpoints through Physical AI Runtime. StarVLA, PyTorch, Transformers, and its dataset code
 live in a separate locked Python 3.11/CUDA 12.8 environment. Neither the host nor
 a Runtime-only install imports `physicalai-train` to perform inference.
 
-This integration supports single-GPU QwenGR00T, QwenPI and QwenOFT on Qwen3-VL, supervised
+This integration supports single-GPU QwenGR00T, QwenPI, QwenOFT and QwenFast on Qwen3-VL, supervised
 training and co-training with VLM data, upstream registered LeRobot dataset mixtures, one observation per camera, native safetensors
 packages (CUDA inference in the isolated worker), and, for QwenGR00T, OpenVINO packages
 (in-process inference on CPU or another OpenVINO device, without StarVLA or PyTorch). Other
@@ -18,7 +18,7 @@ From `library/`:
 
 ```bash
 uv sync --extra starvla
-uv run physicalai engine prepare starvla --policy QwenGR00T --accelerator cu128  # QwenPI and QwenOFT share it
+uv run physicalai engine prepare starvla --policy QwenGR00T --accelerator cu128  # QwenPI, QwenOFT and QwenFast share it
 uv run physicalai engine prepare starvla --enablement qwengr00t-openvino  # OpenVINO conversion
 uv run physicalai train starvla --help
 ```
@@ -27,7 +27,7 @@ Each StarVLA framework maps to a locked worker project under
 `src/physicalai_starvla_policy_plugin/envs/<name>/`, declared in `environments.POLICY_ENVIRONMENTS`
 and mapped through `StarVLAEngine.policy_envs`. Training, export and Runtime pick the environment
 from `framework.name` in the training YAML (a `framework.name=...` override wins). Frameworks with
-the same dependencies share a project: QwenPI and QwenOFT use QwenGR00T's `envs/qwengr00t/`, so the engine
+the same dependencies share a project: QwenPI, QwenOFT and QwenFast use QwenGR00T's `envs/qwengr00t/`, so the engine
 lists and prepares it once. A framework that needs other dependencies gets its own project, so
 frameworks never share a resolution they were not locked for. There is no default environment: a
 framework without an entry is rejected, and the training worker refuses a config whose
@@ -47,8 +47,9 @@ Qwen3-VL/CUDA 12.8 combination; these differ from upstream's older requirements.
 Prepare a **local, materialized** `Qwen/Qwen3-VL-4B-Instruct` backbone, including
 its tokenizer, processor, and safetensors weights. Use a specific Hugging Face
 commit when downloading; do not use a floating revision. Qwen's standard
-Transformers implementation needs no remote Python code. The plugin refuses
-dynamic remote model code and runs model loading offline. Its directory path
+Transformers implementation needs no remote Python code. The workers never run Python code from a
+model folder or the Hub (see [Reviewed remote code](#reviewed-remote-code)) and load models
+offline. Its directory path
 must contain `Qwen3-VL`: upstream dispatches the VLM by this substring. For example,
 run with the library's Python and `huggingface_hub`:
 
@@ -222,6 +223,72 @@ Verified on one RTX 3090: 20 steps through the engine took 23 seconds at 11.0 GB
 the loss fell from 0.87 to 0.47. On a real LIBERO-goal frame, Runtime matched StarVLA's own
 `predict_action` exactly (maximum absolute difference `0.0`) and repeated it exactly, and an
 OpenVINO export was refused.
+
+## QwenFast
+
+QwenFast trains the VLM itself to predict actions. StarVLA encodes each action chunk with the FAST
+tokenizer (a discrete cosine transform, then byte-pair encoding) into `<robot_action_N>` tokens and
+trains the language model on them; at inference the model generates those tokens, which are decoded
+back into actions. It needs:
+
+- StarVLA's `StarVLA/Qwen3-VL-4B-Instruct-Action` backbone (verified at revision
+  `c41500cf1d287cd79e9f6602f419937b05048bd8`), which adds the action tokens. StarVLA enables them
+  only when the backbone path contains `-Action`, so keep that in the folder name; training refuses
+  a QwenFast backbone without it, and packages name their backbone folder `Qwen3-VL-Action`.
+- The FAST tokenizer, `physical-intelligence/fast` at revision
+  `ec4d7aa71691cac0b8bed6942be45684db2110f4`. StarVLA loads it from a fixed path relative to its
+  working directory, with no config key. The plugin reads `framework.action_model.fast_tokenizer_path`
+  (an absolute folder) instead, and QwenFast packages carry the tokenizer's JSON files in `FAST/`.
+
+`configs/qwenfast_libero.yaml` is a 20-step LIBERO smoke run. Because the actions come out of the
+language model, part of it must train: to fit a 24 GB GPU the config trains only the last two of its
+36 layers, where upstream's recipes train the whole VLM. QwenFast exports native packages only.
+
+```bash
+WANDB_MODE=disabled library/.venv/bin/physicalai train starvla \
+  --config_yaml plugins/policies/starvla/configs/qwenfast_libero.yaml \
+  framework.qwenvl.base_vlm=/absolute/path/to/Qwen3-VL-4B-Instruct-Action \
+  framework.action_model.fast_tokenizer_path=/absolute/path/to/fast \
+  datasets.vla_data.data_root_dir=/absolute/path/to/datasets \
+  run_root_dir=/absolute/path/to/runs run_id=starvla-qwenfast
+```
+
+When the generated text holds no action tokens, StarVLA's FAST decoder prints `Error decoding tokens`
+and returns an all-zero normalized chunk instead of failing; Runtime passes that chunk on like any
+other. Check that a QwenFast policy emits action tokens before running it on a robot.
+
+Verified on one RTX 3090: 20 steps through the engine took 21 seconds at 11.6 GB of GPU memory, and
+the loss fell from 16.1 to 14.2. The package held the FAST tokenizer's data files and no Python, and
+an OpenVINO export was refused. After 20 steps the model does not yet generate action tokens, so on a
+real LIBERO-goal frame both StarVLA's own `predict_action` and Runtime returned the zero-chunk
+fallback, after 4.8 seconds of generation. Runtime matched StarVLA exactly and repeated it exactly.
+
+A 2,000-step run (batch size 4, VLM learning rate 1e-4, still only the last two layers; 14 minutes at
+17.7 GB) brought the loss to about 3.8, and the model then generated 9 to 12 action tokens per chunk
+in under a second. None of its sequences decoded, though: they held 48 to 53 DCT coefficients instead
+of 56, so StarVLA and Runtime again returned the same fallback. StarVLA's published QwenFast
+checkpoints use Qwen2.5-VL, which this plugin does not support.
+
+Decoding was therefore checked on its own, with that run's package. Nine recorded LIBERO-goal action
+chunks were normalized with the checkpoint's training transforms, encoded with the package's FAST
+tokenizer (9 to 14 tokens each), and given to the inference worker as the language model's output.
+Its actions equalled FAST's decoding followed by StarVLA's unnormalization exactly, and matched the
+recorded chunks to a mean absolute error of 0.0097 (the actions average 0.24 in magnitude; the worst
+element was 0.063), which is FAST's quantization. The FAST code was the plugin's reviewed copy, its
+data came from the package, the token ids the worker decodes agree with the `<robot_action_N>` text
+used in training, and a sequence one token short gave the zero fallback. How well a fully trained
+QwenFast policy acts was not measured.
+
+### Reviewed remote code
+
+Some Hugging Face models and tokenizers ship their own Python code, which Transformers runs when
+`trust_remote_code=True`; StarVLA passes that flag. The workers replace Transformers' loader for such
+code: they answer requests only for files the plugin has reviewed and ships unmodified, in
+`_worker/remote_code/`, and refuse everything else. Today that is one file, FAST's
+`processing_action_tokenizer.py`. If a model folder holds its own copy, it must match the reviewed
+file's SHA-256, so a different revision is refused rather than run. Packages never contain Python.
+`_worker/remote_code/README.md` records the source, revision, licence, hash and review notes, and a
+unit test checks that the files and the pinned hashes agree.
 
 ## Co-training with VLM data
 
