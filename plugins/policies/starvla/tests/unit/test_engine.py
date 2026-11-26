@@ -30,8 +30,12 @@ def test_entry_point_and_pins() -> None:
 
 @pytest.mark.parametrize(
     "spec",
-    [*environments.POLICY_ENVIRONMENTS.values(), *environments.OPENVINO_EXPORT_ENVIRONMENTS.values()],
-    ids=lambda spec: spec.name,
+    [
+        *environments.POLICY_ENVIRONMENTS.values(),
+        *environments.OPENVINO_EXPORT_ENVIRONMENTS.values(),
+        *environments.QWEN35_ENVIRONMENTS.values(),
+    ],
+    ids=lambda spec: f"{spec.name}-{spec.policy}",
 )
 def test_duplicated_pins_agree(spec: environments.PolicyEnvironment) -> None:
     """Each framework's commit, version and environment are declared in several places; keep them in sync."""
@@ -68,7 +72,7 @@ def test_openvino_export_environment_only_adds_the_converter() -> None:
 def test_frameworks_with_the_same_dependencies_share_one_environment_and_there_is_no_default() -> None:
     assert engine.StarVLAEngine.env is None
     # QwenPI shares QwenGR00T's locked project, so the engine lists (and prepares) it once.
-    assert [env.name for env in engine.StarVLAEngine.environments()] == ["qwengr00t", "qwengr00t-openvino"]
+    assert [env.name for env in engine.StarVLAEngine.environments()] == ["qwengr00t", "qwengr00t-openvino", "qwen35"]
     assert engine.StarVLAEngine.environment_for_policy("QwenPI") == engine.StarVLAEngine.environment_for_policy(
         "QwenGR00T",
     )
@@ -260,7 +264,7 @@ def test_frameworks_without_a_conversion_export_native_packages_only(
 ) -> None:
     capabilities = engine.StarVLAEngine.capabilities(framework)
     assert capabilities.export_formats == ("native",)
-    assert capabilities.enablements == ()
+    assert capabilities.enablements == ("qwen35",)
     (checkpoint.parents[1] / "config.yaml").write_text(f"framework:\n  name: {framework}\n")
 
     native = engine.StarVLAEngine.export_native(
@@ -294,7 +298,7 @@ def test_openvino_export_is_an_enablement_with_its_own_environment() -> None:
     export = engine.StarVLAEngine.environment(environments.QWENGR00T_OPENVINO.name)
 
     assert set(capabilities.export_formats) == {"native", "openvino"}
-    assert capabilities.enablements == (environments.QWENGR00T_OPENVINO.name,)
+    assert set(capabilities.enablements) == {environments.QWENGR00T_OPENVINO.name, "qwen35"}
     assert export.worker == environments.OPENVINO_EXPORT_WORKER
     assert to_isolate_environment(export, "cu128").key() == environments.QWENGR00T_OPENVINO.environment.key()
 
@@ -361,3 +365,129 @@ def test_runtime_only_installs_prepare_through_isolate(monkeypatch: pytest.Monke
 
     assert environments.interpreter_path(environments.QWENGR00T) == tmp_path / "python"
     assert calls == [environments.QWENGR00T.environment]
+
+
+def test_qwen35_environment_only_moves_transformers() -> None:
+    """The Qwen3.5 project is the Qwen3-VL one on transformers 5; every other shared package keeps its version."""
+    locks = [
+        {p["name"]: p["version"] for p in tomllib.loads((Path(str(s.project)) / "uv.lock").read_text())["package"]}
+        for s in (environments.QWENGR00T, environments.QWENGR00T_QWEN35)
+    ]
+    shared = set(locks[0]) & set(locks[1])
+    assert {name for name in shared if locks[0][name] != locks[1][name]} == {"transformers", "huggingface-hub"}
+    assert locks[1]["transformers"] == "5.10.4"
+    assert set(locks[0]) - set(locks[1]) == {"physicalai-starvla-worker"}
+    assert set(locks[1]) - set(locks[0]) <= {
+        "physicalai-starvla-qwen35-worker",
+        "typer",
+        "shellingham",
+        "annotated-doc",
+    }
+
+
+def test_qwen35_is_an_enablement_with_its_own_environment() -> None:
+    env = engine.StarVLAEngine.environment("qwen35")
+    assert env.name == "qwen35"
+    assert to_isolate_environment(env, "cu128").key() == environments.QWENGR00T_QWEN35.environment.key()
+    assert env.pinned() == engine.StarVLAEngine.environment_for_policy("QwenGR00T").pinned()
+    # QwenPI and QwenOFT share it; QwenFast needs a Qwen3.5 "-Action" backbone StarVLA does not publish.
+    assert {spec.name for spec in environments.QWEN35_ENVIRONMENTS.values()} == {"qwen35"}
+    assert engine.StarVLAEngine.capabilities("QwenFast").enablements == ()
+    with pytest.raises(ValueError, match=r"'QwenFast' has no Qwen3\.5 environment; Qwen3\.5 supports"):
+        environments.for_policy("QwenFast", "qwen3_5")
+    with pytest.raises(ValueError, match="backbone type 'molmo2'"):
+        environments.for_policy("QwenGR00T", "molmo2")
+
+
+@pytest.mark.parametrize(
+    ("base_vlm", "expected"),
+    [
+        ("/models/Qwen3-VL-4B-Instruct", "qwen3_vl"),
+        ("/models/Qwen3.5-0.8B", "qwen3_5"),
+        ("/models/Qwen3-VL-2B/Qwen3.5-0.8B", "qwen3_vl"),  # StarVLA checks Qwen3-VL first.
+        ("/models/Qwen2.5-VL-3B", "qwen3_vl"),  # Another VLM: the default, which the worker refuses.
+        ("/home/nora/Qwen3.5-0.8B", "qwen3_vl"),  # StarVLA loads nora's Qwen2.5-VL wrapper first.
+        (None, "qwen3_vl"),
+    ],
+)
+def test_the_backbone_type_follows_starvlas_vlm_dispatch(base_vlm: str | None, expected: str) -> None:
+    assert environments.backbone_for_path(base_vlm) == expected
+
+
+@pytest.mark.parametrize("framework", ["QwenGR00T", "QwenPI", "QwenOFT"])
+def test_qwen35_backbones_train_in_their_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    framework: str,
+) -> None:
+    config = tmp_path / "train.yaml"
+    config.write_text(f"framework:\n  name: {framework}\n  qwenvl:\n    base_vlm: ./Qwen3-VL-4B-Instruct\n")
+    runner = Mock(return_value=Run("starvla", tmp_path, None))
+    monkeypatch.setattr(engine, "run_worker", runner)
+    call = Mock(return_value=0)
+    monkeypatch.setattr(engine.subprocess, "call", call)
+    prepared = Mock(return_value=Path("/worker/python"))
+    monkeypatch.setattr(environments, "interpreter_path", prepared)
+    override = "framework.qwenvl.base_vlm=/models/Qwen3.5-0.8B"
+
+    engine.StarVLAEngine.run(
+        {"config_yaml": str(config), "overrides": [override]},
+        dataset=tmp_path,
+        output_dir=tmp_path / "studio",
+        device="cuda",
+    )
+    engine.StarVLAEngine.cli(["--config_yaml", str(config), override])
+
+    args, kwargs = runner.call_args
+    assert args[0].name == "qwen35"
+    assert kwargs["extra_env"]["PHYSICALAI_STARVLA_BACKBONE"] == "qwen3_5"
+    assert kwargs["extra_env"]["PHYSICALAI_STARVLA_PROVENANCE"] == json.dumps(
+        environments.QWENGR00T_QWEN35.provenance(),
+    )
+    assert prepared.call_args.args[0] is environments.QWEN35_ENVIRONMENTS[framework]
+    assert call.call_args.kwargs["env"]["PHYSICALAI_STARVLA_BACKBONE"] == "qwen3_5"
+    # Without the override, the config's Qwen3-VL backbone keeps the default environment.
+    engine.StarVLAEngine.run({"config_yaml": str(config)}, dataset=tmp_path, output_dir=tmp_path / "vl", device="cuda")
+    assert runner.call_args.args[0].name == "qwengr00t"
+    assert runner.call_args.kwargs["extra_env"]["PHYSICALAI_STARVLA_BACKBONE"] == "qwen3_vl"
+
+
+def test_qwenfast_on_qwen35_is_refused_before_training(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = tmp_path / "train.yaml"
+    config.write_text("framework:\n  name: QwenFast\n  qwenvl:\n    base_vlm: /models/Qwen3.5-0.8B-Action\n")
+    runner = Mock()
+    monkeypatch.setattr(engine, "run_worker", runner)
+
+    with pytest.raises(ValueError, match=r"no Qwen3\.5 environment"):
+        engine.StarVLAEngine.run(
+            {"config_yaml": str(config)},
+            dataset=tmp_path,
+            output_dir=tmp_path / "o",
+            device="cuda",
+        )
+    runner.assert_not_called()
+
+
+def test_export_from_a_qwen35_run(checkpoint: Path, io: IoSpec, tmp_path: Path) -> None:
+    backbone = tmp_path / "Qwen3.5-0.8B"
+    backbone.mkdir()
+    (backbone / "config.json").write_text('{"model_type": "qwen3_5"}')
+    (backbone / "model.safetensors-00001-of-00001.safetensors").write_bytes(b"tiny fake backbone")
+    root = checkpoint.parents[1]
+    (root / "io.json").write_text(json.dumps({"cameras": io.cameras, "state": io.state, "action": io.action}))
+    record = {
+        "environment": environments.QWENGR00T.provenance(),
+        "backbone_path": str(backbone),
+        "unnorm_key": "franka",
+    }
+    (root / RUN_INFO).write_text(json.dumps(record))
+    with pytest.raises(ValueError, match="pins differ"):
+        engine.StarVLAEngine.export(Run("starvla", root, checkpoint), tmp_path / "stale")
+
+    (root / RUN_INFO).write_text(json.dumps({**record, "environment": environments.QWENGR00T_QWEN35.provenance()}))
+    exported = engine.StarVLAEngine.export(Run("starvla", root, checkpoint), tmp_path / "out")
+
+    descriptor = load_descriptor(exported / ARTIFACT)
+    assert descriptor["backbone"] == "Qwen3.5"
+    assert descriptor["environment"] == environments.QWENGR00T_QWEN35.provenance()
+    assert (exported / ARTIFACT / "Qwen3.5" / "model.safetensors-00001-of-00001.safetensors").is_file()

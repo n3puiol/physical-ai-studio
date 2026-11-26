@@ -21,7 +21,7 @@ from physicalai.inference.callbacks.base import Callback
 
 from . import environments
 from ._worker import starvla_worker_protocol as protocol
-from .package import IoSpec, load_descriptor
+from .package import IoSpec, load_descriptor, package_environment
 
 if TYPE_CHECKING:
     from physicalai.inference.model import InferenceModel
@@ -70,7 +70,7 @@ class StarVLARuntimeAdapter(RuntimeAdapter):
         artifact = Path(model_path).expanduser().resolve(strict=True)
         descriptor = load_descriptor(artifact)
         io = IoSpec.from_dict(descriptor["io"])
-        spec = environments.for_policy(descriptor["policy"])
+        spec = package_environment(descriptor)
         worker = _Worker(environments.interpreter_path(spec, self._interpreter))
         try:
             hello = worker.request({"op": "hello"})

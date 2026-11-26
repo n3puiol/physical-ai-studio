@@ -341,6 +341,47 @@ def test_qwenfast_trains_with_the_configured_fast_tokenizer(
     assert train_worker.cfg.framework.action_model.fast_tokenizer_path == str(tmp_path / "fast")
 
 
+def _qwen35(root: Path) -> Path:
+    folder = root / "Qwen3.5-0.8B"
+    folder.mkdir()
+    (folder / "config.json").write_text('{"model_type": "qwen3_5"}')
+    return folder
+
+
+def test_a_qwen35_backbone_trains_in_the_environment_chosen_for_it(
+    train_worker: SimpleNamespace,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    qwen35 = _qwen35(tmp_path)
+    qwen3_vl = train_worker.cfg.framework.qwenvl.base_vlm
+    train_worker.cfg.framework.qwenvl.base_vlm = str(qwen35)
+    # The Qwen3-VL environment (transformers 4) refuses it, as StarVLA's Qwen3.5 wrapper needs transformers 5.
+    with pytest.raises(ValueError, match="Use a local Qwen3-VL backbone"):
+        train_worker.worker.train(["--config_yaml", "unused.yaml"])
+
+    monkeypatch.setenv("PHYSICALAI_STARVLA_BACKBONE", "qwen3_5")
+    _, checkpoint = train_worker.worker.train(["--config_yaml", "unused.yaml"])
+    assert checkpoint.is_file()
+
+    train_worker.cfg.framework.qwenvl.base_vlm = qwen3_vl
+    with pytest.raises(ValueError, match=r"Use a local Qwen3\.5 backbone with Qwen3\.5 in its directory name"):
+        train_worker.worker.train(["--config_yaml", "unused.yaml"])
+
+
+def test_cotraining_needs_a_qwen3_vl_backbone(
+    cotraining: SimpleNamespace,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cotraining.cfg.framework.qwenvl.base_vlm = str(_qwen35(tmp_path))
+    monkeypatch.setenv("PHYSICALAI_STARVLA_BACKBONE", "qwen3_5")
+
+    with pytest.raises(ValueError, match="supports Qwen3-VL backbones"):
+        cotraining.worker.train(["--config_yaml", "unused.yaml"])
+    assert cotraining.saved == []
+
+
 def test_host_acknowledgement_reads_ack_cancel_and_closed(
     train_worker: SimpleNamespace,
     monkeypatch: pytest.MonkeyPatch,

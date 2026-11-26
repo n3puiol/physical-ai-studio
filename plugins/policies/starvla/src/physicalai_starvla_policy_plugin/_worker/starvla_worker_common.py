@@ -139,6 +139,26 @@ REVIEWED_REMOTE_CODE = {
 }
 # Files of a FAST action tokenizer folder (physical-intelligence/fast) that QwenFast needs at run time.
 FAST_TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "processor_config.json")
+# Backbones the plugin trains, by config model_type: the substring of the backbone path that makes
+# StarVLA load that VLM (its get_vlm_model), which packages also use as the backbone folder's name.
+# Qwen3.5 needs transformers 5, so it trains in its own worker environment.
+BACKBONES = {"qwen3_vl": "Qwen3-VL", "qwen3_5": "Qwen3.5"}
+DEFAULT_BACKBONE = "qwen3_vl"
+# The backbone type the host chose this worker environment for; the training worker refuses others.
+BACKBONE_VARIABLE = "PHYSICALAI_STARVLA_BACKBONE"
+
+
+def dispatched_backbone(path: str) -> str | None:
+    """Return the backbone type StarVLA's get_vlm_model loads for a ``base_vlm`` path.
+
+    Upstream picks the VLM by substrings of the path, in a fixed order; this follows that order.
+
+    Returns:
+        A key of ``BACKBONES``, or ``None`` when StarVLA would load another VLM.
+    """
+    if "Qwen2.5-VL" in path or "nora" in path.lower():  # Upstream checks these first.
+        return None
+    return next((model_type for model_type, name in BACKBONES.items() if name in path), None)
 
 
 def use_fast_tokenizer(folder: Path) -> None:

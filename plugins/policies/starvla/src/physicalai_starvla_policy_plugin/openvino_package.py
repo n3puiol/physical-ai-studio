@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import environments
 from ._worker import starvla_openvino_pipeline as pipeline
+from ._worker.starvla_worker_common import DEFAULT_BACKBONE
 from .package import ARTIFACT, IoSpec, contained_file, framework_from_config, write_package
 
 if TYPE_CHECKING:
@@ -89,7 +90,11 @@ def write_openvino_package(
     if image_size is not None and (len(image_size) != 2 or any(type(v) is not int or v <= 0 for v in image_size)):  # ruff: ignore[magic-value-comparison]
         msg = "image_size must be (height, width) in pixels."
         raise ValueError(msg)
-    # Refuse other frameworks before staging a native package, which copies the whole backbone.
+    # Refuse other frameworks and backbones before staging a native package, which copies the backbone.
+    backbone_config = Path(backbone).expanduser() / "config.json"
+    if backbone_config.is_file() and json.loads(backbone_config.read_text()).get("model_type") != DEFAULT_BACKBONE:
+        msg = "The OpenVINO export supports Qwen3-VL backbones."
+        raise ValueError(msg)
     run_config = checkpoint.expanduser().resolve().parents[1] / "config.yaml"
     if run_config.is_file():
         environments.for_openvino_export(framework_from_config(run_config) or "")

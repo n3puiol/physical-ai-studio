@@ -5,7 +5,8 @@ co-training with VLM data, and run exported checkpoints through Physical AI Runt
 live in a separate locked Python 3.11/CUDA 12.8 environment. Neither the host nor
 a Runtime-only install imports `physicalai-train` to perform inference.
 
-This integration supports single-GPU QwenGR00T, QwenPI, QwenOFT and QwenFast on Qwen3-VL, supervised
+This integration supports single-GPU QwenGR00T, QwenPI, QwenOFT and QwenFast on Qwen3-VL (QwenGR00T,
+QwenPI and QwenOFT also on Qwen3.5), supervised
 training and co-training with VLM data, upstream registered LeRobot dataset mixtures, one observation per camera, native safetensors
 packages (CUDA inference in the isolated worker), and, for QwenGR00T, OpenVINO packages
 (in-process inference on CPU or another OpenVINO device, without StarVLA or PyTorch). Other
@@ -20,13 +21,16 @@ From `library/`:
 uv sync --extra starvla
 uv run physicalai engine prepare starvla --policy QwenGR00T --accelerator cu128  # QwenPI, QwenOFT and QwenFast share it
 uv run physicalai engine prepare starvla --enablement qwengr00t-openvino  # OpenVINO conversion
+uv run physicalai engine prepare starvla --enablement qwen35  # Qwen3.5 backbones (transformers 5)
 uv run physicalai train starvla --help
 ```
 
 Each StarVLA framework maps to a locked worker project under
 `src/physicalai_starvla_policy_plugin/envs/<name>/`, declared in `environments.POLICY_ENVIRONMENTS`
 and mapped through `StarVLAEngine.policy_envs`. Training, export and Runtime pick the environment
-from `framework.name` in the training YAML (a `framework.name=...` override wins). Frameworks with
+from `framework.name` in the training YAML and the backbone StarVLA loads for
+`framework.qwenvl.base_vlm` (overrides win); Qwen3.5 backbones use their own environment (see
+[Qwen3.5 backbones](#qwen35-backbones)). Frameworks with
 the same dependencies share a project: QwenPI, QwenOFT and QwenFast use QwenGR00T's `envs/qwengr00t/`, so the engine
 lists and prepares it once. A framework that needs other dependencies gets its own project, so
 frameworks never share a resolution they were not locked for. There is no default environment: a
@@ -289,6 +293,70 @@ code: they answer requests only for files the plugin has reviewed and ships unmo
 file's SHA-256, so a different revision is refused rather than run. Packages never contain Python.
 `_worker/remote_code/README.md` records the source, revision, licence, hash and review notes, and a
 unit test checks that the files and the pinned hashes agree.
+
+## Qwen3.5 backbones
+
+StarVLA also builds QwenGR00T, QwenPI and QwenOFT on Qwen3.5, Qwen's natively multimodal models
+(0.8B to 9B); its own LIBERO QwenPI recipe uses Qwen3.5-0.8B. Qwen3.5 needs transformers 5, while the
+rest of the plugin is locked on transformers 4.57.1, so Qwen3.5 trains and runs in its own worker
+environment, `envs/qwen35`, which the engine declares as the enablement `qwen35`:
+
+```bash
+uv run physicalai engine prepare starvla --enablement qwen35
+```
+
+Its lock is the Qwen3-VL lock with transformers 5.10.4 and huggingface-hub 1.33.0, plus three small
+dependencies of transformers; every other package keeps its version. StarVLA suggests transformers
+5.3.0; 5.10.4 also clears that release's three known advisories.
+
+The engine picks the environment as StarVLA picks the VLM: a `framework.qwenvl.base_vlm` whose path
+contains `Qwen3.5` (and not `Qwen3-VL`, which StarVLA checks first) trains in `qwen35`, and the
+training worker checks that the backbone's `config.json` says `qwen3_5`. Packages keep the backbone
+in a `Qwen3.5` folder and record the `qwen35` pins, so Runtime runs them in the same environment.
+
+Not supported on Qwen3.5: QwenFast, which needs a Qwen3.5 backbone with StarVLA's action tokens that
+StarVLA does not publish; co-training, whose VLM data loader expects Qwen3-VL; and the OpenVINO
+export. The optional `flash-linear-attention` and `causal-conv1d` kernels are not installed, so
+Qwen3.5's linear-attention layers run transformers' PyTorch implementation; StarVLA notes that the
+fast kernels can change the results of older checkpoints.
+
+`configs/qwenpi_libero_qwen35.yaml` is a 20-step LIBERO smoke run of StarVLA's recipe. With this
+small backbone the whole model, VLM included, trains on a 24 GB GPU, as upstream trains it. For
+QwenGR00T or QwenOFT on Qwen3.5, override `framework.qwenvl.base_vlm` in their configs.
+
+```python
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    "Qwen/Qwen3.5-0.8B",
+    revision="2fc06364715b967f1860aea9cf38778875588b17",
+    allow_patterns=["*.safetensors", "*.json", "*.txt", "*.jinja"],
+    local_dir="/absolute/path/to/Qwen3.5-0.8B",
+)
+```
+
+```bash
+WANDB_MODE=disabled library/.venv/bin/physicalai train starvla \
+  --config_yaml plugins/policies/starvla/configs/qwenpi_libero_qwen35.yaml \
+  framework.qwenvl.base_vlm=/absolute/path/to/Qwen3.5-0.8B \
+  datasets.vla_data.data_root_dir=/absolute/path/to/datasets \
+  run_root_dir=/absolute/path/to/runs run_id=starvla-qwenpi-qwen35
+```
+
+Verified on one RTX 3090 with Qwen3.5-0.8B, 20 LIBERO-goal steps each through the engine:
+
+| Framework | What trains                              | Time | GPU memory | Loss        | Runtime vs StarVLA      |
+| --------- | ---------------------------------------- | ---- | ---------- | ----------- | ----------------------- |
+| QwenGR00T | action head (VLM frozen)                 | 24 s | 5.5 GB     | 1.32 → 1.23 | exact, 0.59 s per chunk |
+| QwenPI    | everything (`qwenpi_libero_qwen35.yaml`) | 29 s | 14.7 GB    | 1.49 → 1.47 | exact, 0.57 s per chunk |
+| QwenOFT   | action MLP (VLM frozen)                  | 15 s | 3.1 GB     | 0.67 → 0.41 | exact, 0.64 s per chunk |
+
+Each run recorded the `qwen35` pins, each package held a `Qwen3.5` folder, Runtime matched StarVLA's
+own `predict_action` exactly (maximum absolute difference `0.0`) on a real frame and repeated it
+exactly after a reset, and an OpenVINO export of the QwenGR00T run was refused. QwenPI starts near
+1.5 here, against about 5,200 at initialisation on Qwen3-VL (see [QwenPI](#qwenpi)), so that scale
+problem does not show up with this backbone; why was not measured. A Qwen3-VL-2B QwenGR00T run in
+the same session still trained in `qwengr00t`, matched StarVLA exactly and exported to OpenVINO.
 
 ## Co-training with VLM data
 

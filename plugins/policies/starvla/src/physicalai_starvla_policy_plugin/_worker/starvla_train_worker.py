@@ -25,9 +25,13 @@ if TYPE_CHECKING:
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from starvla_worker_common import (
+    BACKBONE_VARIABLE,
+    BACKBONES,
+    DEFAULT_BACKBONE,
     CancelledError,
     EventChannel,
     WorkerHandshakeError,
+    dispatched_backbone,
     finite_metrics,
     identity,
     restrict_remote_code,
@@ -90,16 +94,7 @@ def train(argv: list[str] | None = None) -> tuple[Path, Path]:  # ruff: ignore[t
     if not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", str(cfg.run_id)):
         msg = "run_id must use 1-64 letters, digits, underscores, or hyphens."
         raise ValueError(msg)
-    backbone = Path(cfg.framework.qwenvl.base_vlm).expanduser().resolve(strict=True)
-    if not (backbone / "config.json").is_file():
-        msg = "framework.qwenvl.base_vlm must point to a local materialized backbone."
-        raise ValueError(msg)
-    if (
-        "Qwen3-VL" not in str(backbone)
-        or json.loads((backbone / "config.json").read_text()).get("model_type") != "qwen3_vl"
-    ):
-        msg = "Use a local Qwen3-VL backbone with Qwen3-VL in its directory name (upstream VLM dispatch)."
-        raise ValueError(msg)
+    backbone = _check_backbone(Path(cfg.framework.qwenvl.base_vlm), cotraining=cotraining)
     cfg.framework.qwenvl.base_vlm = str(backbone)
     if cfg.framework.name == "QwenFast":
         _prepare_qwenfast(cfg, backbone)
@@ -237,6 +232,34 @@ def _import_cotrainer() -> Any:  # ruff: ignore[any-type]  # Upstream module.
     finally:
         accelerate.DeepSpeedPlugin = original
     return train_starvla_cotrain
+
+
+def _check_backbone(path: Path, *, cotraining: bool) -> Path:
+    """Check that StarVLA will load a local backbone as the type the host chose this environment for.
+
+    Returns:
+        The resolved backbone folder.
+
+    Raises:
+        ValueError: If the folder is not a local backbone of that type, or StarVLA would load another VLM.
+    """
+    backbone = path.expanduser().resolve(strict=True)
+    if not (backbone / "config.json").is_file():
+        msg = "framework.qwenvl.base_vlm must point to a local materialized backbone."
+        raise ValueError(msg)
+    # StarVLA picks the VLM by substrings of the path; the config says what the folder holds.
+    kind = os.environ.get(BACKBONE_VARIABLE, DEFAULT_BACKBONE)
+    name = BACKBONES.get(kind, kind)
+    if (
+        dispatched_backbone(str(backbone)) != kind
+        or json.loads((backbone / "config.json").read_text()).get("model_type") != kind
+    ):
+        msg = f"Use a local {name} backbone with {name} in its directory name (upstream VLM dispatch)."
+        raise ValueError(msg)
+    if cotraining and kind != DEFAULT_BACKBONE:
+        msg = "Co-training with VLM data supports Qwen3-VL backbones; StarVLA's VLM data loader needs one."
+        raise ValueError(msg)
+    return backbone
 
 
 def _prepare_qwenfast(cfg: Any, backbone: Path) -> None:  # ruff: ignore[any-type]  # OmegaConf node.

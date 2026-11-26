@@ -4,9 +4,10 @@
 """Pinned per-policy worker declarations, importable without physicalai-train or StarVLA.
 
 Each StarVLA framework (``framework.name`` in its training YAML) trains and runs in a locked
-worker project under ``envs/<name>/``. Frameworks with the same dependencies share a project;
-one that needs different dependencies gets its own, so they never share a resolution. A framework
-without an entry here is not supported.
+worker project under ``envs/<name>/``, chosen by the framework and the backbone type StarVLA loads
+for ``framework.qwenvl.base_vlm``. Frameworks with the same dependencies share a project; one that
+needs different dependencies gets its own, so they never share a resolution. A framework and
+backbone without an entry here are not supported.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from physicalai.isolate import BundledProject, Environment, SyncProfile, prepare
+
+from ._worker.starvla_worker_common import BACKBONES, DEFAULT_BACKBONE, dispatched_backbone
 
 if TYPE_CHECKING:
     from importlib.resources.abc import Traversable  # nosemgrep  # Python 3.10+ only.
@@ -47,6 +50,7 @@ class PolicyEnvironment:
     revision: str
     version: str
     worker: Traversable = TRAIN_WORKER
+    backbone: str = DEFAULT_BACKBONE
 
     @property
     def project(self) -> Traversable:
@@ -122,6 +126,19 @@ POLICY_ENVIRONMENTS: dict[str, PolicyEnvironment] = {
     spec.policy: spec for spec in (QWENGR00T, QWENPI, QWENOFT, QWENFAST)
 }
 
+# Qwen3.5 backbones: the same StarVLA commit on transformers 5. QwenFast is not declared: it needs a
+# Qwen3.5 backbone with StarVLA's action tokens ("-Action"), which StarVLA does not publish.
+QWEN35_BACKBONE = "qwen3_5"
+QWEN35_ENVIRONMENTS: dict[str, PolicyEnvironment] = {
+    policy: PolicyEnvironment(policy, "qwen35", QWENGR00T.revision, QWENGR00T.version, backbone=QWEN35_BACKBONE)
+    for policy in ("QwenGR00T", "QwenPI", "QwenOFT")
+}
+QWENGR00T_QWEN35 = QWEN35_ENVIRONMENTS["QwenGR00T"]
+BACKBONE_ENVIRONMENTS: dict[str, dict[str, PolicyEnvironment]] = {
+    DEFAULT_BACKBONE: POLICY_ENVIRONMENTS,
+    QWEN35_BACKBONE: QWEN35_ENVIRONMENTS,
+}
+
 # Conversion only: the training project plus OpenVINO and NNCF, with every shared package at the
 # same locked version. Kept separate so adding the converter never changes training pins.
 QWENGR00T_OPENVINO = PolicyEnvironment(
@@ -134,8 +151,8 @@ QWENGR00T_OPENVINO = PolicyEnvironment(
 OPENVINO_EXPORT_ENVIRONMENTS: dict[str, PolicyEnvironment] = {QWENGR00T_OPENVINO.policy: QWENGR00T_OPENVINO}
 
 
-def for_policy(policy: str | None) -> PolicyEnvironment:
-    """Return the worker environment for a StarVLA framework.
+def for_policy(policy: str | None, backbone: str = DEFAULT_BACKBONE) -> PolicyEnvironment:
+    """Return the worker environment for a StarVLA framework on a backbone type.
 
     With ``policy=None`` (e.g. ``--help`` without a config), the environment every framework
     shares is used.
@@ -144,15 +161,36 @@ def for_policy(policy: str | None) -> PolicyEnvironment:
         The framework's environment declaration.
 
     Raises:
-        ValueError: If the framework has no environment, or ``None`` is ambiguous.
+        ValueError: If the framework has no environment for the backbone, or ``None`` is ambiguous.
     """
-    if policy is None and len({spec.name for spec in POLICY_ENVIRONMENTS.values()}) == 1:
-        return next(iter(POLICY_ENVIRONMENTS.values()))
+    if backbone not in BACKBONE_ENVIRONMENTS:
+        msg = f"StarVLA backbone type {backbone!r} is not supported; supported: {', '.join(BACKBONE_ENVIRONMENTS)}."
+        raise ValueError(msg)
+    environments = BACKBONE_ENVIRONMENTS[backbone]
+    if policy is None and len({spec.name for spec in environments.values()}) == 1:
+        return next(iter(environments.values()))
+    if policy in environments:
+        return environments[policy]
     if policy in POLICY_ENVIRONMENTS:
-        return POLICY_ENVIRONMENTS[policy]
+        supported = ", ".join(sorted(environments))
+        name = BACKBONES[backbone]
+        msg = f"StarVLA framework {policy!r} has no {name} environment; {name} supports: {supported}."
+        raise ValueError(msg)
     supported = ", ".join(sorted(POLICY_ENVIRONMENTS))
     msg = f"StarVLA framework {policy!r} has no worker environment; supported: {supported}."
     raise ValueError(msg)
+
+
+def backbone_for_path(base_vlm: str | Path | None) -> str:
+    """Return the backbone type StarVLA loads for ``framework.qwenvl.base_vlm``, as its VLM dispatch does.
+
+    Paths StarVLA dispatches to another VLM get the default type; the worker then refuses them.
+
+    Returns:
+        A key of ``BACKBONE_ENVIRONMENTS``.
+    """
+    kind = dispatched_backbone(str(base_vlm)) if base_vlm else None
+    return kind if kind in BACKBONE_ENVIRONMENTS else DEFAULT_BACKBONE
 
 
 def for_openvino_export(policy: str) -> PolicyEnvironment:

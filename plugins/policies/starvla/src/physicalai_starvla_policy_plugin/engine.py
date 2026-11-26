@@ -17,8 +17,9 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from physicalai.engine import Enablement, Run, TrainingEngine, WorkerEnv, run_worker
 
 from . import environments
+from ._worker.starvla_worker_common import BACKBONE_VARIABLE
 from .openvino_package import write_openvino_package
-from .package import RUN_INFO, IoSpec, framework_from_config, write_package
+from .package import RUN_INFO, IoSpec, backbone_from_config, framework_from_config, write_package
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -39,14 +40,23 @@ OPENVINO_ENABLEMENTS = tuple(
     )
     for policy, spec in environments.OPENVINO_EXPORT_ENVIRONMENTS.items()
 )
+# Qwen3.5 backbones train and run in their own environment (transformers 5); the engine picks it
+# when StarVLA would load Qwen3.5 for framework.qwenvl.base_vlm.
+QWEN35_ENABLEMENT = Enablement(
+    name=environments.QWENGR00T_QWEN35.name,
+    provides={policy: {"backbone": (environments.QWEN35_BACKBONE,)} for policy in environments.QWEN35_ENVIRONMENTS},
+    upstream=f"https://github.com/starVLA/starVLA@{environments.QWENGR00T_QWEN35.revision} on transformers 5",
+    env=environments.QWENGR00T_QWEN35.worker_env(),
+)
 
 
 class StarVLAEngine(TrainingEngine):
     """Train StarVLA frameworks in per-framework worker environments and export them for Runtime.
 
     Each framework (``framework.name`` in the training YAML) maps to its own locked environment in
-    ``policy_envs``. There is no default environment: an unlisted framework is rejected rather than
-    run with another framework's dependencies.
+    ``policy_envs``; a Qwen3.5 backbone (``framework.qwenvl.base_vlm``) uses the ``qwen35``
+    enablement's environment instead. There is no default environment: an unlisted framework is
+    rejected rather than run with another framework's dependencies.
     """
 
     framework: ClassVar[str] = environments.FRAMEWORK
@@ -54,7 +64,7 @@ class StarVLAEngine(TrainingEngine):
     policy_envs: ClassVar[Mapping[str, WorkerEnv]] = MappingProxyType(
         {policy: spec.worker_env() for policy, spec in environments.POLICY_ENVIRONMENTS.items()},
     )
-    enablements: ClassVar[tuple[Enablement, ...]] = OPENVINO_ENABLEMENTS
+    enablements: ClassVar[tuple[Enablement, ...]] = (*OPENVINO_ENABLEMENTS, QWEN35_ENABLEMENT)
     training_accelerators: ClassVar[tuple[str, ...]] = (environments.ACCELERATOR,)
     stock_export_formats: ClassVar[tuple[str, ...]] = ("native",)
 
@@ -65,10 +75,11 @@ class StarVLAEngine(TrainingEngine):
         Returns:
             Native process exit code.
         """
-        policy = _policy_from_cli(argv)
-        spec = environments.for_policy(policy)
+        config, overrides = _config_from_cli(argv)
+        policy = framework_from_config(config, overrides)
+        spec = environments.for_policy(policy, backbone_from_config(config, overrides))
         python = environments.interpreter_path(spec, interpreter)
-        variables = {"PHYSICALAI_STARVLA_PROVENANCE": json.dumps(spec.provenance())}
+        variables = {"PHYSICALAI_STARVLA_PROVENANCE": json.dumps(spec.provenance()), BACKBONE_VARIABLE: spec.backbone}
         if policy is not None:
             variables[FRAMEWORK_VARIABLE] = spec.policy
         with resources.as_file(environments.TRAIN_WORKER) as worker:
@@ -114,11 +125,15 @@ class StarVLAEngine(TrainingEngine):
             raise ValueError(msg)
         device_variables = _device_env(device)
         config_yaml = Path(settings["config_yaml"]).expanduser().resolve(strict=True)
-        spec = environments.for_policy(framework_from_config(config_yaml, overrides) or "")
+        spec = environments.for_policy(
+            framework_from_config(config_yaml, overrides) or "",
+            backbone_from_config(config_yaml, overrides),
+        )
         variables = {
             **device_variables,
             "PHYSICALAI_STARVLA_PROVENANCE": json.dumps(spec.provenance()),
             FRAMEWORK_VARIABLE: spec.policy,
+            BACKBONE_VARIABLE: spec.backbone,
         }
         argv = [
             "--config_yaml",
@@ -129,7 +144,7 @@ class StarVLAEngine(TrainingEngine):
             f"run_id={output.name}",
         ]
         return run_worker(
-            cls.environment_for_policy(spec.policy),
+            spec.worker_env(),
             argv,
             device="cuda",
             accelerator="cu128",
@@ -156,7 +171,10 @@ class StarVLAEngine(TrainingEngine):
         checkpoint = _checkpoint(source)
         root = checkpoint.parents[1]
         record = json.loads((root / RUN_INFO).read_text())
-        spec = environments.for_policy(framework_from_config(root / "config.yaml") or "")
+        spec = environments.for_policy(
+            framework_from_config(root / "config.yaml") or "",
+            environments.backbone_for_path(record.get("backbone_path")),
+        )
         if record.get("environment") != spec.provenance():
             msg = f"Training record pins differ from the installed StarVLA {spec.policy} environment."
             raise ValueError(msg)
@@ -254,6 +272,15 @@ def _policy_from_cli(arguments: Sequence[str]) -> str | None:
     Returns:
         The framework name, or ``None`` without a readable config (e.g. ``--help``).
     """
+    return framework_from_config(*_config_from_cli(arguments))
+
+
+def _config_from_cli(arguments: Sequence[str]) -> tuple[str | None, list[str]]:
+    """Split a native command line into its readable ``--config_yaml`` and its dotlist overrides.
+
+    Returns:
+        The config path (``None`` if missing or unreadable) and the ``KEY=VALUE`` overrides.
+    """
     config: str | None = None
     overrides: list[str] = []
     remaining = iter(arguments)
@@ -266,7 +293,7 @@ def _policy_from_cli(arguments: Sequence[str]) -> str | None:
             overrides.append(argument)
     if config is not None and not Path(config).expanduser().is_file():
         config = None
-    return framework_from_config(config, overrides)
+    return config, overrides
 
 
 def _checkpoint(source: Run | str | Path) -> Path:

@@ -13,6 +13,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -381,6 +382,28 @@ def test_openvino_export_options_are_validated(
             unnorm_key="franka",
             **options,
         )
+
+
+def test_openvino_export_refuses_other_backbones_before_staging(
+    tmp_path: Path,
+    checkpoint: Path,
+    backbone: Path,
+    io: IoSpec,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (backbone / "config.json").write_text('{"model_type": "qwen3_5"}')
+    staged = Mock()
+    monkeypatch.setattr(openvino_package, "write_package", staged)
+
+    with pytest.raises(ValueError, match="Qwen3-VL backbones"):
+        openvino_package.write_openvino_package(
+            checkpoint,
+            tmp_path / "ov",
+            backbone=backbone,
+            io=io,
+            unnorm_key="franka",
+        )
+    staged.assert_not_called()
 
 
 def test_package_without_state_runs_without_it(

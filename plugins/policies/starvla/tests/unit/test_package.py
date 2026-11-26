@@ -10,8 +10,16 @@ from pathlib import Path
 import pytest
 from physicalai.inference.manifest import Manifest
 
+from physicalai_starvla_policy_plugin import environments
 from physicalai_starvla_policy_plugin._worker.starvla_worker_common import FAST_TOKENIZER_FILES, trained_with_state
-from physicalai_starvla_policy_plugin.package import ARTIFACT, BACKBONE_DIR, IoSpec, load_descriptor, write_package
+from physicalai_starvla_policy_plugin.package import (
+    ARTIFACT,
+    BACKBONE_DIR,
+    IoSpec,
+    load_descriptor,
+    package_environment,
+    write_package,
+)
 
 
 def test_package_roundtrip(package: Path, io: IoSpec) -> None:
@@ -141,7 +149,7 @@ def test_unsupported_backbones_and_package_folders_are_refused(
     package: Path,
 ) -> None:
     (backbone / "config.json").write_text('{"model_type": "florence2"}')
-    with pytest.raises(ValueError, match="requires a Qwen3-VL backbone"):
+    with pytest.raises(ValueError, match=r"requires a Qwen3-VL or Qwen3\.5 backbone"):
         write_package(checkpoint, tmp_path / "florence-export", backbone=backbone, io=io, unnorm_key="franka")
     path = package / ARTIFACT / "package.json"
     data = json.loads(path.read_text())
@@ -188,3 +196,31 @@ def test_a_qwenfast_package_carries_its_fast_tokenizer_data(
     (artifact / "FAST" / "tokenizer.json").unlink()
     with pytest.raises(ValueError, match="missing"):
         load_descriptor(artifact)
+
+
+def test_a_qwen35_package_runs_in_the_qwen35_environment(
+    tmp_path: Path,
+    checkpoint: Path,
+    backbone: Path,
+    io: IoSpec,
+) -> None:
+    (backbone / "config.json").write_text('{"model_type": "qwen3_5"}')
+    package = write_package(checkpoint, tmp_path / "qwen35", backbone=backbone, io=io, unnorm_key="franka")
+    artifact = package / ARTIFACT
+    descriptor = load_descriptor(artifact)
+
+    assert descriptor["backbone"] == "Qwen3.5"
+    assert package_environment(descriptor) is environments.QWENGR00T_QWEN35
+    # A package claiming the Qwen3-VL environment for a Qwen3.5 backbone is refused.
+    data = json.loads((artifact / "package.json").read_text())
+    (artifact / "package.json").write_text(json.dumps({**data, "environment": environments.QWENGR00T.provenance()}))
+    with pytest.raises(ValueError, match="pins differ"):
+        load_descriptor(artifact)
+
+
+def test_qwenfast_is_not_packaged_on_qwen35(tmp_path: Path, checkpoint: Path, backbone: Path, io: IoSpec) -> None:
+    (backbone / "config.json").write_text('{"model_type": "qwen3_5"}')
+    (checkpoint.parents[1] / "config.yaml").write_text("framework:\n  name: QwenFast\n")
+
+    with pytest.raises(ValueError, match=r"no Qwen3\.5 environment"):
+        write_package(checkpoint, tmp_path / "fast35", backbone=backbone, io=io, unnorm_key="franka")

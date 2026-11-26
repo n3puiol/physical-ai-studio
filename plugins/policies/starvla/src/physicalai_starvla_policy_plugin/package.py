@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import environments
-from ._worker.starvla_worker_common import FAST_TOKENIZER_FILES, trained_with_state
+from ._worker.starvla_worker_common import BACKBONES, DEFAULT_BACKBONE, FAST_TOKENIZER_FILES, trained_with_state
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -21,11 +21,12 @@ if TYPE_CHECKING:
 BACKEND = "starvla"
 ARTIFACT = "policy.starvla"
 RUN_INFO = "physicalai_run.json"
-# StarVLA picks its VLM implementation by this substring of the backbone path.
-BACKBONE_DIR = "Qwen3-VL"
+# StarVLA picks its VLM implementation by a substring of the backbone path (BACKBONES); packages name
+# the backbone folder after it and record that name as "backbone" in package.json. Packages without
+# the field hold Qwen3-VL.
+BACKBONE_DIR = BACKBONES[DEFAULT_BACKBONE]
 # StarVLA also reads this marker in the backbone path: it enables the action tokens of StarVLA's
-# "-Action" backbones, which QwenFast predicts. Packages keep it in the backbone folder's name and
-# record that name as "backbone" in package.json (packages without the field hold Qwen3-VL).
+# "-Action" backbones, which QwenFast predicts. Packages keep it in the backbone folder's name.
 ACTION_MARKER = "-Action"
 # QwenFast packages carry their FAST action tokenizer's data files (never its code) in this folder.
 FAST_DIR = "FAST"
@@ -106,24 +107,53 @@ class IoSpec:
         return cls(**value)
 
 
+def config_value(config_yaml: str | Path | None, overrides: Sequence[str], key: str) -> str | None:
+    """Return a dotted string setting from a StarVLA YAML file, letting ``KEY=VALUE`` overrides win.
+
+    Returns:
+        The value, or ``None`` when neither the overrides nor the file set a non-empty string.
+    """
+    for token in reversed(overrides):
+        name, _, value = token.removeprefix("--").partition("=")
+        if name == key and value.strip():
+            return value.strip().strip("'\"")
+    if config_yaml is None:
+        return None
+    import yaml  # ruff: ignore[import-outside-top-level]  # Only needed when reading training configs.
+
+    data: object = yaml.safe_load(Path(config_yaml).expanduser().read_text(encoding="utf-8"))
+    for part in key.split("."):
+        data = data.get(part) if isinstance(data, dict) else None
+    return data if isinstance(data, str) and data else None
+
+
 def framework_from_config(config_yaml: str | Path | None, overrides: Sequence[str] = ()) -> str | None:
     """Return ``framework.name`` from a StarVLA YAML file, letting ``framework.name=...`` overrides win.
 
     Returns:
         The framework name, or ``None`` when neither the overrides nor the file set one.
     """
-    for token in reversed(overrides):
-        key, _, value = token.removeprefix("--").partition("=")
-        if key == "framework.name" and value.strip():
-            return value.strip().strip("'\"")
-    if config_yaml is None:
-        return None
-    import yaml  # ruff: ignore[import-outside-top-level]  # Only needed when reading training configs.
+    return config_value(config_yaml, overrides, "framework.name")
 
-    data = yaml.safe_load(Path(config_yaml).expanduser().read_text(encoding="utf-8"))
-    framework = data.get("framework") if isinstance(data, dict) else None
-    name = framework.get("name") if isinstance(framework, dict) else None
-    return name if isinstance(name, str) and name else None
+
+def backbone_from_config(config_yaml: str | Path | None, overrides: Sequence[str] = ()) -> str:
+    """Return the backbone type StarVLA loads for a training config's ``framework.qwenvl.base_vlm``.
+
+    Returns:
+        A key of ``environments.BACKBONE_ENVIRONMENTS``.
+    """
+    return environments.backbone_for_path(config_value(config_yaml, overrides, "framework.qwenvl.base_vlm"))
+
+
+def package_environment(descriptor: dict[str, Any]) -> environments.PolicyEnvironment:
+    """Return the worker environment a validated package runs in: its framework on its backbone type.
+
+    Returns:
+        The environment declaration.
+    """
+    folder = str(descriptor.get("backbone", BACKBONE_DIR)).removesuffix(ACTION_MARKER)
+    kind = next((model_type for model_type, name in BACKBONES.items() if name == folder), DEFAULT_BACKBONE)
+    return environments.for_policy(descriptor["policy"], kind)
 
 
 def checkpoint_uses_state(config_yaml: Path) -> bool:
@@ -177,7 +207,11 @@ def load_descriptor(artifact: Path) -> dict[str, Any]:
     ):
         msg = "Unsupported StarVLA package descriptor."
         raise ValueError(msg)
-    if descriptor.get("environment") != environments.for_policy(descriptor["policy"]).provenance():
+    backbone = descriptor.get("backbone", BACKBONE_DIR)
+    if backbone not in {name + suffix for name in BACKBONES.values() for suffix in ("", ACTION_MARKER)}:
+        msg = "Unsupported StarVLA package backbone."
+        raise ValueError(msg)
+    if descriptor.get("environment") != package_environment(descriptor).provenance():
         msg = "StarVLA environment pins differ; install the plugin version that exported this package."
         raise ValueError(msg)
     if not isinstance(descriptor.get("unnorm_key"), str) or not descriptor["unnorm_key"]:
@@ -190,10 +224,6 @@ def load_descriptor(artifact: Path) -> dict[str, Any]:
         raise ValueError(msg)
     contained_file(artifact, "model/config.yaml")
     contained_file(artifact, "model/dataset_statistics.json")
-    backbone = descriptor.get("backbone", BACKBONE_DIR)
-    if backbone not in {BACKBONE_DIR, BACKBONE_DIR + ACTION_MARKER}:
-        msg = "Unsupported StarVLA package backbone."
-        raise ValueError(msg)
     contained_file(artifact, f"{backbone}/config.json")
     if descriptor["policy"] == "QwenFast":
         if descriptor.get("fast_tokenizer") != FAST_DIR:
@@ -233,15 +263,15 @@ def write_package(
     run_dir = checkpoint.parents[1]
     for name in ("config.yaml", "dataset_statistics.json"):
         contained_file(run_dir, name)
-    spec = environments.for_policy(framework_from_config(run_dir / "config.yaml") or "")
+    backbone = backbone.expanduser().resolve(strict=True)
+    kind, folder = _backbone_folder(backbone)
+    spec = environments.for_policy(framework_from_config(run_dir / "config.yaml") or "", kind)
     if not checkpoint_uses_state(run_dir / "config.yaml"):
         io = replace(io, state={})
     stats = json.loads((run_dir / "dataset_statistics.json").read_text())
     if not isinstance(stats, dict) or unnorm_key not in stats:
         msg = "unnorm_key is not present in the checkpoint's dataset statistics."
         raise ValueError(msg)
-    backbone = backbone.expanduser().resolve(strict=True)
-    folder = _backbone_folder(backbone)
     fast = _fast_tokenizer(run_dir / "config.yaml") if spec.policy == "QwenFast" else None
     if not any(backbone.glob("*.safetensors")):
         msg = "The local backbone must contain safetensors weights."
@@ -281,22 +311,23 @@ def write_package(
     return output
 
 
-def _backbone_folder(backbone: Path) -> str:
-    """Name the package folder for a backbone.
+def _backbone_folder(backbone: Path) -> tuple[str, str]:
+    """Return a backbone's type and the package folder named for it.
 
     StarVLA selects the VLM implementation, and enables action tokens, by substrings of its path.
 
     Returns:
-        The folder name, keeping StarVLA's "-Action" marker.
+        The backbone's ``model_type`` and the folder name, keeping StarVLA's "-Action" marker.
 
     Raises:
-        ValueError: If the backbone is not Qwen3-VL.
+        ValueError: If the backbone is not a supported type.
     """
     config = json.loads(contained_file(backbone, "config.json").read_text())
-    if not isinstance(config, dict) or config.get("model_type") != "qwen3_vl":
-        msg = "This plugin requires a Qwen3-VL backbone."
+    kind = config.get("model_type") if isinstance(config, dict) else None
+    if kind not in BACKBONES:
+        msg = "This plugin requires a Qwen3-VL or Qwen3.5 backbone."
         raise ValueError(msg)
-    return BACKBONE_DIR + (ACTION_MARKER if ACTION_MARKER in backbone.name else "")
+    return kind, BACKBONES[kind] + (ACTION_MARKER if ACTION_MARKER in backbone.name else "")
 
 
 def _fast_tokenizer(config_yaml: Path) -> Path:
