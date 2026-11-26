@@ -146,6 +146,16 @@ BACKBONES = {"qwen3_vl": "Qwen3-VL", "qwen3_5": "Qwen3.5"}
 DEFAULT_BACKBONE = "qwen3_vl"
 # The backbone type the host chose this worker environment for; the training worker refuses others.
 BACKBONE_VARIABLE = "PHYSICALAI_STARVLA_BACKBONE"
+# Backbones StarVLA's path dispatch accepts but its VLA frameworks cannot load, by config model_type.
+# StarVLA loads every "Qwen3-VL" path with the dense Qwen3VLForConditionalGeneration (at the pinned
+# commit and on starVLA_dev as of 2026-11-26). Given a Qwen3-VL MoE checkpoint, transformers only
+# warns: the dense MLP weights stay randomly initialized and the experts and routers are dropped.
+UNSUPPORTED_BACKBONES = {
+    "qwen3_vl_moe": (
+        "Qwen3-VL MoE backbones are not supported: StarVLA loads every Qwen3-VL with its dense model class, "
+        "which would drop the experts and leave the MLP weights randomly initialized."
+    ),
+}
 
 
 # World-model backbones (StarVLA's WM4A frameworks), by backbone type: the package folder name, which
@@ -219,6 +229,16 @@ def dispatched_backbone(path: str) -> str | None:
     if "Qwen2.5-VL" in path or "nora" in path.lower():  # Upstream checks these first.
         return None
     return next((model_type for model_type, name in BACKBONES.items() if name in path), None)
+
+
+def unsupported_backbone(config: object) -> str | None:
+    """Say why StarVLA cannot use a backbone, given its parsed ``config.json``, if it is a known case.
+
+    Returns:
+        The reason from ``UNSUPPORTED_BACKBONES``, or ``None``.
+    """
+    model_type = config.get("model_type") if isinstance(config, dict) else None
+    return UNSUPPORTED_BACKBONES.get(model_type) if isinstance(model_type, str) else None
 
 
 def use_fast_tokenizer(folder: Path) -> None:

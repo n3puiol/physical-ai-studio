@@ -159,6 +159,14 @@ def test_unsupported_backbones_and_package_folders_are_refused(
         load_descriptor(path.parent)
 
 
+def test_qwen3_vl_moe_backbones_are_refused(tmp_path: Path, checkpoint: Path, backbone: Path, io: IoSpec) -> None:
+    (backbone / "config.json").write_text('{"model_type": "qwen3_vl_moe"}')
+
+    with pytest.raises(ValueError, match="Qwen3-VL MoE backbones are not supported"):
+        write_package(checkpoint, tmp_path / "moe-export", backbone=backbone, io=io, unnorm_key="franka")
+    assert not (tmp_path / "moe-export").exists()
+
+
 @pytest.fixture
 def fast(tmp_path: Path) -> Path:
     # A FAST tokenizer folder as downloaded from physical-intelligence/fast, code included.

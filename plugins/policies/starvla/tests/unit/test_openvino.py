@@ -384,18 +384,24 @@ def test_openvino_export_options_are_validated(
         )
 
 
+@pytest.mark.parametrize(
+    ("model_type", "match"),
+    [("qwen3_5", "export supports Qwen3-VL backbones"), ("qwen3_vl_moe", "Qwen3-VL MoE backbones are not supported")],
+)
 def test_openvino_export_refuses_other_backbones_before_staging(
     tmp_path: Path,
     checkpoint: Path,
     backbone: Path,
     io: IoSpec,
     monkeypatch: pytest.MonkeyPatch,
+    model_type: str,
+    match: str,
 ) -> None:
-    (backbone / "config.json").write_text('{"model_type": "qwen3_5"}')
+    (backbone / "config.json").write_text(json.dumps({"model_type": model_type}))
     staged = Mock()
     monkeypatch.setattr(openvino_package, "write_package", staged)
 
-    with pytest.raises(ValueError, match="Qwen3-VL backbones"):
+    with pytest.raises(ValueError, match=match):
         openvino_package.write_openvino_package(
             checkpoint,
             tmp_path / "ov",

@@ -20,6 +20,7 @@ from ._worker.starvla_worker_common import (
     WORLD_MODEL_FRAMEWORKS,
     WORLD_MODELS,
     trained_with_state,
+    unsupported_backbone,
     world_model_problem,
 )
 
@@ -361,6 +362,9 @@ def _backbone_folder(backbone: Path, policy: str) -> tuple[str, str]:
             raise ValueError(msg)
         return kind, WORLD_MODELS[kind][0]
     config = json.loads(contained_file(backbone, "config.json").read_text())
+    problem = unsupported_backbone(config)
+    if problem is not None:
+        raise ValueError(problem)
     model_type = config.get("model_type") if isinstance(config, dict) else None
     if model_type not in BACKBONES:
         msg = "This plugin requires a Qwen3-VL or Qwen3.5 backbone."

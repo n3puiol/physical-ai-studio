@@ -14,6 +14,12 @@ packages (CUDA inference in the isolated worker), and, for QwenGR00T, OpenVINO p
 StarVLA frameworks, custom executable dataset registrations, DeepSpeed, multi-machine training
 and ONNX conversion are not enabled. Training requires CUDA.
 
+InternVL and Qwen3-VL MoE backbones are not supported, because StarVLA's VLA frameworks do not
+support them (at the pinned commit, and on `starVLA_dev` as of 2026-11-26). StarVLA has no InternVL
+backbone. It loads every Qwen3-VL path with its dense model class, so a Qwen3-VL MoE checkpoint would
+lose its experts and keep randomly initialized MLP weights, with only a warning from transformers. The
+plugin refuses Qwen3-VL MoE folders (`model_type` `qwen3_vl_moe`) before training and at export.
+
 ## Install and prepare
 
 From `library/`:

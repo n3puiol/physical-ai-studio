@@ -48,6 +48,7 @@ from starvla_worker_common import (
     identity,
     restrict_remote_code,
     start_cancel_listener,
+    unsupported_backbone,
     use_fast_tokenizer,
     wait_for_host_acknowledgement,
     world_model_problem,
@@ -398,13 +399,14 @@ def _check_backbone(path: Path, *, cotraining: bool) -> Path:
     if not (backbone / "config.json").is_file():
         msg = "framework.qwenvl.base_vlm must point to a local materialized backbone."
         raise ValueError(msg)
+    config = json.loads((backbone / "config.json").read_text())
+    problem = unsupported_backbone(config)
+    if problem is not None:
+        raise ValueError(problem)
     # StarVLA picks the VLM by substrings of the path; the config says what the folder holds.
     kind = os.environ.get(BACKBONE_VARIABLE, DEFAULT_BACKBONE)
     name = BACKBONES.get(kind, kind)
-    if (
-        dispatched_backbone(str(backbone)) != kind
-        or json.loads((backbone / "config.json").read_text()).get("model_type") != kind
-    ):
+    if dispatched_backbone(str(backbone)) != kind or config.get("model_type") != kind:
         msg = f"Use a local {name} backbone with {name} in its directory name (upstream VLM dispatch)."
         raise ValueError(msg)
     if cotraining and kind != DEFAULT_BACKBONE:

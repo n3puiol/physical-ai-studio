@@ -369,6 +369,18 @@ def test_a_qwen35_backbone_trains_in_the_environment_chosen_for_it(
         train_worker.worker.train(["--config_yaml", "unused.yaml"])
 
 
+def test_a_qwen3_vl_moe_backbone_is_refused_before_training(train_worker: SimpleNamespace, tmp_path: Path) -> None:
+    # Its path dispatches to StarVLA's Qwen3-VL wrapper, which would load it as a dense model without its experts.
+    moe = tmp_path / "Qwen3-VL-30B-A3B-Instruct"
+    moe.mkdir()
+    (moe / "config.json").write_text('{"model_type": "qwen3_vl_moe"}')
+    train_worker.cfg.framework.qwenvl.base_vlm = str(moe)
+
+    with pytest.raises(ValueError, match="Qwen3-VL MoE backbones are not supported"):
+        train_worker.worker.train(["--config_yaml", "unused.yaml"])
+    train_worker.trainer._train_step.assert_not_called()
+
+
 def test_cotraining_needs_a_qwen3_vl_backbone(
     cotraining: SimpleNamespace,
     tmp_path: Path,

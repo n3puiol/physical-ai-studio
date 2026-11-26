@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import environments
 from ._worker import starvla_openvino_pipeline as pipeline
-from ._worker.starvla_worker_common import DEFAULT_BACKBONE
+from ._worker.starvla_worker_common import DEFAULT_BACKBONE, unsupported_backbone
 from .package import ARTIFACT, IoSpec, contained_file, framework_from_config, write_package
 
 if TYPE_CHECKING:
@@ -59,6 +59,21 @@ def load_openvino_descriptor(artifact: Path) -> dict[str, Any]:
     return descriptor
 
 
+def _check_backbone(config_file: Path) -> None:
+    """Refuse a backbone the OpenVINO export cannot convert; a missing config is left to the native export.
+
+    Raises:
+        ValueError: If the backbone is not Qwen3-VL, or is a type StarVLA cannot load.
+    """
+    config = json.loads(config_file.read_text(encoding="utf-8")) if config_file.is_file() else None
+    problem = unsupported_backbone(config)
+    if problem is not None:
+        raise ValueError(problem)
+    if config is not None and config.get("model_type") != DEFAULT_BACKBONE:
+        msg = "The OpenVINO export supports Qwen3-VL backbones."
+        raise ValueError(msg)
+
+
 def write_openvino_package(
     checkpoint: Path,
     output: Path,
@@ -94,10 +109,7 @@ def write_openvino_package(
     run_config = checkpoint.expanduser().resolve().parents[1] / "config.yaml"
     if run_config.is_file():
         environments.for_openvino_export(framework_from_config(run_config) or "")
-    backbone_config = Path(backbone).expanduser() / "config.json"
-    if backbone_config.is_file() and json.loads(backbone_config.read_text()).get("model_type") != DEFAULT_BACKBONE:
-        msg = "The OpenVINO export supports Qwen3-VL backbones."
-        raise ValueError(msg)
+    _check_backbone(Path(backbone).expanduser() / "config.json")
     output = output.expanduser().absolute()
     if output.exists() or output.is_symlink():
         msg = "Export destination already exists."
