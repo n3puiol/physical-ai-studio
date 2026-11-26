@@ -148,6 +148,33 @@ DEFAULT_BACKBONE = "qwen3_vl"
 BACKBONE_VARIABLE = "PHYSICALAI_STARVLA_BACKBONE"
 
 
+# World-model backbones (StarVLA's WM4A frameworks), by backbone type: the package folder name, which
+# carries the substring StarVLA's get_world_model dispatches on (case-insensitively), and the
+# diffusers pipeline class the folder's model_index.json names. Wan2.2 is not wired: its weights
+# alone fill a 24 GB GPU.
+WORLD_MODELS = {"cosmos_predict2": ("Cosmos-Predict2", "Cosmos2VideoToWorldPipeline")}
+# The world-model frameworks the plugin trains, and the backbone type each is built for.
+WORLD_MODEL_FRAMEWORKS = {
+    "CosmoPredict2GR00T": "cosmos_predict2",
+    "CosmoPredict2OFT": "cosmos_predict2",
+    "CosmoPredict2PI": "cosmos_predict2",
+}
+
+
+def dispatched_world_model(path: str) -> str | None:
+    """Return the world-model type StarVLA's get_world_model loads for a ``base_wm`` path.
+
+    Returns:
+        A key of ``WORLD_MODELS``, or ``None`` when StarVLA would load another model.
+    """
+    name = path.lower()
+    if "cosmos-reason2" in name:  # Upstream checks this first; it is a Qwen3-VL model.
+        return None
+    if "cosmos-predict2" in name:
+        return "cosmos_predict2"
+    return None
+
+
 def dispatched_backbone(path: str) -> str | None:
     """Return the backbone type StarVLA's get_vlm_model loads for a ``base_vlm`` path.
 

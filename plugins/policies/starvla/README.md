@@ -6,7 +6,8 @@ live in a separate locked Python 3.11/CUDA 12.8 environment. Neither the host no
 a Runtime-only install imports `physicalai-train` to perform inference.
 
 This integration supports QwenGR00T, QwenPI, QwenOFT and QwenFast on Qwen3-VL (QwenGR00T, QwenPI and
-QwenOFT also on Qwen3.5), on one GPU or data-parallel on all visible GPUs of one machine, supervised
+QwenOFT also on Qwen3.5), StarVLA's world-model frameworks on Cosmos-Predict2 (CosmoPredict2GR00T,
+CosmoPredict2OFT and CosmoPredict2PI), on one GPU or data-parallel on all visible GPUs of one machine, supervised
 training and co-training with VLM data, upstream registered LeRobot dataset mixtures, one observation per camera, native safetensors
 packages (CUDA inference in the isolated worker), and, for QwenGR00T, OpenVINO packages
 (in-process inference on CPU or another OpenVINO device, without StarVLA or PyTorch). Other
@@ -19,7 +20,7 @@ From `library/`:
 
 ```bash
 uv sync --extra starvla
-uv run physicalai engine prepare starvla --policy QwenGR00T --accelerator cu128  # QwenPI, QwenOFT and QwenFast share it
+uv run physicalai engine prepare starvla --policy QwenGR00T --accelerator cu128  # shared by every framework but on Qwen3.5
 uv run physicalai engine prepare starvla --enablement qwengr00t-openvino  # OpenVINO conversion
 uv run physicalai engine prepare starvla --enablement qwen35  # Qwen3.5 backbones (transformers 5)
 uv run physicalai train starvla --help
@@ -31,7 +32,7 @@ and mapped through `StarVLAEngine.policy_envs`. Training, export and Runtime pic
 from `framework.name` in the training YAML and the backbone StarVLA loads for
 `framework.qwenvl.base_vlm` (overrides win); Qwen3.5 backbones use their own environment (see
 [Qwen3.5 backbones](#qwen35-backbones)). Frameworks with
-the same dependencies share a project: QwenPI, QwenOFT and QwenFast use QwenGR00T's `envs/qwengr00t/`, so the engine
+the same dependencies share a project: QwenPI, QwenOFT, QwenFast and the Cosmos-Predict2 frameworks use QwenGR00T's `envs/qwengr00t/`, so the engine
 lists and prepares it once. A framework that needs other dependencies gets its own project, so
 frameworks never share a resolution they were not locked for. There is no default environment: a
 framework without an entry is rejected, and the training worker refuses a config whose
@@ -357,6 +358,84 @@ exactly after a reset, and an OpenVINO export of the QwenGR00T run was refused. 
 1.5 here, against about 5,200 at initialisation on Qwen3-VL (see [QwenPI](#qwenpi)), so that scale
 problem does not show up with this backbone; why was not measured. A Qwen3-VL-2B QwenGR00T run in
 the same session still trained in `qwengr00t`, matched StarVLA exactly and exported to OpenVINO.
+
+## Cosmos-Predict2 world models
+
+StarVLA's world-model frameworks put its GR00T, OFT and PI action heads on a video world model
+instead of a VLM: CosmoPredict2GR00T, CosmoPredict2OFT and CosmoPredict2PI read their visual features
+from Cosmos-Predict2-2B, NVIDIA's video-to-world diffusion model (a T5 text encoder, a Wan VAE and a
+video DiT whose last block feeds the head). The pinned wheel runs them with QwenGR00T's dependencies,
+so they use the same environment.
+
+The world model is `framework.world_model.base_wm`, not `framework.qwenvl.base_vlm`: a local copy of
+the diffusers folder of `nvidia/Cosmos-Predict2-2B-Video2World`. Its path must contain
+`Cosmos-Predict2` (any case), the substring StarVLA picks the model by, and the training worker
+checks that its `model_index.json` names a `Cosmos2VideoToWorldPipeline`. The model is gated: accept
+NVIDIA's Open Model License on its Hugging Face page first. Packages contain its weights, so the
+licence applies to them too. Download only the parts StarVLA loads (about 14 GB; the repository also
+holds about 24 GB of original checkpoints):
+
+```python
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    "nvidia/Cosmos-Predict2-2B-Video2World",
+    revision="f50c09f5d8ab133a90cac3f4886a6471e9ba3f18",
+    allow_patterns=[
+        "model_index.json",
+        "config.json",
+        "scheduler/*",
+        "text_encoder/*",
+        "tokenizer/*.json",
+        "tokenizer/*.model",
+        "tokenizer/*.txt",
+        "transformer/*",
+        "vae/*",
+    ],
+    local_dir="/absolute/path/to/Cosmos-Predict2-2B-Video2World",
+)
+```
+
+```bash
+WANDB_MODE=disabled library/.venv/bin/physicalai train starvla \
+  --config_yaml plugins/policies/starvla/configs/cosmopredict2groot_libero.yaml \
+  framework.world_model.base_wm=/absolute/path/to/Cosmos-Predict2-2B-Video2World \
+  datasets.vla_data.data_root_dir=/absolute/path/to/datasets \
+  run_root_dir=/absolute/path/to/runs run_id=starvla-cosmos
+```
+
+`configs/cosmopredict2groot_libero.yaml` is a 20-step LIBERO smoke run with the world model frozen,
+so only the action head trains; CosmoPredict2OFT takes it with `framework.name=CosmoPredict2OFT`.
+`configs/cosmopredict2pi_libero.yaml` also freezes the PI head's DiT blocks (one per world-model
+layer), which do not fit 24 GB next to the world model, and it sets the head's DiT shape: StarVLA's
+layer-wise head reads its depth and width only from `action_model.diffusion_model_cfg`, which QwenPI
+fills from its backbone but CosmoPredict2PI does not (at the pinned commit, and on `starVLA_dev` as
+of 2026-11-18), so the head would otherwise build 36 blocks for Cosmos-Predict2-2B's 28 and fail at
+the first step. The config sets 28 blocks of width 2048, as QwenPI would. StarVLA's own recipes
+train everything on 8 GPUs with DeepSpeed.
+
+StarVLA's world-model wrapper resizes every camera image to 320×576 and feeds the cameras as frames
+of one short video, and it samples the VAE's latent distribution, so a prediction depends on the
+seed; Runtime seeds it the same way as StarVLA's own server. Packages keep the world model in a
+`Cosmos-Predict2` folder (`model_index.json` and its parts) and, as for every framework, a checkpoint
+that holds the whole model again. Co-training and the OpenVINO export are refused. Wan2.2, StarVLA's
+other world model, is not wired: its weights alone take about 23 GB in bf16, more than a 24 GB GPU
+holds with anything else.
+
+Verified on one RTX 3090 with Cosmos-Predict2-2B (revision `f50c09f5`), 20 LIBERO-goal steps each
+through the engine:
+
+| Framework          | What trains                | Time | GPU memory | Loss        | Runtime vs StarVLA      |
+| ------------------ | -------------------------- | ---- | ---------- | ----------- | ----------------------- |
+| CosmoPredict2GR00T | action head                | 33 s | 17.2 GB    | 1.29 → 1.28 | exact, 0.64 s per chunk |
+| CosmoPredict2OFT   | action MLP                 | 30 s | 16.0 GB    | 0.73 → 0.64 | exact, 0.70 s per chunk |
+| CosmoPredict2PI    | head encoders and decoders | 48 s | 21.9 GB    | 24.9 → 28.3 | exact, 0.75 s per chunk |
+
+Each package held the world model's diffusers folder (14.2 GB, without the repository's original
+checkpoints or download metadata) and the checkpoint (14.3 to 20.8 GB), and no Python. Runtime
+matched StarVLA's own `predict_action` exactly on a real frame and repeated it exactly after a reset,
+and the OpenVINO export was refused. CosmoPredict2PI's loss starts near 25, far above the other two
+heads, much as QwenPI's does on Qwen3-VL (see [QwenPI](#qwenpi)); its cause was not investigated.
 
 ## Co-training with VLM data
 

@@ -13,7 +13,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import environments
-from ._worker.starvla_worker_common import BACKBONES, DEFAULT_BACKBONE, FAST_TOKENIZER_FILES, trained_with_state
+from ._worker.starvla_worker_common import (
+    BACKBONES,
+    DEFAULT_BACKBONE,
+    FAST_TOKENIZER_FILES,
+    WORLD_MODEL_FRAMEWORKS,
+    WORLD_MODELS,
+    trained_with_state,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -28,6 +35,8 @@ BACKBONE_DIR = BACKBONES[DEFAULT_BACKBONE]
 # StarVLA also reads this marker in the backbone path: it enables the action tokens of StarVLA's
 # "-Action" backbones, which QwenFast predicts. Packages keep it in the backbone folder's name.
 ACTION_MARKER = "-Action"
+# World-model packages keep the diffusers folder (model_index.json and its parts) under these names.
+WORLD_MODEL_FOLDERS = {folder: kind for kind, (folder, _pipeline) in WORLD_MODELS.items()}
 # QwenFast packages carry their FAST action tokenizer's data files (never its code) in this folder.
 FAST_DIR = "FAST"
 _SLICE_BOUNDS = 2
@@ -137,12 +146,17 @@ def framework_from_config(config_yaml: str | Path | None, overrides: Sequence[st
 
 
 def backbone_from_config(config_yaml: str | Path | None, overrides: Sequence[str] = ()) -> str:
-    """Return the backbone type StarVLA loads for a training config's ``framework.qwenvl.base_vlm``.
+    """Return the backbone type StarVLA loads for a training config.
+
+    World-model frameworks read ``framework.world_model.base_wm``; the others
+    ``framework.qwenvl.base_vlm``.
 
     Returns:
         A key of ``environments.BACKBONE_ENVIRONMENTS``.
     """
-    return environments.backbone_for_path(config_value(config_yaml, overrides, "framework.qwenvl.base_vlm"))
+    policy = framework_from_config(config_yaml, overrides)
+    key = "framework.world_model.base_wm" if policy in WORLD_MODEL_FRAMEWORKS else "framework.qwenvl.base_vlm"
+    return environments.backbone_for(policy, config_value(config_yaml, overrides, key))
 
 
 def package_environment(descriptor: dict[str, Any]) -> environments.PolicyEnvironment:
@@ -152,7 +166,10 @@ def package_environment(descriptor: dict[str, Any]) -> environments.PolicyEnviro
         The environment declaration.
     """
     folder = str(descriptor.get("backbone", BACKBONE_DIR)).removesuffix(ACTION_MARKER)
-    kind = next((model_type for model_type, name in BACKBONES.items() if name == folder), DEFAULT_BACKBONE)
+    kind = WORLD_MODEL_FOLDERS.get(folder) or next(
+        (model_type for model_type, name in BACKBONES.items() if name == folder),
+        DEFAULT_BACKBONE,
+    )
     return environments.for_policy(descriptor["policy"], kind)
 
 
@@ -208,7 +225,8 @@ def load_descriptor(artifact: Path) -> dict[str, Any]:
         msg = "Unsupported StarVLA package descriptor."
         raise ValueError(msg)
     backbone = descriptor.get("backbone", BACKBONE_DIR)
-    if backbone not in {name + suffix for name in BACKBONES.values() for suffix in ("", ACTION_MARKER)}:
+    vlm_folders = {name + suffix for name in BACKBONES.values() for suffix in ("", ACTION_MARKER)}
+    if backbone not in vlm_folders | set(WORLD_MODEL_FOLDERS):
         msg = "Unsupported StarVLA package backbone."
         raise ValueError(msg)
     if descriptor.get("environment") != package_environment(descriptor).provenance():
@@ -224,7 +242,8 @@ def load_descriptor(artifact: Path) -> dict[str, Any]:
         raise ValueError(msg)
     contained_file(artifact, "model/config.yaml")
     contained_file(artifact, "model/dataset_statistics.json")
-    contained_file(artifact, f"{backbone}/config.json")
+    # A world model is a diffusers folder: model_index.json names its parts.
+    contained_file(artifact, f"{backbone}/{'model_index.json' if backbone in WORLD_MODEL_FOLDERS else 'config.json'}")
     if descriptor["policy"] == "QwenFast":
         if descriptor.get("fast_tokenizer") != FAST_DIR:
             msg = "QwenFast packages carry their FAST tokenizer."
@@ -264,8 +283,7 @@ def write_package(
     for name in ("config.yaml", "dataset_statistics.json"):
         contained_file(run_dir, name)
     backbone = backbone.expanduser().resolve(strict=True)
-    kind, folder = _backbone_folder(backbone)
-    spec = environments.for_policy(framework_from_config(run_dir / "config.yaml") or "", kind)
+    spec, folder = _package_environment(run_dir / "config.yaml", backbone)
     if not checkpoint_uses_state(run_dir / "config.yaml"):
         io = replace(io, state={})
     stats = json.loads((run_dir / "dataset_statistics.json").read_text())
@@ -273,7 +291,7 @@ def write_package(
         msg = "unnorm_key is not present in the checkpoint's dataset statistics."
         raise ValueError(msg)
     fast = _fast_tokenizer(run_dir / "config.yaml") if spec.policy == "QwenFast" else None
-    if not any(backbone.glob("*.safetensors")):
+    if not any(backbone.rglob("*.safetensors") if folder in WORLD_MODEL_FOLDERS else backbone.glob("*.safetensors")):
         msg = "The local backbone must contain safetensors weights."
         raise ValueError(msg)
     output = output.expanduser().absolute()
@@ -311,23 +329,44 @@ def write_package(
     return output
 
 
-def _backbone_folder(backbone: Path) -> tuple[str, str]:
-    """Return a backbone's type and the package folder named for it.
-
-    StarVLA selects the VLM implementation, and enables action tokens, by substrings of its path.
+def _package_environment(config_yaml: Path, backbone: Path) -> tuple[environments.PolicyEnvironment, str]:
+    """Return the environment a run's package runs in, and the package folder for its backbone.
 
     Returns:
-        The backbone's ``model_type`` and the folder name, keeping StarVLA's "-Action" marker.
+        The framework's environment on the backbone's type, and the folder name.
+    """
+    policy = framework_from_config(config_yaml) or ""
+    kind, folder = _backbone_folder(backbone, policy)
+    return environments.for_policy(policy, kind), folder
+
+
+def _backbone_folder(backbone: Path, policy: str) -> tuple[str, str]:
+    """Return a backbone's type and the package folder named for it.
+
+    StarVLA selects the VLM or world-model implementation, and enables action tokens, by substrings
+    of its path.
+
+    Returns:
+        The backbone type and the folder name, keeping StarVLA's "-Action" marker.
 
     Raises:
-        ValueError: If the backbone is not a supported type.
+        ValueError: If the backbone is not a supported type for the framework.
     """
+    if policy in WORLD_MODEL_FRAMEWORKS:
+        kind = WORLD_MODEL_FRAMEWORKS[policy]
+        folder, pipeline = WORLD_MODELS[kind]
+        index_file = backbone / "model_index.json"
+        index = json.loads(index_file.read_text()) if index_file.is_file() else None
+        if not isinstance(index, dict) or index.get("_class_name") != pipeline:
+            msg = f"{policy} needs a {folder} world model: a diffusers {pipeline} folder."
+            raise ValueError(msg)
+        return kind, folder
     config = json.loads(contained_file(backbone, "config.json").read_text())
-    kind = config.get("model_type") if isinstance(config, dict) else None
-    if kind not in BACKBONES:
+    model_type = config.get("model_type") if isinstance(config, dict) else None
+    if model_type not in BACKBONES:
         msg = "This plugin requires a Qwen3-VL or Qwen3.5 backbone."
         raise ValueError(msg)
-    return kind, BACKBONES[kind] + (ACTION_MARKER if ACTION_MARKER in backbone.name else "")
+    return model_type, BACKBONES[model_type] + (ACTION_MARKER if ACTION_MARKER in backbone.name else "")
 
 
 def _fast_tokenizer(config_yaml: Path) -> Path:
@@ -358,6 +397,8 @@ def _copy_backbone(source: Path, destination: Path) -> None:
     for path in source.rglob("*"):
         if path.suffix not in {".json", ".safetensors", ".txt", ".model", ".jinja"}:
             continue
+        if any(part.startswith(".") for part in path.relative_to(source).parts):
+            continue  # Download metadata, such as huggingface_hub's .cache folder.
         resolved = path.resolve(strict=True)
         if not resolved.is_relative_to(source) or not resolved.is_file():
             msg = "Materialize backbone symlinks inside the source directory before export."

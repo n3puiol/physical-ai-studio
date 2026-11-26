@@ -37,10 +37,13 @@ from starvla_worker_common import (
     BACKBONE_VARIABLE,
     BACKBONES,
     DEFAULT_BACKBONE,
+    WORLD_MODEL_FRAMEWORKS,
+    WORLD_MODELS,
     CancelledError,
     EventChannel,
     WorkerHandshakeError,
     dispatched_backbone,
+    dispatched_world_model,
     finite_metrics,
     identity,
     restrict_remote_code,
@@ -190,8 +193,11 @@ def _load_config(config_yaml: str, overrides: list[str]) -> tuple[Any, Path, boo
     if not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", str(cfg.run_id)):
         msg = "run_id must use 1-64 letters, digits, underscores, or hyphens."
         raise ValueError(msg)
-    backbone = _check_backbone(Path(cfg.framework.qwenvl.base_vlm), cotraining=cotraining)
-    cfg.framework.qwenvl.base_vlm = str(backbone)
+    if cfg.framework.name in WORLD_MODEL_FRAMEWORKS:
+        backbone = _check_world_model(cfg, cotraining=cotraining)
+    else:
+        backbone = _check_backbone(Path(cfg.framework.qwenvl.base_vlm), cotraining=cotraining)
+        cfg.framework.qwenvl.base_vlm = str(backbone)
     # These register upstream state in this process, so every torchrun rank repeats them.
     if cfg.framework.name == "QwenFast":
         _prepare_qwenfast(cfg, backbone)
@@ -345,6 +351,39 @@ def _import_cotrainer() -> Any:  # ruff: ignore[any-type]  # Upstream module.
     finally:
         accelerate.DeepSpeedPlugin = original
     return train_starvla_cotrain
+
+
+def _check_world_model(cfg: Any, *, cotraining: bool) -> Path:  # ruff: ignore[any-type]  # OmegaConf node.
+    """Check that StarVLA will load ``framework.world_model.base_wm`` as the world model chosen for it.
+
+    Returns:
+        The resolved world-model folder, also written back to the config.
+
+    Raises:
+        ValueError: If the folder is not a local diffusers world model of that type, StarVLA would load
+            another model, or the config co-trains.
+    """
+    kind = os.environ.get(BACKBONE_VARIABLE, WORLD_MODEL_FRAMEWORKS[cfg.framework.name])
+    folder_name, pipeline = WORLD_MODELS.get(kind, (kind, "?"))
+    base_wm = getattr(getattr(cfg.framework, "world_model", None), "base_wm", None)
+    if not base_wm:
+        msg = f"{cfg.framework.name} reads its backbone from framework.world_model.base_wm; set a local {folder_name}."
+        raise ValueError(msg)
+    backbone = Path(str(base_wm)).expanduser().resolve(strict=True)
+    index = backbone / "model_index.json"
+    found = json.loads(index.read_text()).get("_class_name") if index.is_file() else None
+    # StarVLA picks the world model by a substring of the path; model_index.json says what it holds.
+    if found != pipeline or dispatched_world_model(str(backbone)) != kind:
+        msg = (
+            f"Use a local, materialized {folder_name} diffusers folder ({pipeline}) with {folder_name} in its "
+            "directory name (upstream world-model dispatch)."
+        )
+        raise ValueError(msg)
+    if cotraining:
+        msg = "Co-training with VLM data supports Qwen3-VL backbones; StarVLA's VLM data loader needs one."
+        raise ValueError(msg)
+    cfg.framework.world_model.base_wm = str(backbone)
+    return backbone
 
 
 def _check_backbone(path: Path, *, cotraining: bool) -> Path:

@@ -91,13 +91,13 @@ def write_openvino_package(
         msg = "image_size must be (height, width) in pixels."
         raise ValueError(msg)
     # Refuse other frameworks and backbones before staging a native package, which copies the backbone.
+    run_config = checkpoint.expanduser().resolve().parents[1] / "config.yaml"
+    if run_config.is_file():
+        environments.for_openvino_export(framework_from_config(run_config) or "")
     backbone_config = Path(backbone).expanduser() / "config.json"
     if backbone_config.is_file() and json.loads(backbone_config.read_text()).get("model_type") != DEFAULT_BACKBONE:
         msg = "The OpenVINO export supports Qwen3-VL backbones."
         raise ValueError(msg)
-    run_config = checkpoint.expanduser().resolve().parents[1] / "config.yaml"
-    if run_config.is_file():
-        environments.for_openvino_export(framework_from_config(run_config) or "")
     output = output.expanduser().absolute()
     if output.exists() or output.is_symlink():
         msg = "Export destination already exists."

@@ -513,6 +513,92 @@ def test_a_rank_stopped_by_a_cancellation_exits_cleanly(
     assert train_worker.events == []
 
 
+def _cosmos(
+    root: Path,
+    name: str = "Cosmos-Predict2-2B-Video2World",
+    pipeline: str = "Cosmos2VideoToWorldPipeline",
+) -> Path:
+    folder = root / name
+    folder.mkdir(parents=True)
+    (folder / "model_index.json").write_text(json.dumps({"_class_name": pipeline}))
+    return folder
+
+
+def test_a_world_model_framework_trains_on_its_cosmos_predict2_folder(
+    train_worker: SimpleNamespace,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PHYSICALAI_STARVLA_FRAMEWORK", "CosmoPredict2GR00T")
+    monkeypatch.setenv("PHYSICALAI_STARVLA_BACKBONE", "cosmos_predict2")
+    framework = train_worker.cfg.framework
+    framework.name = "CosmoPredict2GR00T"
+    framework.world_model = SimpleNamespace()
+    with pytest.raises(ValueError, match=r"reads its backbone from framework\.world_model\.base_wm"):
+        train_worker.worker.train(["--config_yaml", "unused.yaml"])
+    # StarVLA would load another model, or the folder is not a Cosmos-Predict2 pipeline.
+    for folder in (_cosmos(tmp_path / "a", name="world-model"), _cosmos(tmp_path / "b", pipeline="WanPipeline")):
+        framework.world_model.base_wm = str(folder)
+        with pytest.raises(ValueError, match="materialized Cosmos-Predict2 diffusers folder"):
+            train_worker.worker.train(["--config_yaml", "unused.yaml"])
+    cosmos = _cosmos(tmp_path)
+    framework.world_model.base_wm = str(cosmos)
+
+    output, _ = train_worker.worker.train(["--config_yaml", "unused.yaml"])
+
+    assert framework.world_model.base_wm == str(cosmos.resolve())
+    assert json.loads((output / "physicalai_run.json").read_text())["backbone_path"] == str(cosmos.resolve())
+
+
+def test_world_model_frameworks_do_not_cotrain(
+    cotraining: SimpleNamespace,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PHYSICALAI_STARVLA_FRAMEWORK", "CosmoPredict2GR00T")
+    monkeypatch.setenv("PHYSICALAI_STARVLA_BACKBONE", "cosmos_predict2")
+    cotraining.cfg.framework.name = "CosmoPredict2GR00T"
+    cotraining.cfg.framework.world_model = SimpleNamespace(base_wm=str(_cosmos(tmp_path)))
+
+    with pytest.raises(ValueError, match="supports Qwen3-VL backbones"):
+        cotraining.worker.train(["--config_yaml", "unused.yaml"])
+
+
+def test_world_model_packages_load_their_backbone_as_the_world_model(
+    train_worker: SimpleNamespace,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del train_worker
+    worker = importlib.import_module("starvla_infer_worker")
+    monkeypatch.setattr(worker, "restrict_remote_code", lambda: None)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    config = SimpleNamespace(framework=SimpleNamespace(name="CosmoPredict2GR00T"))
+    wrapper = Mock(side_effect=RuntimeError("wrapper built"))
+    for module, value in {
+        "omegaconf": SimpleNamespace(OmegaConf=SimpleNamespace(load=lambda _: config)),
+        "deployment": SimpleNamespace(),
+        "deployment.model_server": SimpleNamespace(),
+        "deployment.model_server.policy_wrapper": SimpleNamespace(PolicyServerWrapper=wrapper),
+    }.items():
+        monkeypatch.setitem(sys.modules, module, value)
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / "model.safetensors").write_bytes(b"fake")
+    (tmp_path / "Cosmos-Predict2").mkdir()
+    descriptor = {
+        "checkpoint": "model/model.safetensors",
+        "policy": "CosmoPredict2GR00T",
+        "backbone": "Cosmos-Predict2",
+        "unnorm_key": "franka",
+    }
+
+    with pytest.raises(RuntimeError, match="wrapper built"):
+        worker.Policy(tmp_path, descriptor, "cuda")
+
+    folder = (tmp_path / "Cosmos-Predict2").resolve()
+    assert wrapper.call_args.kwargs["config_overrides"] == [f"framework.world_model.base_wm={folder}"]
+
+
 def test_host_acknowledgement_reads_ack_cancel_and_closed(
     train_worker: SimpleNamespace,
     monkeypatch: pytest.MonkeyPatch,

@@ -1,0 +1,66 @@
+# CosmoPredict2PI: StarVLA's layer-wise flow-matching head (QwenPI's) on the Cosmos-Predict2-2B
+# world model (nvidia/Cosmos-Predict2-2B-Video2World, gated: accept NVIDIA's Open Model License on
+# Hugging Face first). A 20-step LIBERO smoke run for one 24 GB GPU. The head has one DiT block per
+# world-model layer at its width; with the world model (about 14 GB in bf16) also on the GPU, training
+# those blocks does not fit 24 GB, so the world model and the DiT blocks are frozen and the head's
+# encoders, decoders and embeddings train. StarVLA's own recipes train everything on 8 GPUs with
+# DeepSpeed. Supply the local world model and dataset root as overrides.
+# The head takes its DiT shape only from action_model.diffusion_model_cfg, which StarVLA's QwenPI fills
+# from its backbone but CosmoPredict2PI (at the pinned commit) does not, so it would fall back to 36
+# blocks and fail; the shape below is Cosmos-Predict2-2B's (28 blocks of width 2048), as QwenPI would
+# set it for a 28-layer, 2048-wide backbone.
+run_id: starvla-cosmos-pi
+run_root_dir: ./runs
+seed: 42
+wandb_entity: null
+wandb_project: physicalai-starvla
+is_debug: false
+version_id: "0.21"
+framework:
+  name: CosmoPredict2PI
+  world_model:
+    base_wm: ./Cosmos-Predict2-2B-Video2World
+    extract_layers: [-1]
+  action_model:
+    action_dim: 7
+    state_dim: 8
+    action_horizon: 8
+    diffusion_model_cfg:
+      num_layers: 28
+      input_embedding_dim: 2048
+      cross_attention_dim: 2048
+      attention_head_dim: 64
+      num_attention_heads: 32
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: ./datasets
+    data_mix: libero_goal
+    action_type: delta_qpos
+    sequential_step_sampling: false
+    per_device_batch_size: 1
+    num_workers: 0 # Avoid forking video decoders after model initialization in the smoke run.
+    load_all_data_for_training: true
+    video_backend: torchvision_av
+trainer:
+  max_train_steps: 20
+  num_warmup_steps: 2
+  save_interval: 20
+  eval_interval: 100
+  save_format: safetensors
+  learning_rate:
+    base: 2.5e-5
+    qwen_vl_interface: 1.0e-5
+    action_model: 1.0e-4
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-6
+  freeze_modules: backbone,action_model.model.transformer_blocks
+  logging_frequency: 1
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: true
+  optimizer:
+    betas: [0.9, 0.95]
+    eps: 1.0e-8
+    weight_decay: 1.0e-8

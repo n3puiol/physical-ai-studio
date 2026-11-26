@@ -20,7 +20,14 @@ from typing import TYPE_CHECKING
 
 from physicalai.isolate import BundledProject, Environment, SyncProfile, prepare
 
-from ._worker.starvla_worker_common import BACKBONES, DEFAULT_BACKBONE, dispatched_backbone
+from ._worker.starvla_worker_common import (
+    BACKBONES,
+    DEFAULT_BACKBONE,
+    WORLD_MODEL_FRAMEWORKS,
+    WORLD_MODELS,
+    dispatched_backbone,
+    dispatched_world_model,
+)
 
 if TYPE_CHECKING:
     from importlib.resources.abc import Traversable  # nosemgrep  # Python 3.10+ only.
@@ -122,8 +129,21 @@ QWENFAST = PolicyEnvironment(
     revision=QWENGR00T.revision,
     version=QWENGR00T.version,
 )
+VLM_ENVIRONMENTS: dict[str, PolicyEnvironment] = {spec.policy: spec for spec in (QWENGR00T, QWENPI, QWENOFT, QWENFAST)}
+# World-model frameworks build on a diffusers world model instead of a VLM; the pinned wheel runs them
+# with the same dependencies, so they share QwenGR00T's environment too.
+WORLD_MODEL_ENVIRONMENTS: dict[str, dict[str, PolicyEnvironment]] = {
+    kind: {
+        policy: PolicyEnvironment(policy, QWENGR00T.name, QWENGR00T.revision, QWENGR00T.version, backbone=kind)
+        for policy, built_for in WORLD_MODEL_FRAMEWORKS.items()
+        if built_for == kind
+    }
+    for kind in WORLD_MODELS
+}
+# Every framework's own environment, on the backbone type it is built for by default.
 POLICY_ENVIRONMENTS: dict[str, PolicyEnvironment] = {
-    spec.policy: spec for spec in (QWENGR00T, QWENPI, QWENOFT, QWENFAST)
+    **VLM_ENVIRONMENTS,
+    **{policy: spec for specs in WORLD_MODEL_ENVIRONMENTS.values() for policy, spec in specs.items()},
 }
 
 # Qwen3.5 backbones: the same StarVLA commit on transformers 5. QwenFast is not declared: it needs a
@@ -135,9 +155,12 @@ QWEN35_ENVIRONMENTS: dict[str, PolicyEnvironment] = {
 }
 QWENGR00T_QWEN35 = QWEN35_ENVIRONMENTS["QwenGR00T"]
 BACKBONE_ENVIRONMENTS: dict[str, dict[str, PolicyEnvironment]] = {
-    DEFAULT_BACKBONE: POLICY_ENVIRONMENTS,
+    DEFAULT_BACKBONE: VLM_ENVIRONMENTS,
     QWEN35_BACKBONE: QWEN35_ENVIRONMENTS,
+    **WORLD_MODEL_ENVIRONMENTS,
 }
+# Display names of the backbone types, for messages.
+BACKBONE_NAMES = {**BACKBONES, **{kind: folder for kind, (folder, _pipeline) in WORLD_MODELS.items()}}
 
 # Conversion only: the training project plus OpenVINO and NNCF, with every shared package at the
 # same locked version. Kept separate so adding the converter never changes training pins.
@@ -151,11 +174,11 @@ QWENGR00T_OPENVINO = PolicyEnvironment(
 OPENVINO_EXPORT_ENVIRONMENTS: dict[str, PolicyEnvironment] = {QWENGR00T_OPENVINO.policy: QWENGR00T_OPENVINO}
 
 
-def for_policy(policy: str | None, backbone: str = DEFAULT_BACKBONE) -> PolicyEnvironment:
+def for_policy(policy: str | None, backbone: str | None = None) -> PolicyEnvironment:
     """Return the worker environment for a StarVLA framework on a backbone type.
 
-    With ``policy=None`` (e.g. ``--help`` without a config), the environment every framework
-    shares is used.
+    Without a backbone type, the framework's own default is used. With ``policy=None`` (e.g.
+    ``--help`` without a config), the environment every framework shares is used.
 
     Returns:
         The framework's environment declaration.
@@ -163,6 +186,8 @@ def for_policy(policy: str | None, backbone: str = DEFAULT_BACKBONE) -> PolicyEn
     Raises:
         ValueError: If the framework has no environment for the backbone, or ``None`` is ambiguous.
     """
+    if backbone is None:
+        backbone = POLICY_ENVIRONMENTS[policy].backbone if policy in POLICY_ENVIRONMENTS else DEFAULT_BACKBONE
     if backbone not in BACKBONE_ENVIRONMENTS:
         msg = f"StarVLA backbone type {backbone!r} is not supported; supported: {', '.join(BACKBONE_ENVIRONMENTS)}."
         raise ValueError(msg)
@@ -173,12 +198,28 @@ def for_policy(policy: str | None, backbone: str = DEFAULT_BACKBONE) -> PolicyEn
         return environments[policy]
     if policy in POLICY_ENVIRONMENTS:
         supported = ", ".join(sorted(environments))
-        name = BACKBONES[backbone]
+        name = BACKBONE_NAMES[backbone]
         msg = f"StarVLA framework {policy!r} has no {name} environment; {name} supports: {supported}."
         raise ValueError(msg)
     supported = ", ".join(sorted(POLICY_ENVIRONMENTS))
     msg = f"StarVLA framework {policy!r} has no worker environment; supported: {supported}."
     raise ValueError(msg)
+
+
+def backbone_for(policy: str | None, path: str | Path | None) -> str:
+    """Return the backbone type StarVLA loads for a framework's backbone path.
+
+    World-model frameworks take ``framework.world_model.base_wm``, the others
+    ``framework.qwenvl.base_vlm``. A path StarVLA would load as another model gets the framework's
+    default type; the training worker then refuses it.
+
+    Returns:
+        A key of ``BACKBONE_ENVIRONMENTS``.
+    """
+    if policy in WORLD_MODEL_FRAMEWORKS:
+        kind = dispatched_world_model(str(path)) if path else None
+        return kind if kind in BACKBONE_ENVIRONMENTS else WORLD_MODEL_FRAMEWORKS[policy]
+    return backbone_for_path(path)
 
 
 def backbone_for_path(base_vlm: str | Path | None) -> str:

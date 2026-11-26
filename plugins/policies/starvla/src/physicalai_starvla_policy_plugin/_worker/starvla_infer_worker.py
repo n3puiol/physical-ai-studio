@@ -17,7 +17,13 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import starvla_worker_protocol as protocol
-from starvla_worker_common import identity, restrict_remote_code, trained_with_state, use_fast_tokenizer
+from starvla_worker_common import (
+    WORLD_MODELS,
+    identity,
+    restrict_remote_code,
+    trained_with_state,
+    use_fast_tokenizer,
+)
 
 _ACTION_RANK = 3
 
@@ -51,14 +57,18 @@ class Policy:
             msg = "StarVLA inference requires CUDA."
             raise ValueError(msg)
         # Upstream picks its VLM, and enables action tokens, by substrings of this folder name.
-        backbone = (artifact / descriptor.get("backbone", "Qwen3-VL")).resolve(strict=True)
+        folder = descriptor.get("backbone", "Qwen3-VL")
+        backbone = (artifact / folder).resolve(strict=True)
+        # World-model frameworks load their backbone from framework.world_model.base_wm.
+        world_models = {name for name, _pipeline in WORLD_MODELS.values()}
+        key = "framework.world_model.base_wm" if folder in world_models else "framework.qwenvl.base_vlm"
         if descriptor.get("fast_tokenizer"):
             use_fast_tokenizer((artifact / descriptor["fast_tokenizer"]).resolve(strict=True))
         self.wrapper = PolicyServerWrapper(
             str(checkpoint),
             device=device,
             unnorm_key=descriptor["unnorm_key"],
-            config_overrides=[f"framework.qwenvl.base_vlm={backbone}"],
+            config_overrides=[f"{key}={backbone}"],
         )
         self.processor = self.wrapper.get_norm_processor()
         self.io = descriptor["io"]

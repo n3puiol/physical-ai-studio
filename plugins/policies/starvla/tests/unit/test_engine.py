@@ -21,7 +21,15 @@ from physicalai_starvla_policy_plugin.package import ARTIFACT, RUN_INFO, IoSpec,
 def test_entry_point_and_pins() -> None:
     env = engine.StarVLAEngine.environment_for_policy("QwenGR00T")
     assert Engine.get("starvla") is engine.StarVLAEngine
-    assert engine.StarVLAEngine.policies() == ["QwenFast", "QwenGR00T", "QwenOFT", "QwenPI"]
+    assert engine.StarVLAEngine.policies() == [
+        "CosmoPredict2GR00T",
+        "CosmoPredict2OFT",
+        "CosmoPredict2PI",
+        "QwenFast",
+        "QwenGR00T",
+        "QwenOFT",
+        "QwenPI",
+    ]
     assert env.pinned().base_version == "1.0.1"
     assert env.accelerators == ("cu128",)
     assert len(environments.QWENGR00T.provenance()["lock_sha256"]) == 64
@@ -518,3 +526,94 @@ def test_all_devices_trains_on_every_gpu_the_caller_exposes(tmp_path: Path, monk
         )
     engine.StarVLAEngine.run({"config_yaml": str(config)}, dataset=tmp_path, output_dir=tmp_path / "one", device="cuda")
     assert "--all_devices" not in runner.call_args.args[1]
+
+
+def _cosmos_folder(root: Path) -> Path:
+    """A Cosmos-Predict2 diffusers folder, with the original checkpoints the package must leave out.
+
+    Returns:
+        The folder.
+    """
+    folder = root / "Cosmos-Predict2-2B-Video2World"
+    for part, name in (
+        ("transformer", "diffusion_pytorch_model.safetensors"),
+        ("text_encoder", "model.safetensors"),
+        ("vae", "diffusion_pytorch_model.safetensors"),
+    ):
+        (folder / part).mkdir(parents=True)
+        (folder / part / "config.json").write_text("{}")
+        (folder / part / name).write_bytes(b"weights")
+    (folder / "tokenizer").mkdir()
+    (folder / "tokenizer" / "spiece.model").write_bytes(b"spm")
+    (folder / "scheduler").mkdir()
+    (folder / "scheduler" / "scheduler_config.json").write_text("{}")
+    (folder / "model_index.json").write_text('{"_class_name": "Cosmos2VideoToWorldPipeline"}')
+    (folder / "config.json").write_text('{"_class_name": "Cosmos2VideoToWorldPipeline"}')
+    (folder / "model.pt").write_bytes(b"pickle")
+    (folder / ".cache" / "huggingface").mkdir(parents=True)
+    (folder / ".cache" / "huggingface" / "download.json").write_text("{}")
+    return folder
+
+
+def test_world_model_frameworks_train_in_the_shared_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "train.yaml"
+    config.write_text(
+        "framework:\n  name: CosmoPredict2GR00T\n  world_model:\n    base_wm: /models/Cosmos-Predict2-2B-Video2World\n",
+    )
+    runner = Mock(return_value=Run("starvla", tmp_path, None))
+    monkeypatch.setattr(engine, "run_worker", runner)
+
+    engine.StarVLAEngine.run({"config_yaml": str(config)}, dataset=tmp_path, output_dir=tmp_path / "wm", device="cuda")
+
+    args, kwargs = runner.call_args
+    assert args[0].name == "qwengr00t"
+    assert kwargs["extra_env"]["PHYSICALAI_STARVLA_BACKBONE"] == "cosmos_predict2"
+    assert kwargs["extra_env"]["PHYSICALAI_STARVLA_PROVENANCE"] == json.dumps(environments.QWENGR00T.provenance())
+    assert environments.for_policy("CosmoPredict2PI").backbone == "cosmos_predict2"
+    assert engine.StarVLAEngine.capabilities("CosmoPredict2GR00T").export_formats == ("native",)
+    with pytest.raises(ValueError, match=r"no Qwen3\.5 environment"):
+        environments.for_policy("CosmoPredict2GR00T", "qwen3_5")
+    with pytest.raises(ValueError, match="no Cosmos-Predict2 environment"):
+        environments.for_policy("QwenGR00T", "cosmos_predict2")
+
+
+@pytest.mark.parametrize(
+    ("policy", "path", "expected"),
+    [
+        ("CosmoPredict2GR00T", "/models/Cosmos-Predict2-2B-Video2World", "cosmos_predict2"),
+        ("CosmoPredict2OFT", "/models/nvidia/cosmos-predict2-2b", "cosmos_predict2"),  # Case-insensitive upstream.
+        ("CosmoPredict2GR00T", "/models/Wan2.2-TI2V-5B", "cosmos_predict2"),  # Not wired: the worker refuses it.
+        ("QwenGR00T", "/models/Cosmos-Predict2-2B-Video2World", "qwen3_vl"),
+    ],
+)
+def test_the_world_model_type_follows_starvlas_dispatch(policy: str, path: str, expected: str) -> None:
+    assert environments.backbone_for(policy, path) == expected
+
+
+def test_export_from_a_world_model_run(checkpoint: Path, io: IoSpec, tmp_path: Path) -> None:
+    cosmos = _cosmos_folder(tmp_path)
+    root = checkpoint.parents[1]
+    (root / "config.yaml").write_text("framework:\n  name: CosmoPredict2GR00T\n")
+    (root / "io.json").write_text(json.dumps({"cameras": io.cameras, "state": io.state, "action": io.action}))
+    record = {"environment": environments.QWENGR00T.provenance(), "backbone_path": str(cosmos), "unnorm_key": "franka"}
+    (root / RUN_INFO).write_text(json.dumps(record))
+
+    exported = engine.StarVLAEngine.export(Run("starvla", root, checkpoint), tmp_path / "out")
+
+    artifact = exported / ARTIFACT
+    descriptor = load_descriptor(artifact)
+    assert descriptor["backbone"] == "Cosmos-Predict2"
+    assert descriptor["policy"] == "CosmoPredict2GR00T"
+    copied = sorted(
+        str(path.relative_to(artifact / "Cosmos-Predict2")) for path in (artifact / "Cosmos-Predict2").rglob("*.*")
+    )
+    assert "model.pt" not in copied
+    assert not any(name.startswith(".cache") for name in copied)
+    assert {"model_index.json", "tokenizer/spiece.model", "transformer/diffusion_pytorch_model.safetensors"} <= set(
+        copied,
+    )
+    with pytest.raises(ValueError, match="has no OpenVINO export"):
+        engine.StarVLAEngine.export(Run("starvla", root, checkpoint), tmp_path / "ov", backend="openvino")

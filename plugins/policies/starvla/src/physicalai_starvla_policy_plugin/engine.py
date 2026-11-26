@@ -187,10 +187,8 @@ class StarVLAEngine(TrainingEngine):
         checkpoint = _checkpoint(source)
         root = checkpoint.parents[1]
         record = json.loads((root / RUN_INFO).read_text())
-        spec = environments.for_policy(
-            framework_from_config(root / "config.yaml") or "",
-            environments.backbone_for_path(record.get("backbone_path")),
-        )
+        policy = framework_from_config(root / "config.yaml") or ""
+        spec = environments.for_policy(policy, environments.backbone_for(policy, record.get("backbone_path")))
         if record.get("environment") != spec.provenance():
             msg = f"Training record pins differ from the installed StarVLA {spec.policy} environment."
             raise ValueError(msg)

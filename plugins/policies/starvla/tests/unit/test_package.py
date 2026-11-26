@@ -224,3 +224,17 @@ def test_qwenfast_is_not_packaged_on_qwen35(tmp_path: Path, checkpoint: Path, ba
 
     with pytest.raises(ValueError, match=r"no Qwen3\.5 environment"):
         write_package(checkpoint, tmp_path / "fast35", backbone=backbone, io=io, unnorm_key="franka")
+
+
+def test_world_model_frameworks_need_their_world_model(
+    tmp_path: Path,
+    checkpoint: Path,
+    backbone: Path,
+    io: IoSpec,
+) -> None:
+    (checkpoint.parents[1] / "config.yaml").write_text("framework:\n  name: CosmoPredict2GR00T\n")
+    with pytest.raises(ValueError, match="needs a Cosmos-Predict2 world model"):
+        write_package(checkpoint, tmp_path / "vlm", backbone=backbone, io=io, unnorm_key="franka")
+    (backbone / "model_index.json").write_text('{"_class_name": "WanPipeline"}')
+    with pytest.raises(ValueError, match="Cosmos2VideoToWorldPipeline"):
+        write_package(checkpoint, tmp_path / "wan", backbone=backbone, io=io, unnorm_key="franka")
