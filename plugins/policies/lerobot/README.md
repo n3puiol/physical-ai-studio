@@ -67,12 +67,14 @@ The plugin supports only LeRobot policy types whose training, packaging and Runt
 
 ## Development Checks
 
-From the repository root, run the focused contract tests with the library dependencies installed:
+The plugin has no lockfile of its own: `library/uv.lock` locks it as an editable path dependency, so its tests run in the library environment. From the repository root, run the focused contract tests with the torch extra you installed (`cpu`, `cu132` or `xpu`):
 
 ```bash
-uv run --project library pytest library/tests/unit/engine
-uv run --project plugins/policies/lerobot --extra train --extra tests pytest plugins/policies/lerobot/tests
+uv run --project library --extra cu132 --extra tests --extra lerobot \
+    pytest library/tests/unit/engine plugins/policies/lerobot/tests
 ```
+
+uv also reads this plugin's `[tool.uv.sources]` when it resolves the library, so its `physicalai` pin must match the ones in `library/pyproject.toml` and `application/backend/pyproject.toml`; move all three together.
 
 Optional public-dataset training checks are gated because they download data and start the isolated worker:
 
