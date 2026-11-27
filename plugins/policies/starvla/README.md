@@ -890,6 +890,13 @@ Both differences are within what repeated runs of one server vary by (two episod
 [StarVLA's benchmark clients](#starvlas-benchmark-clients)), and QwenPI's noise comes from numpy in the package and from PyTorch in StarVLA's
 server, so its episodes differ individually.
 
+QwenPI's absolute score is low on both sides for another reason. Its model card reports 96.2% on
+`libero_goal` with `framework.action_model.diffusion_model_cfg.use_canonical_forward=false`, which
+builds the all-cross-attention DiT the checkpoint was trained with instead of today's interleaved
+one. Both runs above, and two controls with StarVLA's unmodified 224-pixel client (66/100, and
+69/100 with `--use_bf16`), used today's default. The export builds the head from the run's
+`config.yaml`, so that is where the override would go; an export with it has not been tried.
+
 QwenPI's 20-step smoke runs do not validate, and the export refuses them. Their head is barely
 trained and amplifies rounding: the traced text graph differs from transformers' own by 1e-6
 (relative, both float32), and that alone moves their actions by 20 to 24% in PyTorch, against
