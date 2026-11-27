@@ -32,15 +32,13 @@ FRAMEWORK_VARIABLE = "PHYSICALAI_STARVLA_FRAMEWORK"
 # Devices that leave the worker every GPU the caller exposes.
 _ALL_VISIBLE_DEVICES = frozenset({"auto", "cuda", "gpu"})
 
-# StarVLA has no OpenVINO path; the plugin adds one, converting in its own locked environment.
-OPENVINO_ENABLEMENTS = tuple(
-    Enablement(
-        name=spec.name,
-        provides={policy: {"export": ("openvino",)}},
-        upstream=f"https://github.com/starVLA/starVLA@{spec.revision} + OpenVINO and NNCF",
-        env=spec.worker_env(),
-    )
-    for policy, spec in environments.OPENVINO_EXPORT_ENVIRONMENTS.items()
+# StarVLA has no OpenVINO path; the plugin adds one, converting in its own locked environment,
+# which every framework with an OpenVINO export shares.
+OPENVINO_ENABLEMENT = Enablement(
+    name=environments.QWENGR00T_OPENVINO.name,
+    provides={policy: {"export": ("openvino",)} for policy in environments.OPENVINO_EXPORT_ENVIRONMENTS},
+    upstream=f"https://github.com/starVLA/starVLA@{environments.QWENGR00T_OPENVINO.revision} + OpenVINO and NNCF",
+    env=environments.QWENGR00T_OPENVINO.worker_env(),
 )
 # Qwen3.5 backbones train and run in their own environment (transformers 5); the engine picks it
 # when StarVLA would load Qwen3.5 for framework.qwenvl.base_vlm.
@@ -66,7 +64,7 @@ class StarVLAEngine(TrainingEngine):
     policy_envs: ClassVar[Mapping[str, WorkerEnv]] = MappingProxyType(
         {policy: spec.worker_env() for policy, spec in environments.POLICY_ENVIRONMENTS.items()},
     )
-    enablements: ClassVar[tuple[Enablement, ...]] = (*OPENVINO_ENABLEMENTS, QWEN35_ENABLEMENT)
+    enablements: ClassVar[tuple[Enablement, ...]] = (OPENVINO_ENABLEMENT, QWEN35_ENABLEMENT)
     training_accelerators: ClassVar[tuple[str, ...]] = (environments.ACCELERATOR,)
     stock_export_formats: ClassVar[tuple[str, ...]] = ("native",)
 

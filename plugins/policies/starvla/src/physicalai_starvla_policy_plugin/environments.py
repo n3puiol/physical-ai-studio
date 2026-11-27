@@ -171,7 +171,20 @@ QWENGR00T_OPENVINO = PolicyEnvironment(
     version=QWENGR00T.version,
     worker=OPENVINO_EXPORT_WORKER,
 )
-OPENVINO_EXPORT_ENVIRONMENTS: dict[str, PolicyEnvironment] = {QWENGR00T_OPENVINO.policy: QWENGR00T_OPENVINO}
+# QwenPI and QwenOFT train in QwenGR00T's environment, so they convert in its OpenVINO one too.
+OPENVINO_EXPORT_ENVIRONMENTS: dict[str, PolicyEnvironment] = {
+    QWENGR00T_OPENVINO.policy: QWENGR00T_OPENVINO,
+    **{
+        policy: PolicyEnvironment(
+            policy,
+            QWENGR00T_OPENVINO.name,
+            QWENGR00T_OPENVINO.revision,
+            QWENGR00T_OPENVINO.version,
+            worker=OPENVINO_EXPORT_WORKER,
+        )
+        for policy in ("QwenPI", "QwenOFT")
+    },
+}
 
 
 def for_policy(policy: str | None, backbone: str | None = None) -> PolicyEnvironment:

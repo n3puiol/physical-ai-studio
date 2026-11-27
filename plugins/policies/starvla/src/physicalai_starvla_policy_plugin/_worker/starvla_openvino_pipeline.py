@@ -1,21 +1,26 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-"""Torch-free QwenGR00T inference over exported OpenVINO graphs.
+"""Torch-free StarVLA inference over exported OpenVINO graphs (QwenGR00T, QwenPI, QwenOFT).
 
 Shared by the export worker, which checks it against StarVLA's PyTorch implementation, and
 by the in-process Runtime adapter. Only numpy, OpenVINO and ``tokenizers`` are imported; the
 module must stay importable on the worker's Python 3.11 and Runtime's Python 3.12+.
 
-The pipeline reproduces ``QwenGR00T.predict_action`` for one observation:
+The pipeline reproduces the framework's ``predict_action`` for one observation:
 
-1. Qwen3-VL image preprocessing (``Qwen2VLImageProcessorFast``) and the chat prompt.
+1. Qwen3-VL image preprocessing (``Qwen2VLImageProcessorFast``) and the chat prompt; QwenOFT
+   appends its action-query tokens, and the discretized state when trained with it.
 2. ``vision.xml``: the vision tower with the exported camera grid baked in.
 3. Host glue: token embedding lookup, image-token scatter, dense DeepStack features, mRoPE ids.
-4. ``llm.xml``: the text model, returning the *pre-norm* last hidden state StarVLA conditions on.
-5. ``head.xml``: the flow-matching action head with the sampled noise as an input, and the
-   normalized state when the checkpoint was trained with it (StarVLA's ``include_state``).
+4. ``llm.xml``: the text model, returning the *pre-norm* last hidden state StarVLA conditions on
+   (QwenPI: the hidden states of the last layers its DiT blocks attend to, stacked).
+5. ``head.xml``: the action head. QwenGR00T and QwenPI unroll their flow-matching steps with the
+   sampled noise as an input, plus the normalized state when the checkpoint was trained with it
+   (StarVLA's ``include_state``); QwenOFT's MLP reads the hidden states at its action-query tokens.
 6. StarVLA's state normalization and action unnormalization.
+
+The head's inputs are named in the package descriptor; packages without that entry are QwenGR00T's.
 """
 
 from __future__ import annotations
@@ -37,6 +42,9 @@ EMBEDDINGS = "embed_tokens.npy"
 TOKENIZER = "tokenizer.json"
 WEIGHT_FORMATS = ("fp32", "fp16", "int8")
 NORMALIZATION_MODES = ("q99", "mean_std", "min_max", "binary")
+# Inputs an exported head may declare: conditioning hidden states, their mask, normalized state,
+# flow-matching noise, and QwenOFT's hidden states at its action-query tokens.
+HEAD_INPUTS = ("vl_embs", "attention_mask", "state", "noise", "queries")
 _MAX_ASPECT_RATIO = 200
 
 
@@ -196,6 +204,30 @@ def unnormalize(values: np.ndarray, spec: dict[str, Any], threshold: float) -> n
     raise ValueError(msg)
 
 
+def state_tokens(state: np.ndarray, bins: int) -> str:
+    """StarVLA's ``state2str_transform``: normalized state as bin indices over [-1, 1].
+
+    QwenOFT checkpoints trained with state read it as text: ``<task> [STATE] <bins> [ACTION]``.
+
+    Returns:
+        Space-separated bin indices.
+    """
+    indices = np.digitize(np.asarray(state).reshape(-1), bins=np.linspace(-1, 1, bins + 1)[:-1]) - 1
+    return " ".join(map(str, indices))
+
+
+def head_inputs(descriptor: dict[str, Any]) -> list[str]:
+    """Return the exported head's input names, in order.
+
+    Returns:
+        Input names; QwenGR00T packages that predate the field get QwenGR00T's head inputs.
+    """
+    if "head" in descriptor:
+        return list(descriptor["head"]["inputs"])
+    with_state = ["state"] if descriptor["state"]["keys"] else []
+    return ["vl_embs", "attention_mask", *with_state, "noise"]
+
+
 def load_descriptor(artifact: Path) -> dict[str, Any]:
     """Read an OpenVINO package descriptor and check the fields the pipeline relies on.
 
@@ -219,6 +251,16 @@ def load_descriptor(artifact: Path) -> dict[str, Any]:
     modes = {spec.get("mode") for spec in descriptor["normalization"]["keys"].values()}
     if not modes <= set(NORMALIZATION_MODES):
         msg = f"Unsupported normalization modes {sorted(modes - set(NORMALIZATION_MODES))}."
+        raise ValueError(msg)
+    inputs = head_inputs(descriptor)
+    queries = descriptor.get("queries")
+    if (
+        not set(inputs) <= set(HEAD_INPUTS)
+        or len(set(inputs)) != len(inputs)
+        or ("queries" in inputs) != isinstance(queries, dict)
+        or ("state" in inputs and not descriptor["state"]["keys"])
+    ):
+        msg = "Unsupported StarVLA OpenVINO head inputs."
         raise ValueError(msg)
     return descriptor
 
@@ -246,8 +288,8 @@ class EmbeddingTable:
         return rows.astype(np.float32, copy=False)
 
 
-class QwenGR00TPipeline:
-    """Run an exported QwenGR00T package with OpenVINO on one observation."""
+class StarVLAPipeline:
+    """Run an exported StarVLA package (QwenGR00T, QwenPI or QwenOFT) with OpenVINO on one observation."""
 
     def __init__(self, artifact: Path, device: str = "CPU", config: dict[str, Any] | None = None) -> None:
         """Compile the three graphs and load the tokenizer and embedding table."""
@@ -263,7 +305,27 @@ class QwenGR00TPipeline:
         self.tokenizer = Tokenizer.from_file(str(artifact / TOKENIZER))
 
     # Preprocessing -----------------------------------------------------------------------
-    def input_ids(self, task: str, cameras: int) -> np.ndarray:
+    def instruction(self, task: str, state: np.ndarray | None = None) -> str:
+        """The instruction the framework puts into its chat prompt.
+
+        QwenOFT appends its action-query tokens, after the discretized state when the checkpoint
+        was trained with state; the other frameworks use the task as is.
+
+        Returns:
+            The instruction text.
+
+        Raises:
+            ValueError: If the package reads state from the prompt and none is given.
+        """
+        bins = self.descriptor["state"].get("prompt_bins")
+        if bins and self.descriptor["state"]["keys"]:
+            if state is None:
+                msg = "This package reads the robot state from its prompt; pass the state."
+                raise ValueError(msg)
+            task = f"{task} [STATE] {state_tokens(state, int(bins))} [ACTION]"
+        return task + self.descriptor["prompt"].get("instruction_suffix", "")
+
+    def input_ids(self, instruction: str, cameras: int) -> np.ndarray:
         """Tokenize the chat prompt with each image placeholder expanded to its token count.
 
         Returns:
@@ -273,7 +335,7 @@ class QwenGR00TPipeline:
             ValueError: If the prompt's image placeholders differ from the camera count.
         """
         prompt, image = self.descriptor["prompt"], self.descriptor["image"]
-        text = prompt["prefix"] + task + prompt["suffix"]
+        text = prompt["prefix"] + instruction + prompt["suffix"]
         placeholder = prompt["image_token"]
         if text.count(placeholder) != cameras:
             msg = "Prompt template image placeholders differ from the camera count."
@@ -281,8 +343,10 @@ class QwenGR00TPipeline:
         text = text.replace(placeholder, "\0").replace("\0", placeholder * image["tokens"])
         return np.asarray([self.tokenizer.encode(text).ids], dtype=np.int64)
 
-    def prepare(self, images: list[np.ndarray], task: str) -> dict[str, np.ndarray]:
+    def prepare(self, images: list[np.ndarray], task: str, state: np.ndarray | None = None) -> dict[str, np.ndarray]:
         """Build the vision and text inputs for HWC uint8 RGB images in training camera order.
+
+        ``state`` is the normalized state; only packages that read it from the prompt use it here.
 
         Returns:
             ``pixel_values``, ``input_ids`` and ``position_ids``.
@@ -299,7 +363,7 @@ class QwenGR00TPipeline:
                 msg = f"Camera images must be uint8 {spec['size'][0]}x{spec['size'][1]}x3 for this export."
                 raise ValueError(msg)
         pixel_values = np.concatenate([image_patches(image, spec) for image in images])
-        input_ids = self.input_ids(task, len(images))
+        input_ids = self.input_ids(self.instruction(task, state), len(images))
         grids = [list(spec["grid"])] * len(images)
         position_ids = rope_index(input_ids, grids, {**spec, **self.descriptor["tokens"]})
         return {"pixel_values": pixel_values, "input_ids": input_ids, "position_ids": position_ids}
@@ -343,7 +407,7 @@ class QwenGR00TPipeline:
         """Scatter image features into the token embeddings and run the text model.
 
         Returns:
-            Pre-norm last hidden state of shape (1, L, hidden).
+            Pre-norm last hidden state of shape (1, L, hidden); QwenPI: (layers, 1, L, hidden).
         """
         ids = input_ids[0]
         embeds = self.embeddings(ids)[None].copy()
@@ -355,37 +419,74 @@ class QwenGR00TPipeline:
         mask = np.ones_like(input_ids)
         return self.models["llm"]([embeds, mask, position_ids, deepstack])[0]
 
-    def head(self, hidden: np.ndarray, state: np.ndarray, noise: np.ndarray) -> np.ndarray:
-        """Run the unrolled flow-matching action head on normalized state and explicit noise.
+    def queries(self, hidden: np.ndarray, input_ids: np.ndarray) -> np.ndarray:
+        """QwenOFT: the hidden states at the last ``count`` action-query tokens, in prompt order.
 
-        A package exported from a checkpoint trained without proprioceptive state declares no
-        state keys, and its head has no state input; ``state`` is then ignored.
+        Returns:
+            float32 array of shape (1, count, hidden).
+
+        Raises:
+            ValueError: If the prompt has fewer action-query tokens than the head reads.
+        """
+        spec = self.descriptor["queries"]
+        positions = np.flatnonzero(input_ids[0] == spec["token_id"])
+        if len(positions) < spec["count"]:
+            msg = f"The prompt has {len(positions)} action-query tokens; the head reads {spec['count']}."
+            raise ValueError(msg)
+        return hidden[:, positions[-spec["count"] :]]
+
+    def head(
+        self,
+        hidden: np.ndarray,
+        state: np.ndarray | None,
+        noise: np.ndarray | None,
+        input_ids: np.ndarray,
+    ) -> np.ndarray:
+        """Run the exported action head on the inputs it declares.
+
+        A head exported from a checkpoint trained without proprioceptive state has no state input,
+        and QwenOFT's has no noise input; values the head does not take are ignored.
 
         Returns:
             Normalized actions of shape (1, horizon, action_dim).
+
+        Raises:
+            ValueError: If the head needs state or noise and none was given.
         """
-        mask = np.ones(hidden.shape[:2], dtype=bool)
-        noise = noise.astype(np.float32)
-        inputs = [hidden, mask, state, noise] if self.descriptor["state"]["keys"] else [hidden, mask, noise]
-        return self.models["head"](inputs)[0]
+        values = {
+            "vl_embs": hidden,
+            "attention_mask": np.ones(input_ids.shape, dtype=bool),
+            "state": state,
+            "noise": None if noise is None else noise.astype(np.float32),
+        }
+        names = head_inputs(self.descriptor)
+        if "queries" in names:
+            values["queries"] = self.queries(hidden, input_ids)
+        missing = [name for name in names if values[name] is None]
+        if missing:
+            msg = f"The action head needs {', '.join(missing)}."
+            raise ValueError(msg)
+        return self.models["head"]([values[name] for name in names])[0]
 
     def predict_normalized(
         self,
         images: list[np.ndarray],
         task: str,
-        state: np.ndarray,
-        noise: np.ndarray,
+        state: np.ndarray | None,
+        noise: np.ndarray | None = None,
     ) -> np.ndarray:
         """Return normalized actions of shape (1, horizon, action_dim)."""
-        inputs = self.prepare(images, task)
+        inputs = self.prepare(images, task, state)
         hidden = self.language(inputs["input_ids"], inputs["position_ids"], self.vision(inputs["pixel_values"]))
-        return self.head(hidden, state, noise)
+        return self.head(hidden, state, noise, inputs["input_ids"])
 
-    def noise(self, rng: np.random.Generator) -> np.ndarray:
+    def noise(self, rng: np.random.Generator) -> np.ndarray | None:
         """Sample the head's initial noise.
 
         Returns:
-            float32 noise of shape (1, horizon, action_dim).
+            float32 noise of shape (1, horizon, action_dim); ``None`` for a head without noise (QwenOFT).
         """
+        if "noise" not in head_inputs(self.descriptor):
+            return None
         action = self.descriptor["action"]
         return rng.standard_normal((1, action["horizon"], action["dim"]), dtype=np.float32)

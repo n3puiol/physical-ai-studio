@@ -265,7 +265,15 @@ def test_cli_tells_the_worker_which_framework_it_runs(tmp_path: Path, monkeypatc
 
 
 @pytest.mark.parametrize("framework", ["QwenPI", "QwenOFT"])
-def test_frameworks_without_a_conversion_export_native_packages_only(
+def test_qwenpi_and_qwenoft_export_to_openvino_like_qwengr00t(framework: str) -> None:
+    capabilities = engine.StarVLAEngine.capabilities(framework)
+    assert set(capabilities.export_formats) == {"native", "openvino"}
+    assert set(capabilities.enablements) == {environments.QWENGR00T_OPENVINO.name, "qwen35"}
+    assert environments.for_openvino_export(framework).name == environments.QWENGR00T_OPENVINO.name
+
+
+@pytest.mark.parametrize("framework", ["QwenFast", "CosmoPredict2GR00T", "WanOFT"])
+def test_frameworks_without_a_conversion_are_refused_before_staging(
     checkpoint: Path,
     backbone: Path,
     io: IoSpec,
@@ -275,17 +283,8 @@ def test_frameworks_without_a_conversion_export_native_packages_only(
 ) -> None:
     capabilities = engine.StarVLAEngine.capabilities(framework)
     assert capabilities.export_formats == ("native",)
-    assert capabilities.enablements == ("qwen35",)
+    assert environments.QWENGR00T_OPENVINO.name not in capabilities.enablements
     (checkpoint.parents[1] / "config.yaml").write_text(f"framework:\n  name: {framework}\n")
-
-    native = engine.StarVLAEngine.export_native(
-        checkpoint,
-        tmp_path / "native",
-        backbone_path=backbone,
-        io=io,
-        unnorm_key="franka",
-    )
-    assert load_descriptor(native / ARTIFACT)["policy"] == framework
 
     # Refused before staging a native copy (the whole backbone) or preparing the conversion environment.
     prepared, staged = Mock(), Mock()

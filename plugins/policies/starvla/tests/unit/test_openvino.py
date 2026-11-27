@@ -23,7 +23,7 @@ from physicalai_starvla_policy_plugin import engine, environments, openvino_pack
 from physicalai_starvla_policy_plugin._worker import starvla_openvino_pipeline as pipeline
 from physicalai_starvla_policy_plugin.package import ARTIFACT, IoSpec
 
-VOCAB = {"[UNK]": 0, "<vs>": 1, "<img>": 2, "<ve>": 3, "pick": 4, "up": 5, "go": 6}
+VOCAB = {"[UNK]": 0, "<vs>": 1, "<img>": 2, "<ve>": 3, "pick": 4, "up": 5, "go": 6, "<q>": 7, "STATE": 8, "ACTION": 9}
 
 
 @pytest.mark.parametrize(
@@ -155,7 +155,7 @@ def _write_artifact(artifact: Path, descriptor: dict[str, Any]) -> Path:
     artifact.mkdir(parents=True)
     tokenizer = Tokenizer(models.WordLevel(VOCAB, unk_token="[UNK]"))  # ruff: ignore[hardcoded-password-func-arg]
     tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
-    tokenizer.add_special_tokens(["<vs>", "<img>", "<ve>"])
+    tokenizer.add_special_tokens(["<vs>", "<img>", "<ve>", "<q>"])
     tokenizer.save(str(artifact / pipeline.TOKENIZER))
     np.save(artifact / pipeline.EMBEDDINGS, np.arange(len(VOCAB) * 3, dtype=np.float32).reshape(-1, 3))
     for name in pipeline.MODELS:
@@ -165,7 +165,7 @@ def _write_artifact(artifact: Path, descriptor: dict[str, Any]) -> Path:
     return artifact
 
 
-class FakePipeline(pipeline.QwenGR00TPipeline):
+class FakePipeline(pipeline.StarVLAPipeline):
     """Real glue, preprocessing and normalization; the three graphs are recorded fakes."""
 
     calls: list[dict[str, Any]]
@@ -191,11 +191,22 @@ class FakePipeline(pipeline.QwenGR00TPipeline):
             return [embeds + deepstack.sum(0)]
 
         def head(inputs: list[np.ndarray]) -> list[np.ndarray]:
-            # A head exported without proprioceptive state has no state input.
-            hidden, mask, *rest = inputs
-            state, noise = rest if len(rest) == 2 else (None, rest[0])
-            self.calls.append({"hidden": hidden, "state": state, "noise": noise, "head_mask": mask})
-            return [noise * 0 + (state.sum() if state is not None else 0)]
+            # Inputs arrive in the order the package declares; QwenOFT's head takes only its queries.
+            values = dict(zip(pipeline.head_inputs(self.descriptor), inputs, strict=True))
+            state, noise = values.get("state"), values.get("noise")
+            self.calls.append(
+                {
+                    "hidden": values.get("vl_embs"),
+                    "state": state,
+                    "noise": noise,
+                    "head_mask": values.get("attention_mask"),
+                    "queries": values.get("queries"),
+                },
+            )
+            action = self.descriptor["action"]
+            return [
+                np.zeros((1, action["horizon"], action["dim"]), np.float32) + (state.sum() if state is not None else 0),
+            ]
 
         self.models = {"vision": vision, "llm": llm, "head": head}
 
@@ -205,7 +216,7 @@ def ov_package(tmp_path: Path, descriptor: dict[str, Any], monkeypatch: pytest.M
     package = tmp_path / "ov-export"
     _write_artifact(package / openvino_package.OPENVINO_ARTIFACT, descriptor)
     openvino_package._write_manifest(package, "QwenGR00T")
-    monkeypatch.setattr(openvino_runtime.pipeline, "QwenGR00TPipeline", FakePipeline)
+    monkeypatch.setattr(openvino_runtime.pipeline, "StarVLAPipeline", FakePipeline)
     return package
 
 
@@ -423,7 +434,7 @@ def test_package_without_state_runs_without_it(
     descriptor = {**descriptor, "io": {**descriptor["io"], "state": {}}, "state": {"keys": []}}
     _write_artifact(package / openvino_package.OPENVINO_ARTIFACT, descriptor)
     openvino_package._write_manifest(package, "QwenGR00T")
-    monkeypatch.setattr(openvino_runtime.pipeline, "QwenGR00TPipeline", FakePipeline)
+    monkeypatch.setattr(openvino_runtime.pipeline, "StarVLAPipeline", FakePipeline)
 
     with InferenceModel(package, seed=3) as model:
         action = model({key: value for key, value in observation.items() if key != "state"})["action"]
@@ -432,3 +443,132 @@ def test_package_without_state_runs_without_it(
     assert head["state"] is None
     assert head["noise"].shape == (1, 2, 3)
     np.testing.assert_allclose(action, [[[0, 10, 20], [0, 10, 20]]])
+
+
+def test_state_tokens_match_starvlas_binning() -> None:
+    """``state2str_transform``: 256 uniform bins over [-1, 1], with values outside clamped to -1 and 255."""
+    state = np.array([[[-1.5, -1.0, -0.5, 0.0, 0.1, 0.99, 1.0, 2.0]]], np.float32)
+    assert pipeline.state_tokens(state, 256) == "-1 0 64 128 140 254 255 255"
+
+
+def _install(tmp_path: Path, descriptor: dict, monkeypatch: pytest.MonkeyPatch, policy: str) -> Path:
+    package = tmp_path / f"ov-{policy}"
+    _write_artifact(package / openvino_package.OPENVINO_ARTIFACT, descriptor)
+    openvino_package._write_manifest(package, policy)
+    monkeypatch.setattr(openvino_runtime.pipeline, "StarVLAPipeline", FakePipeline)
+    return package
+
+
+def test_a_qwenoft_package_prompts_with_state_and_reads_its_query_tokens(
+    tmp_path: Path,
+    descriptor: dict,
+    observation: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor = {
+        **descriptor,
+        "policy": "QwenOFT",
+        "prompt": {**descriptor["prompt"], "instruction_suffix": " <q><q>"},
+        "state": {"keys": [["state.arm", 2]], "prompt_bins": 256},
+        "head": {"inputs": ["queries"]},
+        "queries": {"token_id": VOCAB["<q>"], "count": 2},
+    }
+    package = _install(tmp_path, descriptor, monkeypatch, "QwenOFT")
+
+    with InferenceModel(package, seed=3) as model:
+        action = model(observation)["action"]
+        fake = FakePipeline.last
+        # min_max state [0.5, 1.0] normalizes to [0, 0]: bin 128 twice, as StarVLA's text.
+        assert fake.instruction("pick up", np.zeros((1, 1, 2), np.float32)) == "pick up [STATE] 128 128 [ACTION] <q><q>"
+        with pytest.raises(ValueError, match="state"):
+            fake.instruction("pick up")
+
+    llm, head = fake.calls
+    ids = llm["embeds"][0, :, 0] / 3  # Each embedding row starts at 3 * token id.
+    query_positions = np.flatnonzero(ids == VOCAB["<q>"])
+    assert len(query_positions) == 2
+    # The head reads the text model's output at the query tokens, and no noise or state.
+    np.testing.assert_array_equal(head["queries"], (llm["embeds"] + llm["deepstack"].sum(0))[:, query_positions])
+    assert head["noise"] is None
+    assert head["state"] is None
+    np.testing.assert_allclose(action, [[[0, 10, 20], [0, 10, 20]]])
+
+
+def test_a_qwenpi_package_feeds_stacked_layers_and_noise(
+    tmp_path: Path,
+    descriptor: dict,
+    observation: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptor = {
+        **descriptor,
+        "policy": "QwenPI",
+        "head": {"inputs": ["vl_embs", "attention_mask", "state", "noise"]},
+    }
+    package = _install(tmp_path, descriptor, monkeypatch, "QwenPI")
+
+    def layers(inputs: list[np.ndarray]) -> list[np.ndarray]:  # The last two layers' hidden states.
+        embeds = inputs[0]
+        return [np.stack([embeds, embeds + 1])]
+
+    with InferenceModel(package, seed=3) as model:
+        FakePipeline.last.models["llm"] = layers
+        model(observation)
+    head = FakePipeline.last.calls[-1]
+    assert head["hidden"].shape == (2, 1, 15, 3)
+    assert head["head_mask"].shape == (1, 15)
+    assert head["noise"].shape == (1, 2, 3)
+    np.testing.assert_allclose(head["state"], [[[0.0, 0.0]]])
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda d: d.update(head={"inputs": ["vl_embs", "attention_mask", "logits"]}),
+        lambda d: d.update(head={"inputs": ["queries"]}),
+        lambda d: d.update(head={"inputs": ["noise", "noise"]}),
+        lambda d: d.update(
+            head={"inputs": ["vl_embs", "attention_mask", "state", "noise"]},
+            io={**d["io"], "state": {}},
+            state={"keys": []},
+        ),
+    ],
+)
+def test_descriptor_rejects_unknown_head_inputs(
+    tmp_path: Path,
+    descriptor: dict,
+    change: Callable[[dict], object],
+) -> None:
+    change(descriptor)
+    artifact = _write_artifact(tmp_path / "artifact", descriptor)
+    with pytest.raises(ValueError, match="head inputs"):
+        openvino_package.load_openvino_descriptor(artifact)
+
+
+@pytest.mark.parametrize("framework", ["QwenPI", "QwenOFT"])
+def test_qwenpi_and_qwenoft_convert_in_the_shared_openvino_environment(
+    tmp_path: Path,
+    checkpoint: Path,
+    backbone: Path,
+    io: IoSpec,
+    descriptor: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    framework: str,
+) -> None:
+    (checkpoint.parents[1] / "config.yaml").write_text(f"framework:\n  name: {framework}\n")
+    calls = _fake_export_worker({**descriptor, "policy": framework}, monkeypatch)
+
+    output = openvino_package.write_openvino_package(
+        checkpoint,
+        tmp_path / "ov",
+        backbone=backbone,
+        io=io,
+        unnorm_key="franka",
+    )
+
+    spec = environments.for_openvino_export(framework)
+    assert spec.name == environments.QWENGR00T_OPENVINO.name
+    assert Path(calls[0][0][2]).name == "starvla_openvino_export.py"
+    artifact = output / openvino_package.OPENVINO_ARTIFACT
+    assert json.loads((artifact / "package.json").read_text())["export_environment"] == spec.provenance()
+    assert json.loads((output / "manifest.json").read_text())["policy"]["name"] == framework

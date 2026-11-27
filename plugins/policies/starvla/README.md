@@ -9,7 +9,7 @@ This integration supports QwenGR00T, QwenPI, QwenOFT and QwenFast on Qwen3-VL (Q
 QwenOFT also on Qwen3.5), StarVLA's world-model frameworks on Cosmos-Predict2 (CosmoPredict2GR00T,
 CosmoPredict2OFT and CosmoPredict2PI) and Wan2.2 (WanGR00T, WanOFT and WanPI), on one GPU or data-parallel on all visible GPUs of one machine, supervised
 training and co-training with VLM data, upstream registered LeRobot dataset mixtures, one observation per camera, native safetensors
-packages (CUDA inference in the isolated worker), and, for QwenGR00T, OpenVINO packages
+packages (CUDA inference in the isolated worker), and, for QwenGR00T, QwenPI and QwenOFT on Qwen3-VL, OpenVINO packages
 (in-process inference on CPU or another OpenVINO device, without StarVLA or PyTorch). Other
 StarVLA frameworks, custom executable dataset registrations, DeepSpeed, multi-machine training
 and ONNX conversion are not enabled. Training requires CUDA.
@@ -197,8 +197,7 @@ WANDB_MODE=disabled library/.venv/bin/physicalai train starvla \
 ```
 
 Runs and packages record the shared environment's pins. Export and Runtime inference work as for
-QwenGR00T, but only as native packages: `backend="openvino"` is refused, because the OpenVINO
-conversion is written for QwenGR00T's graphs.
+QwenGR00T, including the [OpenVINO export](#openvino-export).
 
 Verified on one RTX 3090 with the smoke config: 20 steps through the engine took 40 seconds with
 progress events, using at most 12.2 GB of GPU memory. The loss fell from 8,784 to 3,379; QwenGR00T's
@@ -227,13 +226,12 @@ prompt as discretized text.
 
 `configs/qwenoft_libero.yaml` is a 20-step LIBERO smoke run on Qwen3-VL-4B with the VLM frozen, so
 only the MLP trains. Upstream's OFT recipes also train the VLM, which needs more than 24 GB, so this
-run checks the integration rather than producing a useful policy. QwenOFT exports native packages
-only.
+run checks the integration rather than producing a useful policy. QwenOFT also exports to OpenVINO
+(see [OpenVINO export](#openvino-export)).
 
 Verified on one RTX 3090: 20 steps through the engine took 23 seconds at 11.0 GB of GPU memory, and
 the loss fell from 0.87 to 0.47. On a real LIBERO-goal frame, Runtime matched StarVLA's own
-`predict_action` exactly (maximum absolute difference `0.0`) and repeated it exactly, and an
-OpenVINO export was refused.
+`predict_action` exactly (maximum absolute difference `0.0`) and repeated it exactly.
 
 ## QwenFast
 
@@ -795,10 +793,13 @@ Materialize Hugging Face cache symlinks before export.
 
 ## OpenVINO export
 
-`export_native(..., backend="openvino")` (or `export(run, out, backend="openvino")`) converts the
-checkpoint on CPU in a second locked environment, `envs/qwengr00t-openvino/`: the training
-project plus OpenVINO 2026.4.1 and NNCF, with every shared package at the same locked version.
-Adding the converter never changes the training pins.
+`export_native(..., backend="openvino")` (or `export(run, out, backend="openvino")`) converts a
+QwenGR00T, QwenPI or QwenOFT checkpoint on a Qwen3-VL backbone on CPU in a second locked
+environment, `envs/qwengr00t-openvino/`: the training project plus OpenVINO 2026.4.1 and NNCF, with
+every shared package at the same locked version. Adding the converter never changes the training
+pins. The three frameworks share that environment, as they share the training one. QwenFast, the
+world-model frameworks and Qwen3.5 backbones export native packages only, and an OpenVINO export of
+them is refused before anything is staged.
 
 Runs and native packages record the hash of the training lock. Those made before the workers moved
 to Python 3.11 are refused by `export(run)` and by Runtime; re-export their checkpoint with
@@ -821,19 +822,30 @@ The package holds three graphs and the data needed to run them without StarVLA:
 
 - `vision.xml`: the Qwen3-VL vision tower, with the camera grid for `image_size` baked in.
 - `llm.xml`: the text model, returning the **pre-norm** last hidden state (StarVLA conditions on
-  `hidden_states[-1]`, before the final RMSNorm).
-- `head.xml`: the 4-step flow-matching action head, unrolled, with the noise as an input.
-- The token embedding table, `tokenizer.json`, and `package.json` with the prompt template, image
-  preprocessing, mRoPE settings, and the state/action normalization statistics.
+  `hidden_states[-1]`, before the final RMSNorm). For QwenPI it returns the hidden states of the
+  text model's last layers instead, one per DiT block, stacked.
+- `head.xml`: the action head. QwenGR00T's and QwenPI's 4-step flow-matching heads are unrolled,
+  with the noise as an input. QwenOFT's MLP reads the text model's output at its eight
+  action-query tokens and takes no noise, so its packages are deterministic.
+- The token embedding table, `tokenizer.json`, and `package.json` with the prompt template
+  (QwenOFT's with its action-query tokens), image preprocessing, mRoPE settings, the head's
+  inputs, and the state/action normalization statistics.
+
+A head takes proprioceptive state only if the checkpoint was trained with it. QwenOFT reads state
+as text in its prompt (`<task> [STATE] <bin indices> [ACTION]`, 256 bins over [-1, 1]), so its head
+never has a state input; the numpy pipeline writes the same text, and its token ids are part of the
+validation below.
 
 The checkpoint, backbone weights and Python code are not included. Numpy glue
 (`_worker/starvla_openvino_pipeline.py`) reproduces the Qwen3-VL image preprocessing, chat prompt,
-multimodal RoPE ids, image-token scatter and StarVLA's normalization. Before writing `validation`
-into `package.json`, the export worker runs that pipeline on a synthetic observation and requires it
-to match StarVLA's PyTorch `predict_action`:
+multimodal RoPE ids, image-token scatter and StarVLA's normalization. The export worker first
+checks the PyTorch graphs it traces against StarVLA, stage by stage on a synthetic observation: the
+text graph must reproduce StarVLA's hidden states (relative difference 1e-5), and the head, fed
+StarVLA's own hidden states, its `predict_action` (1e-4). Before writing `validation` into
+`package.json`, it runs the torch-free pipeline on the same observation and requires it to match:
 
 - Token ids, position ids, pixel values and normalization must match exactly.
-- Normalized actions must match within the weight format's tolerance.
+- Normalized actions must match the traced PyTorch graphs within the weight format's tolerance.
 
 The export fails rather than writing an unvalidated package.
 
@@ -848,6 +860,26 @@ The export fails rather than writing an unvalidated package.
 INT8 vision weights were accurate on real frames but drifted on out-of-distribution inputs, so
 `int8` compresses only the text model.
 
+QwenOFT and QwenPI, fp16, on the same CPU. The real-frame check runs 10 LIBERO-goal frames (five
+episodes, frames 0 and 60) through the package and through StarVLA's PyTorch `predict_action` in
+float32 on the same CPU, with the same noise for QwenPI; StarVLA's published checkpoints were
+converted to safetensors with PyTorch's weights-only loader first:
+
+| Checkpoint                                       | Package | Validation, vs PyTorch    | 10 real frames, vs PyTorch  | Error vs recorded actions¹ | CPU per chunk²  |
+| ------------------------------------------------ | ------- | ------------------------- | --------------------------- | -------------------------- | --------------- |
+| StarVLA's QwenOFT LIBERO, Qwen3-VL-4B            | 8.2 GB  | max 5.4e-5                | max 5.4e-5                  | 0.0070 / 0.0070            | 1.29 s / 2.04 s |
+| StarVLA's QwenPI LIBERO, Qwen3-VL-4B (3.35B DiT) | 14.8 GB | max 0.014, cosine 0.99996 | max 0.014, cosine ≥ 0.99994 | 0.066 / 0.066              | 2.51 s / 4.55 s |
+| QwenOFT, 20-step smoke run, Qwen3-VL-4B          | 8.2 GB  | max 5.9e-4                | max 6.5e-4                  |                            | 1.18 s / 1.89 s |
+| QwenOFT, 20-step smoke run, Qwen3-VL-2B, state   | 3.7 GB  | max 6.0e-4                | max 8.7e-4                  |                            | 0.70 s / 1.18 s |
+
+¹ Mean absolute error of the unnormalized chunk against the dataset's actions, PyTorch / OpenVINO.
+² OpenVINO / PyTorch float32, i9-10920X.
+
+QwenPI's 20-step smoke runs do not validate, and the export refuses them. Their head is barely
+trained and amplifies rounding: the traced text graph differs from transformers' own by 1e-6
+(relative, both float32), and that alone moves their actions by 20 to 24% in PyTorch, against
+0.0005% for StarVLA's trained QwenPI. Their fp16 packages differed from PyTorch by 43 to 46%.
+
 On the same 30-episode LIBERO-goal benchmark as the native package, the fp16 OpenVINO package scored
 **7/30** on CPU, against **8/30** for native CUDA bf16. The checkpoint, seeds, initial states,
 observation handling and action conversion were identical. The noise stream (numpy vs torch) was not,
@@ -861,6 +893,7 @@ an RTX 3090. INT8 and fp32 packages have not been benchmarked closed-loop. Curre
   re-export them.
 - Checkpoints trained with `obs_image_size`, rotation state transforms, or batch size above one
   are not supported.
+- A checkpoint whose head amplifies rounding, such as a barely trained QwenPI, does not validate.
 
 ```python
 model = InferenceModel("exports/starvla-openvino", device="CPU", seed=42)  # or GPU / NPU

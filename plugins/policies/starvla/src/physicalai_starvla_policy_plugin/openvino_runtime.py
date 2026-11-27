@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-"""In-process OpenVINO Runtime adapter for exported QwenGR00T packages (no StarVLA, torch or CUDA)."""
+"""In-process OpenVINO Runtime adapter for exported StarVLA packages (no StarVLA, torch or CUDA)."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ _DEVICES = {"auto": "CPU", "cpu": "CPU", "gpu": "GPU", "xpu": "GPU", "npu": "NPU
 
 @adapter_registry.register(BACKEND, extensions=(".starvla_ov",))
 class StarVLAOpenVINOAdapter(RuntimeAdapter):
-    """Run an OpenVINO QwenGR00T package: vision, text and action-head graphs plus numpy glue."""
+    """Run an OpenVINO StarVLA package: vision, text and action-head graphs plus numpy glue."""
 
     def __init__(
         self,
@@ -38,7 +38,7 @@ class StarVLAOpenVINOAdapter(RuntimeAdapter):
         self._config = dict(config or {})
         self._calls = 0
         self._rng = np.random.default_rng(seed)
-        self._pipeline: pipeline.QwenGR00TPipeline | None = None
+        self._pipeline: pipeline.StarVLAPipeline | None = None
         self._io: IoSpec | None = None
 
     def default_device(self) -> str:  # ruff: ignore[no-self-use]
@@ -54,7 +54,7 @@ class StarVLAOpenVINOAdapter(RuntimeAdapter):
         artifact = Path(model_path).expanduser().resolve(strict=True)
         descriptor = load_openvino_descriptor(artifact)
         device = _DEVICES.get(str(self.device).lower(), str(self.device))
-        self._pipeline = pipeline.QwenGR00TPipeline(artifact, device, self._config)
+        self._pipeline = pipeline.StarVLAPipeline(artifact, device, self._config)
         self._io = IoSpec.from_dict(descriptor["io"])
         self.reset()
 
@@ -76,7 +76,7 @@ class StarVLAOpenVINOAdapter(RuntimeAdapter):
         return {"action": flatten_actions(self._pipeline.unnormalize_actions(normalized[0]), self._io)}
 
     def reset(self) -> None:
-        """Restart the deterministic noise sequence between episodes."""
+        """Restart the deterministic noise sequence between episodes (heads without noise ignore it)."""
         self._calls = 0
 
     def close(self) -> None:

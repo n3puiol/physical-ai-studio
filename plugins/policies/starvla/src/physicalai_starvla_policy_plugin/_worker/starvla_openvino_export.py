@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-"""Convert a native QwenGR00T package to OpenVINO and check it against StarVLA's PyTorch code.
+"""Convert a native QwenGR00T, QwenPI or QwenOFT package to OpenVINO and check it against StarVLA.
 
 Runs in the locked ``qwengr00t-openvino`` environment on CPU:
 
@@ -38,13 +38,19 @@ from starvla_worker_common import trained_with_state
 
 # Largest acceptable |OpenVINO - PyTorch| on normalized actions, and smallest cosine, per weight format.
 TOLERANCE = {"fp32": (1e-3, 0.99999), "fp16": (5e-2, 0.9999), "int8": (1e-1, 0.999)}
-# The staged PyTorch model must reproduce StarVLA's own predict_action this closely.
+# The staged PyTorch model must reproduce StarVLA, stage by stage: the text graph its hidden states
+# (relative to their norm; float rounding differs because the graph passes an explicit mask), and the
+# head, fed StarVLA's own hidden states, its predict_action. Checked separately because QwenPI's head
+# can amplify the text graph's rounding many times over (see ``reference``).
+TEXT_TOLERANCE = 1e-5
 SPLIT_TOLERANCE = 1e-4
 STATE_TOLERANCE = 1e-5
 UNNORMALIZE_TOLERANCE = 1e-4
 SENTINEL = "\x00INSTRUCTION\x00"
 VALIDATION_TASK = "put the bowl on the plate"
-POLICY = "QwenGR00T"
+POLICIES = ("QwenGR00T", "QwenPI", "QwenOFT")
+# QwenOFT reads state as text with StarVLA's default bin count (``add_discretized_state_to_instruction``).
+STATE_PROMPT_BINS = 256
 
 
 class ExportError(RuntimeError):
@@ -65,18 +71,33 @@ def stats(actual: Any, expected: Any) -> dict[str, float]:
     a = np.asarray(actual, dtype=np.float64).ravel()
     b = np.asarray(expected, dtype=np.float64).ravel()
     cosine = float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-30))
-    return {"max_abs": float(np.max(np.abs(a - b))), "mean_abs": float(np.mean(np.abs(a - b))), "cosine": cosine}
+    return {
+        "max_abs": float(np.max(np.abs(a - b))),
+        "mean_abs": float(np.mean(np.abs(a - b))),
+        "relative": float(np.linalg.norm(a - b) / (np.linalg.norm(b) + 1e-30)),
+        "cosine": cosine,
+    }
 
 
 # PyTorch modules traced into the three graphs ------------------------------------------------
-def build_modules(torch: Any, framework: Any, grid: Any, *, with_state: bool) -> dict[str, Any]:
+def pi_layers(framework: Any, policy: str) -> int:
+    """QwenPI's DiT blocks each attend to one of the text model's last layers; 0 for the others.
+
+    Returns:
+        The number of conditioning layers.
+    """
+    return len(framework.action_model.model.transformer_blocks) if policy == "QwenPI" else 0
+
+
+def build_modules(torch: Any, framework: Any, grid: Any, *, with_state: bool, policy: str) -> dict[str, Any]:
     """Wrap StarVLA's vision tower, text model and action head as traceable modules.
 
     Patches the text model in place (identity final norm, dense DeepStack), so StarVLA's own
     ``predict_action`` must not be called afterwards.
 
-    ``with_state`` adds the proprioceptive state token and input; a checkpoint trained without
-    state (StarVLA's ``include_state``) gets a head without either, as in training.
+    ``with_state`` adds the proprioceptive state token and input to a flow-matching head; a
+    checkpoint trained without state (StarVLA's ``include_state``) gets a head without either, as in
+    training. QwenOFT reads state from its prompt, so its head never takes it.
 
     Returns:
         ``vision``, ``llm`` and ``head`` modules, and ``head_fn`` for the PyTorch reference.
@@ -84,18 +105,27 @@ def build_modules(torch: Any, framework: Any, grid: Any, *, with_state: bool) ->
     head = framework.action_model
     text = framework.qwen_vl_interface.model.model.language_model
     visual = framework.qwen_vl_interface.model.model.visual
+    layers = pi_layers(framework, policy)
 
-    def head_with_noise(vl_embs: Any, mask: Any, state: Any, noise: Any) -> Any:
-        """``FlowmatchingActionHead.predict_action`` with the sampled noise as an input.
+    def head_with_noise(conditioning: Any, mask: Any, state: Any, noise: Any) -> Any:
+        """The flow-matching head's ``predict_action`` with the sampled noise as an input.
+
+        QwenGR00T's ``FlowmatchingActionHead`` attends to the last hidden state; QwenPI's
+        ``LayerwiseFlowmatchingActionHead`` gives each DiT block its own layer's hidden state.
 
         Returns:
             Normalized actions of shape (batch, horizon, action_dim).
         """
-        batch = vl_embs.shape[0]
+        batch = noise.shape[0]
         actions = noise
         steps = head.num_inference_timesteps
         state_features = head.state_encoder(state) if state is not None else None
         future = head.future_tokens.weight.unsqueeze(0).expand(batch, -1, -1)
+        encoder = (
+            {"encoder_hidden_states": list(conditioning.unbind(0)), "return_pre_output": True}
+            if layers
+            else {"encoder_hidden_states": conditioning}
+        )
         for step in range(steps):
             bucket = int(step / float(steps) * head.num_timestep_buckets)
             timesteps = torch.full((batch,), bucket, dtype=torch.long)
@@ -104,18 +134,13 @@ def build_modules(torch: Any, framework: Any, grid: Any, *, with_state: bool) ->
                 features += head.position_embedding(torch.arange(features.shape[1])).unsqueeze(0)
             parts = (state_features, future, features) if state_features is not None else (future, features)
             hidden = torch.cat(parts, dim=1)
-            out = head.model(
-                hidden_states=hidden,
-                encoder_hidden_states=vl_embs,
-                encoder_attention_mask=mask,
-                timestep=timesteps,
-            )
+            out = head.model(hidden_states=hidden, encoder_attention_mask=mask, timestep=timesteps, **encoder)
             # Not ``+=``: the first step would update the caller's noise tensor in place.
             actions = actions + (1.0 / steps) * head.action_decoder(out)[:, -head.action_horizon :]  # ruff: ignore[non-augmented-assignment]
         return actions
 
     class Head(torch.nn.Module):
-        """Four unrolled Euler steps of the flow-matching head."""
+        """The unrolled Euler steps of the flow-matching head."""
 
         def __init__(self) -> None:
             super().__init__()
@@ -134,6 +159,16 @@ def build_modules(torch: Any, framework: Any, grid: Any, *, with_state: bool) ->
         def forward(self, vl_embs: Any, attention_mask: Any, noise: Any) -> Any:  # ruff: ignore[no-self-use]
             return head_with_noise(vl_embs, attention_mask, None, noise)
 
+    class QueryHead(torch.nn.Module):
+        """QwenOFT's MLP on the hidden states at its action-query tokens."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.head = head
+
+        def forward(self, queries: Any) -> Any:
+            return self.head.predict_action(queries)
+
     class Vision(torch.nn.Module):
         """Vision tower with the exported camera grid baked in."""
 
@@ -149,10 +184,15 @@ def build_modules(torch: Any, framework: Any, grid: Any, *, with_state: bool) ->
     # StarVLA conditions on hidden_states[-1]: the last decoder layer before the final RMSNorm.
     text.norm = torch.nn.Identity()
     # DeepStack features arrive dense (zero off image tokens) instead of boolean-index assignment.
-    text._deepstack_process = lambda hidden, _mask, dense: hidden + dense
+    # In place, as transformers does: the hidden states it records for the first layers then
+    # include the features, and QwenPI's DiT attends to those layers.
+    text._deepstack_process = lambda hidden, _mask, dense: hidden.add_(dense)
 
     class Text(torch.nn.Module):
-        """Text model on prepared embeddings, returning the pre-norm last hidden state."""
+        """Text model on prepared embeddings, returning the pre-norm last hidden state.
+
+        For QwenPI, the hidden states of the last ``layers`` layers instead, stacked.
+        """
 
         def __init__(self) -> None:
             super().__init__()
@@ -174,9 +214,17 @@ def build_modules(torch: Any, framework: Any, grid: Any, *, with_state: bool) ->
                 visual_pos_masks=None,
                 deepstack_visual_embeds=list(deepstack.unbind(0)),
                 use_cache=False,
+                output_hidden_states=bool(layers),
             )
-            return out.last_hidden_state
+            return torch.stack(out.hidden_states[-layers:]) if layers else out.last_hidden_state
 
+    if policy == "QwenOFT":
+        return {
+            "head": QueryHead().eval(),
+            "vision": Vision().eval(),
+            "llm": Text().eval(),
+            "head_fn": head.predict_action,
+        }
     exported_head = Head() if with_state else StatelessHead()
     return {"head": exported_head.eval(), "vision": Vision().eval(), "llm": Text().eval(), "head_fn": head_with_noise}
 
@@ -285,6 +333,10 @@ class Export:
     weights: str
     image_size: tuple[int, int] | None
     uses_state: bool = True
+    policy: str = ""
+    # QwenOFT's action-query tokens after the instruction; empty for the other frameworks.
+    instruction_suffix: str = ""
+    head_inputs: list[str] = field(default_factory=list)
     descriptor: dict[str, Any] = field(default_factory=dict)
     framework: Any = None
     processor: Any = None
@@ -327,7 +379,7 @@ def load(export: Export) -> None:
         _resolve_robot_type(OmegaConf.to_container(cfg), export.descriptor["unnorm_key"])
     ]
     problems = {
-        "Only QwenGR00T has an OpenVINO export.": cfg.framework.name != POLICY,
+        f"Only {', '.join(POLICIES)} have an OpenVINO export.": cfg.framework.name not in POLICIES,
         "Checkpoints trained with obs_image_size have no OpenVINO export yet.": bool(
             getattr(cfg.datasets.vla_data, "obs_image_size", None),
         ),
@@ -336,9 +388,11 @@ def load(export: Export) -> None:
     for message, failed in problems.items():
         if failed:
             raise ExportError(message)
+    export.policy = str(cfg.framework.name)
     if export.image_size is None:
         export.image_size = dataset_image_size(cfg, cameras)
-    log(f"cameras {cameras} at {export.image_size[0]}x{export.image_size[1]}, weights {export.weights}")
+    height, width = export.image_size
+    log(f"{export.policy}: cameras {cameras} at {height}x{width}, weights {export.weights}")
 
     started = time.time()
     wrapper = PolicyServerWrapper(
@@ -374,6 +428,54 @@ def load(export: Export) -> None:
     log(f"loaded checkpoint in {time.time() - started:.0f}s")
 
 
+def synthetic_example(export: Export) -> tuple[dict[str, Any], np.ndarray | None]:
+    """A random observation at the exported camera size, with state when the checkpoint was trained with it.
+
+    Also records the raw images and state groups the torch-free pipeline is validated on.
+
+    Returns:
+        StarVLA's example dictionary and its normalized state (``None`` without state).
+    """
+    from PIL import Image
+
+    processor, io = export.processor, export.descriptor["io"]
+    rng = np.random.default_rng(0)
+    export.images = [rng.integers(0, 256, (*export.resolved_image_size, 3), dtype=np.uint8) for _ in io["cameras"]]
+    example: dict[str, Any] = {"image": [Image.fromarray(image) for image in export.images], "lang": VALIDATION_TASK}
+    if not export.uses_state:
+        return example, None
+    raw_state = rng.normal(0, 0.2, max(end for _, end in io["state"].values())).astype(np.float32)
+    export.state_groups = {key: raw_state[None, start:end] for key, (start, end) in io["state"].items()}
+    normalized_state = {key: value.copy() for key, value in export.state_groups.items()}
+    for transform in processor.transform.transforms:
+        if any(key.startswith("state.") for key in transform.apply_to):
+            normalized_state = transform(normalized_state)
+    example["state"] = np.concatenate([np.asarray(normalized_state[key]) for key in processor.state_keys], axis=-1)
+    return example, example["state"]
+
+
+def framework_instruction(export: Export, state: np.ndarray | None) -> str:
+    """The instruction the framework puts into its chat prompt for the validation task.
+
+    QwenOFT appends its discretized state when trained with it, then its action-query tokens, as in
+    ``Qwenvl_OFT.predict_action``; ``reference`` checks the result against that method.
+
+    Returns:
+        The instruction; also records QwenOFT's action-query suffix for the package.
+    """
+    framework = export.framework
+    if export.policy != "QwenOFT":
+        return VALIDATION_TASK
+    instruction = VALIDATION_TASK
+    if state is not None:
+        instruction = framework.add_discretized_state_to_instruction([instruction], [state])[0]
+    tokens = framework.action_token * framework.chunk_len
+    export.instruction_suffix = (
+        f" Please predict the next {framework.chunk_len} robot actions: <action>{tokens}<action>."
+    )
+    return instruction + export.instruction_suffix
+
+
 def reference(export: Export) -> None:  # ruff: ignore[too-many-locals]  # One linear reference computation.
     """Run StarVLA's predict_action and the staged PyTorch split on a synthetic observation.
 
@@ -381,32 +483,22 @@ def reference(export: Export) -> None:  # ruff: ignore[too-many-locals]  # One l
         ExportError: If the staged split no longer reproduces predict_action.
     """
     import torch
-    from PIL import Image
 
-    framework, processor, io = export.framework, export.processor, export.descriptor["io"]
-    rng = np.random.default_rng(0)
-    export.images = [rng.integers(0, 256, (*export.resolved_image_size, 3), dtype=np.uint8) for _ in io["cameras"]]
-    example: dict[str, Any] = {"image": [Image.fromarray(image) for image in export.images], "lang": VALIDATION_TASK}
-    example_state = None
-    if export.uses_state:
-        raw_state = rng.normal(0, 0.2, max(end for _, end in io["state"].values())).astype(np.float32)
-        export.state_groups = {key: raw_state[None, start:end] for key, (start, end) in io["state"].items()}
-        normalized_state = {key: value.copy() for key, value in export.state_groups.items()}
-        for transform in processor.transform.transforms:
-            if any(key.startswith("state.") for key in transform.apply_to):
-                normalized_state = transform(normalized_state)
-        example_state = np.concatenate([np.asarray(normalized_state[key]) for key in processor.state_keys], axis=-1)
-        example["state"] = example_state
+    framework = export.framework
+    example, example_state = synthetic_example(export)
+    instruction = framework_instruction(export, example_state)
 
     with torch.inference_mode():
         interface = framework.qwen_vl_interface
-        inputs = interface.build_qwenvl_inputs(images=[example["image"]], instructions=[example["lang"]])
+        inputs = interface.build_qwenvl_inputs(images=[example["image"]], instructions=[instruction])
         vlm = interface.model.model
         grid = inputs["image_grid_thw"]
         if len({tuple(row) for row in grid.tolist()}) != 1:
             msg = "Cameras resolve to different image grids."
             raise ExportError(msg)
-        native_hidden = interface(**inputs, output_hidden_states=True, return_dict=True).hidden_states[-1]
+        layers = pi_layers(framework, export.policy)
+        native_states = interface(**inputs, output_hidden_states=True, return_dict=True).hidden_states
+        native_hidden = torch.stack(native_states[-layers:]) if layers else native_states[-1]
         image_embeds, deepstack = vlm.visual(inputs["pixel_values"], grid_thw=grid)
         ids = inputs["input_ids"]
         embeds = vlm.get_input_embeddings()(ids)
@@ -419,18 +511,38 @@ def reference(export: Export) -> None:  # ruff: ignore[too-many-locals]  # One l
         head = framework.action_model
         torch.manual_seed(1)
         native_actions = framework.predict_action(examples=[example])["normalized_actions"]
-        torch.manual_seed(1)
-        noise = torch.randn((1, head.action_horizon, head.action_dim))
+        noise = None
+        if export.policy != "QwenOFT":  # QwenOFT regresses its actions; the others sample noise first.
+            torch.manual_seed(1)
+            noise = torch.randn((1, head.action_horizon, head.action_dim))
 
         # Patches the text model in place, so the native path above must already have run.
-        export.modules = build_modules(torch, framework, grid.clone(), with_state=export.uses_state)
+        export.modules = build_modules(
+            torch,
+            framework,
+            grid.clone(),
+            with_state=export.uses_state,
+            policy=export.policy,
+        )
         hidden = export.modules["llm"](embeds, inputs["attention_mask"], position_ids, dense)
         state = torch.from_numpy(np.array([example_state])).float() if example_state is not None else None
         mask = inputs["attention_mask"].bool()
-        actions = export.modules["head_fn"](hidden, mask, state, noise)
-    split = stats(actions, native_actions)
-    log(f"torch split vs predict_action: hidden {stats(hidden, native_hidden)}, actions {split}")
-    if split["max_abs"] > SPLIT_TOLERANCE:
+
+        def head_on(conditioning: Any) -> tuple[Any, Any]:
+            if export.policy == "QwenOFT":
+                picked = framework._gather_action_token_embeddings(
+                    conditioning,
+                    ids,
+                    action_token_id=framework.action_token_id,
+                )
+                return picked, export.modules["head_fn"](picked)
+            return None, export.modules["head_fn"](conditioning, mask, state, noise)
+
+        head_on_native = head_on(native_hidden)[1]
+        queries, actions = head_on(hidden)
+    text, head_split = stats(hidden, native_hidden), stats(head_on_native, native_actions)
+    log(f"torch split: text {text}, head {head_split}, end to end {stats(actions, native_actions)}")
+    if text["relative"] > TEXT_TOLERANCE or head_split["max_abs"] > SPLIT_TOLERANCE:
         msg = "The staged PyTorch model no longer reproduces predict_action; upstream changed."
         raise ExportError(msg)
     export.tensors = {
@@ -442,6 +554,7 @@ def reference(export: Export) -> None:  # ruff: ignore[too-many-locals]  # One l
         "mask": mask,
         "state": state,
         "noise": noise,
+        "queries": queries,
         "actions": actions,
         "native_actions": native_actions,
     }
@@ -453,17 +566,21 @@ def convert(export: Export) -> None:
     import torch
 
     t = export.tensors
+    head: tuple[tuple[Any, ...], list[str]]
+    if export.policy == "QwenOFT":
+        head = ((t["queries"],), ["queries"])
+    elif export.uses_state:
+        head = ((t["hidden"], t["mask"], t["state"], t["noise"]), ["vl_embs", "attention_mask", "state", "noise"])
+    else:
+        head = ((t["hidden"], t["mask"], t["noise"]), ["vl_embs", "attention_mask", "noise"])
+    export.head_inputs = head[1]
     examples = {
         "vision": ((t["pixel_values"],), ["pixel_values"]),
         "llm": (
             (t["embeds"], t["attention_mask"], t["position_ids"], t["dense"]),
             ["inputs_embeds", "attention_mask", "position_ids", "deepstack"],
         ),
-        "head": (
-            ((t["hidden"], t["mask"], t["state"], t["noise"]), ["vl_embs", "attention_mask", "state", "noise"])
-            if export.uses_state
-            else ((t["hidden"], t["mask"], t["noise"]), ["vl_embs", "attention_mask", "noise"])
-        ),
+        "head": head,
     }
     for name in pipeline.MODELS:
         started = time.time()
@@ -507,11 +624,17 @@ def describe(export: Export) -> None:
     grid = export.tensors["image_grid_thw"][0].tolist()
     vlm_config = framework.qwen_vl_interface.model.model.config
     head = framework.action_model
+    oft = export.policy == "QwenOFT"
     io = export.descriptor["io"]
+    state: dict[str, Any] = {
+        "keys": [[key, processor.state_key_dims[key]] for key in processor.state_keys] if export.uses_state else [],
+    }
+    if oft and export.uses_state:
+        state["prompt_bins"] = STATE_PROMPT_BINS
     export.package = {
         "format_version": pipeline.FORMAT_VERSION,
         "backend": pipeline.BACKEND,
-        "policy": POLICY,
+        "policy": export.policy,
         "source_environment": export.descriptor["environment"],
         "weights": export.weights,
         "unnorm_key": export.descriptor["unnorm_key"],
@@ -528,22 +651,23 @@ def describe(export: Export) -> None:
             "temporal_patch_size": image_processor.temporal_patch_size,
             "merge_size": merge,
         },
-        "prompt": prompt_template(framework, len(io["cameras"])),
+        "prompt": {**prompt_template(framework, len(io["cameras"])), "instruction_suffix": export.instruction_suffix},
         "tokens": {
             "image_token_id": int(vlm_config.image_token_id),
             "vision_start_token_id": int(vlm_config.vision_start_token_id),
         },
         "embedding": {"dtype": "bfloat16" if bfloat16 else "float32", "shape": list(export.embedding.shape)},
-        "state": {
-            "keys": [[key, processor.state_key_dims[key]] for key in processor.state_keys] if export.uses_state else [],
-        },
+        "state": state,
+        "head": {"inputs": export.head_inputs},
         "action": {
             "keys": [[key, processor.action_key_dims[key]] for key in processor.action_keys],
-            "horizon": int(head.action_horizon),
+            "horizon": int(framework.chunk_len if oft else head.action_horizon),
             "dim": int(head.action_dim),
         },
         "normalization": normalization_spec(processor),
     }
+    if oft:
+        export.package["queries"] = {"token_id": int(framework.action_token_id), "count": int(framework.chunk_len)}
     (export.output / pipeline.DESCRIPTOR).write_text(json.dumps(export.package, indent=2) + "\n")
 
 
@@ -557,16 +681,16 @@ def validate(export: Export) -> dict[str, Any]:
         ExportError: If any stage differs beyond tolerance.
     """
     t = export.tensors
-    ov_pipeline = pipeline.QwenGR00TPipeline(export.output, "CPU", {"INFERENCE_PRECISION_HINT": "f32"})
-    prepared = ov_pipeline.prepare(export.images, VALIDATION_TASK)
+    ov_pipeline = pipeline.StarVLAPipeline(export.output, "CPU", {"INFERENCE_PRECISION_HINT": "f32"})
+    state = ov_pipeline.normalize_state(export.state_groups) if export.uses_state else None
+    # QwenOFT's prompt carries the discretized state, so equal ids also check the numpy binning.
+    prepared = ov_pipeline.prepare(export.images, VALIDATION_TASK, state)
     unnormalized = ov_pipeline.unnormalize_actions(t["native_actions"][0])
     checks: dict[str, Any] = {
         "input_ids_equal": bool(np.array_equal(prepared["input_ids"], t["input_ids"].numpy())),
         "position_ids_equal": bool(np.array_equal(prepared["position_ids"], t["position_ids"].numpy())),
         "pixel_values": stats(prepared["pixel_values"], t["pixel_values"]),
-        "state": (
-            stats(ov_pipeline.normalize_state(export.state_groups), t["state"].numpy()) if export.uses_state else None
-        ),
+        "state": stats(state, t["state"].numpy()) if state is not None else None,
         "unnormalize": stats(
             np.concatenate([unnormalized[key] for key, _ in export.package["action"]["keys"]], axis=-1),
             export.processor.unapply_actions(t["native_actions"][0]),
@@ -575,8 +699,8 @@ def validate(export: Export) -> dict[str, Any]:
             ov_pipeline.predict_normalized(
                 export.images,
                 VALIDATION_TASK,
-                ov_pipeline.normalize_state(export.state_groups),
-                t["noise"].numpy(),
+                state,
+                t["noise"].numpy() if t["noise"] is not None else None,
             ),
             t["actions"],
         ),
