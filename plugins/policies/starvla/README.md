@@ -555,7 +555,10 @@ WANDB_MODE=disabled library/.venv/bin/physicalai train starvla \
   run_root_dir=/absolute/path/to/runs run_id=starvla-cotrain
 ```
 
-Co-trained checkpoints export and run like any other run of their framework.
+Co-trained checkpoints export and run like any other run of their framework. The other frameworks on
+a Qwen3-VL backbone co-train the same way: add the `vlm_data` block and `trainer.loss_scale` to the
+framework's own config and leave part of the VLM trainable. StarVLA's co-trainer reports every
+framework's action loss as `action_dit_loss`.
 
 Three upstream gaps for single-GPU co-training are bridged in the worker:
 
@@ -572,6 +575,17 @@ Verified on one RTX 3090 with a 40-example question-answering set built from LIB
 seconds at 8.9 GB of GPU memory and reported the action loss (1.28) and the weighted VLM loss
 (0.46) every step. Runtime matched StarVLA's own `predict_action` exactly, and the co-trained
 QwenGR00T also exported to OpenVINO (actions within 3.1e-3 of PyTorch).
+
+Also verified on one A100 80 GB with the same set, 20 steps each, training the VLM's last two layers:
+
+| Run                                      | Time | GPU memory | Runtime vs StarVLA |
+| ---------------------------------------- | ---- | ---------- | ------------------ |
+| QwenPI on Qwen3-VL-2B, DiT blocks frozen | 36 s | 12.8 GB    | exact              |
+| QwenOFT on Qwen3-VL-2B                   | 19 s | 6.7 GB     | exact              |
+| QwenFast on Qwen3-VL-4B-Instruct-Action  | 24 s | 11.7 GB    | exact              |
+
+Each reported both losses every step, packaged without Python, and repeated its actions exactly
+after a reset.
 
 ## Multi-GPU training
 
@@ -614,6 +628,13 @@ DeepSpeed is published only as source code and is not in the worker environments
 still holds the whole model and optimizer state: more GPUs train on more samples per step, but do
 not let a larger model fit.
 
+If the ranks load the model but never report a step, check NCCL on its own. On an 8× A100 PCIe
+machine whose GPUs connect through PCIe switches, NCCL's peer-to-peer transport hung: each rank sat
+at about 640 MiB of GPU memory and 100% utilization, and a plain two-GPU `torch.distributed`
+all-reduce never returned. With `NCCL_P2P_DISABLE=1` in the caller's environment, which the engine
+passes on to the ranks, NCCL used shared memory instead and training ran normally. The machine, not
+StarVLA, decides this.
+
 Verified on two RTX 3090s, 20 LIBERO-goal steps each through the engine:
 
 | Run                                            | GPUs | Time | GPU memory       | Runtime vs StarVLA |
@@ -630,6 +651,30 @@ run took 14.7 GB on one GPU. Rank 0 reported every step in order, and Runtime ma
 5 stopped both ranks together after step 6, returning 3.2 seconds after the request with no rank left
 and both GPUs free. Killing the host process at step 3, as a crash would, also left no worker,
 `torchrun` or rank behind. A co-training config was refused before any rank started.
+
+Also verified on four A100 80 GB PCIe GPUs (with `NCCL_P2P_DISABLE=1`, see above), 20 LIBERO-goal
+steps each through the engine with the bundled smoke configs:
+
+| Run                                      | Time   | GPU memory, each | Runtime vs StarVLA |
+| ---------------------------------------- | ------ | ---------------- | ------------------ |
+| QwenGR00T on Qwen3.5-0.8B (`qwen35`)     | 188 s¹ | 5.9 GB           | exact              |
+| QwenPI on Qwen3-VL-2B                    | 55 s   | 22.0 GB          | exact              |
+| QwenOFT on Qwen3-VL-4B                   | 42 s   | 18.6 GB          | exact              |
+| QwenOFT on Qwen3.5-0.8B (`qwen35`)       | 26 s   | 4.2 GB           | exact              |
+| QwenFast on Qwen3-VL-4B-Instruct-Action  | 36 s   | 18.2 GB          | exact              |
+| CosmoPredict2GR00T on Cosmos-Predict2-2B | 47 s   | 28.7 GB          | exact              |
+| CosmoPredict2OFT on Cosmos-Predict2-2B   | 47 s   | 28.3 GB          | exact              |
+| CosmoPredict2PI on Cosmos-Predict2-2B    | 68 s   | 36.9 GB          | exact              |
+| WanGR00T on Wan2.2-TI2V-5B               | 77 s   | 42–44 GB         | exact              |
+| WanOFT on Wan2.2-TI2V-5B                 | 69 s   | 43–45 GB         | exact              |
+| WanPI on Wan2.2-TI2V-5B                  | 127 s  | 61–63 GB         | exact              |
+
+¹ Including the first preparation of the `qwen35` environment on that machine.
+
+Every GPU trained, rank 0 reported every step in order, each package held its backbone, its
+environment's pins and no Python, and each repeated its actions exactly after a reset. Cancelling a
+four-GPU WanGR00T run after step 5 stopped every rank after step 6, returning 4.0 seconds after the
+request with no rank left and the four GPUs free.
 
 ## RL post-training with RLinf
 
@@ -692,6 +737,18 @@ tensors. The `.pt` from step 2 was identical to the one RLinf trained from, RLin
 run exported, with Runtime matching StarVLA's own `predict_action` exactly and repeating it
 exactly after a reset. An RL run that improves a policy (longer episodes; RLinf's recipe
 uses 8 GPUs) was not tried.
+
+The same round trip passed for QwenGR00T and QwenPI on Qwen3-VL-2B on two A100s (GRPO in 114 and
+161 seconds), with the same results: RLinf's own parameter `actor_logstd` left out, and only the
+bf16 rounding of the runs' fp32 tensors (248 and 416) between the starting and imported runs.
+Two things were needed on that shared 8-GPU machine:
+
+- RLinf counts every GPU on the machine and sets each worker's `CUDA_VISIBLE_DEVICES` itself, so
+  `CUDA_VISIBLE_DEVICES` does not limit it. Name the GPUs in the config instead, for example
+  `cluster.component_placement` `actor,env,rollout: 6-7`. `all` means every GPU, including ones other
+  jobs use; there, the test config's 8 simulators did not divide across 8 GPUs and RLinf stopped.
+- NCCL's peer-to-peer transport hung between GPUs behind PCIe switches (see
+  [Multi-GPU training](#multi-gpu-training)); `NCCL_P2P_DISABLE=1` fixed it.
 
 ## Export with explicit robot mappings
 
@@ -863,6 +920,26 @@ to safetensors with PyTorch's weights-only loader and then exported with `export
 unmodified LIBERO client ran 100 `libero_goal` episodes (10 per task, seed 7) twice: against StarVLA's
 own server and against this server with the native package, both without `--use_bf16`. Both
 succeeded in 98 of 100 episodes, with the same outcome in every episode, in about 8.5 minutes each.
+
+A run trained through the plugin was checked the same way on A100s. The converted checkpoint was
+fine-tuned for 2,000 steps on `libero_goal` with `trainer.pretrained_checkpoint`, the whole model
+trainable as upstream trains it, batch size 8 on each of four GPUs (`all_devices`), and learning
+rates where the published run's cosine schedule stood at its step 50,000. That took 84 minutes at
+55 GB per GPU, and the run was exported with `export`. StarVLA's client then ran 100 episodes against
+StarVLA's own server on the run and 100 against this server with its native package, twice, with
+the two servers on swapped GPUs the second time:
+
+| Server                                     | First round | Second round |
+| ------------------------------------------ | ----------- | ------------ |
+| StarVLA's own server, published checkpoint | 98 / 100    |              |
+| StarVLA's own server, fine-tuned run       | 97 / 100    | 99 / 100     |
+| This server, fine-tuned run's package      | 97 / 100    | 99 / 100     |
+
+Each server's outcomes changed in two episodes from one round to the next, as much as the two
+servers differed within a round: two episodes in the first round and none in the second. The
+closed loop (simulation and GPU inference over a few hundred steps) is not bit-reproducible from run
+to run, so per-episode agreement in one round is not guaranteed even between two runs of StarVLA's
+own server.
 
 ## Runtime-only inference
 
