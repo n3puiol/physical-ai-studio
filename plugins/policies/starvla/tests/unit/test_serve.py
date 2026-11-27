@@ -6,7 +6,10 @@
 import asyncio
 import contextlib
 import json
+import logging
 import threading
+import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -191,8 +194,13 @@ def test_messages_are_routed_like_starvlas_server(native: Path) -> None:
     assert serve.respond(policy, "not a map")["status"] == "error"
 
 
-def test_a_starvla_style_client_gets_metadata_then_actions(native: Path) -> None:
-    policy = serve.RuntimePolicy(FakeModel(), native)
+@contextlib.contextmanager
+def running(policy: serve.RuntimePolicy) -> Iterator[int]:
+    """Serve on a free local port in a background thread.
+
+    Yields:
+        The bound port.
+    """
     loop = asyncio.new_event_loop()
     ready, ports, tasks = threading.Event(), [], []
 
@@ -210,14 +218,34 @@ def test_a_starvla_style_client_gets_metadata_then_actions(native: Path) -> None
     thread.start()
     assert ready.wait(10)
     try:
-        with connect(f"ws://127.0.0.1:{ports[0]}", max_size=None, compression=None) as client:
-            metadata = serve.unpack(client.recv())
-            assert metadata["action_chunk_size"] == 8
-            example = {"image": [np.zeros((4, 4, 3), np.uint8)] * 2, "lang": "x", "state": np.zeros(2, np.float32)}
-            client.send(serve.pack({"examples": [example], "unnorm_key": None, "do_sample": False}))
-            response = serve.unpack(client.recv())
+        yield ports[0]
     finally:
         loop.call_soon_threadsafe(tasks[0].cancel)
         thread.join(10)
+
+
+def test_a_starvla_style_client_gets_metadata_then_actions(native: Path) -> None:
+    policy = serve.RuntimePolicy(FakeModel(), native)
+    with running(policy) as port, connect(f"ws://127.0.0.1:{port}", max_size=None, compression=None) as client:
+        metadata = serve.unpack(client.recv())
+        assert metadata["action_chunk_size"] == 8
+        example = {"image": [np.zeros((4, 4, 3), np.uint8)] * 2, "lang": "x", "state": np.zeros(2, np.float32)}
+        client.send(serve.pack({"examples": [example], "unnorm_key": None, "do_sample": False}))
+        response = serve.unpack(client.recv())
     assert response["status"] == "ok"
     assert response["data"]["actions"].shape == (1, 2, 3)
+
+
+def test_a_client_leaving_without_a_close_frame_is_not_an_error(native: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """StarVLA's LIBERO client exits without closing; StarVLA's server logs that as a closed connection."""
+    policy = serve.RuntimePolicy(FakeModel(), native)
+    caplog.set_level(logging.INFO)
+    with running(policy) as port, connect(f"ws://127.0.0.1:{port}", max_size=None, compression=None) as client:
+        serve.unpack(client.recv())
+        client.socket.close()  # Drop the TCP connection without a close frame.
+        deadline = time.monotonic() + 10
+        while not any("closed" in record.getMessage() for record in caplog.records) and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+    assert any(record.levelno == logging.INFO and "closed" in record.getMessage() for record in caplog.records)
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]

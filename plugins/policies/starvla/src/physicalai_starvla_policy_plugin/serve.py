@@ -247,12 +247,16 @@ async def serve(policy: RuntimePolicy, host: str, port: int, ready: Callable[[in
     ``ready`` is called with the bound port once the server listens.
     """
     from websockets.asyncio.server import serve as websocket_serve  # ruff: ignore[import-outside-top-level]
+    from websockets.exceptions import ConnectionClosed  # ruff: ignore[import-outside-top-level]
 
     async def handle(connection: Any) -> None:  # ruff: ignore[any-type]  # websockets connection.
-        await connection.send(pack(policy.metadata))
-        async for frame in connection:
-            response = respond(policy, unpack(frame) if isinstance(frame, bytes) else None)
-            await connection.send(pack(response))
+        try:
+            await connection.send(pack(policy.metadata))
+            async for frame in connection:
+                response = respond(policy, unpack(frame) if isinstance(frame, bytes) else None)
+                await connection.send(pack(response))
+        except ConnectionClosed:  # StarVLA's LIBERO client exits without a close frame; its server logs it too.
+            logger.info("Connection from %s closed", connection.remote_address)
 
     async with websocket_serve(handle, host, port, compression=None, max_size=None) as server:
         bound = next(iter(server.sockets)).getsockname()[1]
