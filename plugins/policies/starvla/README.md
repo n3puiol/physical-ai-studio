@@ -875,6 +875,21 @@ converted to safetensors with PyTorch's weights-only loader first:
 ¹ Mean absolute error of the unnormalized chunk against the dataset's actions, PyTorch / OpenVINO.
 ² OpenVINO / PyTorch float32, i9-10920X.
 
+In closed loop on LIBERO-goal, on the 8× A100 machine: StarVLA's LIBERO client ran 100 episodes (10
+per task, seed 7) against StarVLA's own server on a GPU, and against this plugin's server with the
+fp16 OpenVINO package on one 26-core Xeon Gold 5320 socket. The client was patched only to send
+LIBERO's 256-pixel frames instead of shrinking them to 224, since an OpenVINO package takes the
+resolution it was exported for:
+
+| Checkpoint               | StarVLA's server, GPU | OpenVINO package, CPU |
+| ------------------------ | --------------------- | --------------------- |
+| StarVLA's QwenOFT LIBERO | 99/100 (15 min)       | 98/100 (34 min)       |
+| StarVLA's QwenPI LIBERO  | 65/100 (32 min)       | 68/100 (73 min)       |
+
+Both differences are within what repeated runs of one server vary by (two episodes for QwenOFT, see
+[StarVLA's benchmark clients](#starvlas-benchmark-clients)), and QwenPI's noise comes from numpy in the package and from PyTorch in StarVLA's
+server, so its episodes differ individually.
+
 QwenPI's 20-step smoke runs do not validate, and the export refuses them. Their head is barely
 trained and amplifies rounding: the traced text graph differs from transformers' own by 1e-6
 (relative, both float32), and that alone moves their actions by 20 to 24% in PyTorch, against
