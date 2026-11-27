@@ -225,3 +225,9 @@ graphify-out/
 
 # Local-only SnapFlow verification script (kept out of PRs, not a supported CLI tool)
 library/scripts/benchmark_snapflow_libero.py
+
+# Policy plugins are locked by library/uv.lock, which installs them as path dependencies. Running uv from a
+# plugin directory writes a stray uv.lock there.
+plugins/policies/*/uv.lock
+# A plugin's worker project and lock ship in its env/ package directory, which the env/ rule above would hide.
+!plugins/policies/*/src/*/env/
